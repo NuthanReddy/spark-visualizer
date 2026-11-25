@@ -8,9 +8,16 @@ import {
 } from '../src/data/runModel.ts';
 import { isLocalPort } from '../src/engine/adaptTrace.ts';
 import { getExpandableStepIds, projectRun } from '../src/engine/projection.ts';
-import { buildSimulatedRun, resolveValidSimulationConfig } from '../src/engine/simulator.ts';
+import {
+  buildSimulatedRun,
+  resolveValidSimulationConfig,
+  SimRunBuilder,
+} from '../src/engine/simulator.ts';
 import {
   DEFAULT_SIMULATION_CONFIG,
+  FAULT_CATEGORIES,
+  FAULT_MAP,
+  FAULTS_BY_CATEGORY,
   SIMULATED_FAULTS,
   SIMULATED_JOBS,
   SIMULATION_PRESETS,
@@ -40,14 +47,23 @@ function assertValidSimulatedRun(run: ExecutionRun, label: string) {
     assert.ok(!eventIds.has(ev.id), `${label}: duplicate event id ${ev.id}`);
     eventIds.add(ev.id);
     assert.ok(stepIds.has(ev.stepId), `${label}: unknown stepId ${ev.stepId}`);
-    assert.ok(run.instances[ev.fromInstance], `${label}: missing fromInstance ${ev.fromInstance}`);
-    assert.ok(run.instances[ev.toInstance], `${label}: missing toInstance ${ev.toInstance}`);
+    const fromInst = run.instances[ev.fromInstance];
+    const toInst = run.instances[ev.toInstance];
+    assert.ok(fromInst, `${label}: missing fromInstance ${ev.fromInstance}`);
+    assert.ok(toInst, `${label}: missing toInstance ${ev.toInstance}`);
     assert.ok(COMPONENTS[ev.fromComponent], `${label}: invalid fromComponent ${ev.fromComponent}`);
     assert.ok(COMPONENTS[ev.toComponent], `${label}: invalid toComponent ${ev.toComponent}`);
     assert.ok(ev.label.length <= 28, `${label}: label too long "${ev.label}"`);
     assert.ok(!/[^\x00-\x7f]/.test(`${ev.label} ${ev.info} ${ev.command ?? ''}`), `${label}: non-ASCII`);
     if (isLocalPort(ev.port)) {
       assert.equal(ev.kind, 'local', `${label}/${ev.id}: local port "${ev.port}" marked wire`);
+    }
+    if (ev.kind === 'local' || isLocalPort(ev.port)) {
+      assert.equal(
+        fromInst.hostZone,
+        toInst.hostZone,
+        `${label}/${ev.id}: cross-host local event ${ev.fromInstance}(${fromInst.hostZone}) -> ${ev.toInstance}(${toInst.hostZone}) port="${ev.port}"`,
+      );
     }
   }
 
@@ -65,8 +81,8 @@ function assertValidSimulatedRun(run: ExecutionRun, label: string) {
   }
 }
 
-test('all 8 simulation presets build valid hierarchical runs', () => {
-  assert.equal(SIMULATION_PRESETS.length, 8);
+test('all 12 simulation presets build valid hierarchical runs', () => {
+  assert.equal(SIMULATION_PRESETS.length, 12);
   for (const preset of SIMULATION_PRESETS) {
     const check = validateSimulationConfig(preset.config);
     assert.equal(check.valid, true, `Preset ${preset.id} should be valid: ${check.blockers.map(b => b.reason)}`);
@@ -180,7 +196,9 @@ test('dynamic executor count (1..6), client placement, TorrentBroadcast P2P, ESS
   assert.equal(skewOff.steps.some(s => s.title.includes('PartialReducerPartitionSpec')), false);
 });
 
-test('all 7 job types and all 13 fault modes produce valid runs when paired cleanly', () => {
+test('all 7 job types and all 53 fault modes produce valid runs matching severity and invariants', () => {
+  assert.equal(SIMULATED_FAULTS.length, 53);
+
   for (const job of SIMULATED_JOBS) {
     const cfg: SimulationConfig = {
       ...DEFAULT_SIMULATION_CONFIG,
@@ -190,14 +208,154 @@ test('all 7 job types and all 13 fault modes produce valid runs when paired clea
     };
     assertValidSimulatedRun(buildSimulatedRun(cfg), `job-${job.id}`);
   }
+
   for (const fault of SIMULATED_FAULTS) {
     const raw: SimulationConfig = {
       ...DEFAULT_SIMULATION_CONFIG,
       fault: fault.id,
-      deployMode: fault.id === 'client-disconnect' ? 'client' : 'cluster',
     };
     const valid = resolveValidSimulationConfig(raw);
-    assertValidSimulatedRun(buildSimulatedRun(valid), `fault-${fault.id}`);
+    assert.equal(validateSimulationConfig(valid).valid, true, `fault-${fault.id}: auto-resolve must be valid`);
+    const run = buildSimulatedRun(valid);
+    assertValidSimulatedRun(run, `fault-${fault.id}`);
+    assert.ok(run.events.length >= 4, `fault-${fault.id}: expected >= 4 events, got ${run.events.length}`);
+
+    const hasSucceededUnreg = run.events.some(e => e.label === 'unregisterAM(SUCCEEDED)');
+    if (fault.severity === 'terminal') {
+      assert.equal(
+        hasSucceededUnreg,
+        false,
+        `fault-${fault.id}: terminal fault must NOT emit unregisterAM(SUCCEEDED)`,
+      );
+      assert.equal(
+        run.events.some(e => e.isError === true),
+        true,
+        `fault-${fault.id}: terminal fault must emit at least one error event`,
+      );
+    } else {
+      assert.equal(
+        hasSucceededUnreg,
+        true,
+        `fault-${fault.id} (${fault.severity}): non-terminal fault must complete with unregisterAM(SUCCEEDED)`,
+      );
+    }
+  }
+});
+
+test('all 9 fault categories are non-empty and partition all 53 simulated faults', () => {
+  assert.equal(FAULT_CATEGORIES.length, 9);
+  const seen = new Set<string>();
+  for (const cat of FAULT_CATEGORIES) {
+    const list = FAULTS_BY_CATEGORY[cat.id];
+    assert.ok(list && list.length > 0, `Category ${cat.id} must be non-empty`);
+    for (const f of list) {
+      assert.equal(f.category, cat.id);
+      assert.ok(!seen.has(f.id), `Duplicate fault ${f.id} across categories`);
+      seen.add(f.id);
+    }
+  }
+  assert.equal(seen.size, SIMULATED_FAULTS.length);
+  assert.equal(seen.size, 53);
+});
+
+test('SIGKILL-137 and key non-137 distinction faults carry exact diagnostic semantics', () => {
+  const runCorpus = (faultId: SimulationConfig['fault']) => {
+    const cfg = resolveValidSimulationConfig({ ...DEFAULT_SIMULATION_CONFIG, fault: faultId });
+    const run = buildSimulatedRun(cfg);
+    assertValidSimulatedRun(run, `distinction-${faultId}`);
+    const text = [
+      ...run.steps.map(s => `${s.title} ${s.explanation} ${s.keyState ?? ''} ${s.command ?? ''}`),
+      ...run.events.map(e => `${e.label} ${e.info} ${e.command ?? ''} ${e.fields.map(f => `${f.name}=${f.value}`).join(' ')}`),
+    ].join('\n');
+    return { run, text };
+  };
+
+  // 1. oom-pmem: -104 & KILLED_EXCEEDED_PMEM
+  const pmem = runCorpus('oom-pmem');
+  assert.ok(pmem.text.includes('-104') && pmem.text.includes('KILLED_EXCEEDED_PMEM'));
+
+  // 2. oom-vmem: -103 & KILLED_EXCEEDED_VMEM
+  const vmem = runCorpus('oom-vmem');
+  assert.ok(vmem.text.includes('-103') && vmem.text.includes('KILLED_EXCEEDED_VMEM'));
+
+  // 3. kernel-node-oom: 137 & Linux kernel OOM killer
+  const kernel = runCorpus('kernel-node-oom');
+  assert.ok(kernel.text.includes('137') && kernel.text.includes('Linux kernel OOM killer'));
+
+  // 4. yarn-preemption: -102 / PREEMPTED and exitCausedByApp=false
+  const preempt = runCorpus('yarn-preemption');
+  assert.ok(
+    preempt.text.includes('-102') &&
+      preempt.text.includes('PREEMPTED') &&
+      preempt.text.includes('exitCausedByApp=false'),
+  );
+
+  // 5. jvm-heap-oom: exit 52 (SparkExitCode.OOM) and NOT 137 as exit code
+  const heap = runCorpus('jvm-heap-oom');
+  assert.ok(heap.text.includes('52') && heap.text.includes('SparkExitCode.OOM'));
+  assert.equal(heap.text.includes('exitStatus=137'), false);
+  assert.equal(heap.text.includes('exit 137'), false);
+  assert.equal(heap.text.includes('exit code 137'), false);
+
+  // 6. node-crash-power-loss: no exit status / node lost & dead worker-a execs not stopped
+  const nodeCrash = runCorpus('node-crash-power-loss');
+  assert.ok(
+    nodeCrash.text.toLowerCase().includes('no exit code') &&
+      nodeCrash.text.includes('LOST'),
+  );
+  const crashStops = nodeCrash.run.events.filter(e => e.label.startsWith('StopExecutor'));
+  assert.ok(crashStops.length >= 1);
+  assert.equal(
+    crashStops.some(e => nodeCrash.run.instances[e.toInstance]?.hostZone === 'worker-node-a'),
+    false,
+    'Dead worker-a executors must never receive StopExecutor after node crash',
+  );
+
+  // 7. yarn-app-kill: ends in KILLED (terminal)
+  const appKill = runCorpus('yarn-app-kill');
+  assert.ok(appKill.text.includes('FinalApplicationStatus.KILLED') && appKill.text.includes('-106'));
+  assert.equal(appKill.run.events.some(e => e.label === 'unregisterAM(SUCCEEDED)'), false);
+
+  // 8. sigterm-escalated-sigkill: SIGTERM -> SIGKILL (137)
+  const sigterm = runCorpus('sigterm-escalated-sigkill');
+  assert.ok(
+    sigterm.text.includes('SIGTERM') &&
+      sigterm.text.includes('SIGKILL') &&
+      sigterm.text.includes('137'),
+  );
+});
+
+test('client-mode placement and 1-executor mode hold across all compatible faults with zero cross-host local ports', () => {
+  for (const fault of SIMULATED_FAULTS) {
+    if (!fault.requires?.clusterMode) {
+      const clientCfg = resolveValidSimulationConfig({
+        ...DEFAULT_SIMULATION_CONFIG,
+        deployMode: 'client',
+        fault: fault.id,
+      });
+      assert.equal(clientCfg.deployMode, 'client', `${fault.id} should remain in client mode`);
+      const clientRun = buildSimulatedRun(clientCfg);
+      assertValidSimulatedRun(clientRun, `client-${fault.id}`);
+      assert.ok(clientRun.events.length >= 4, `client-${fault.id}: expected >= 4 events`);
+      if (fault.id === 'listener-bus-overflow') {
+        assert.equal(clientRun.instances['metrics-system']?.hostZone, 'submit-host');
+      }
+      if (fault.id === 'rpc-ask-timeout') {
+        assert.equal(clientRun.instances['rpc-env']?.hostZone, 'submit-host');
+      }
+    }
+
+    if ((fault.requires?.minExecutors ?? 1) <= 1) {
+      const singleCfg = resolveValidSimulationConfig({
+        ...DEFAULT_SIMULATION_CONFIG,
+        numExecutors: 1,
+        fault: fault.id,
+      });
+      assert.equal(singleCfg.numExecutors, 1, `${fault.id} should remain at 1 executor`);
+      const singleRun = buildSimulatedRun(singleCfg);
+      assertValidSimulatedRun(singleRun, `e1-${fault.id}`);
+      assert.ok(singleRun.events.length >= 4, `e1-${fault.id}: expected >= 4 events`);
+    }
   }
 });
 
@@ -668,3 +826,965 @@ test('collect() maxResultSize math, AQE OFF omission, dynamic allocation orderin
     true,
   );
 });
+
+function collectRunText(run: ExecutionRun): string {
+  return [
+    ...run.steps.map(s => `${s.title} ${s.explanation} ${s.keyState ?? ''} ${s.command ?? ''}`),
+    ...run.events.map(
+      e =>
+        `${e.label} ${e.info} ${e.command ?? ''} ${e.senderState ?? ''} ${e.receiverState ?? ''} ${e.fields.map(f => `${f.name}=${f.value}`).join(' ')}`,
+    ),
+  ].join('\n');
+}
+
+function assertAmRegistrationInvariant(run: ExecutionRun, label: string) {
+  const registeredAms = new Set<string>();
+  for (const ev of run.events) {
+    const isReg =
+      ev.fromComponent === 'application-master' &&
+      ev.toComponent === 'resource-manager' &&
+      ev.port === 'rm01:8030' &&
+      /register/i.test(`${ev.label} ${ev.command ?? ''}`) &&
+      !/unregister/i.test(`${ev.label} ${ev.command ?? ''}`);
+    if (isReg) {
+      registeredAms.add(ev.fromInstance);
+      continue;
+    }
+    if (
+      ev.fromComponent === 'node-manager' &&
+      ev.toComponent === 'resource-manager' &&
+      ev.port === 'rm01:8031' &&
+      (ev.command ?? '').includes('container_e01_000001')
+    ) {
+      registeredAms.delete('application-master');
+      continue;
+    }
+    const isUnreg =
+      /(?:^|\b)(?:amclient\.)?unregister(?:am|applicationmaster)?\s*\(/i.test(ev.label) ||
+      /(?:^|\b)(?:amclient\.)?unregister(?:am|applicationmaster)?\s*\(/i.test(ev.command ?? '') ||
+      (ev.fromComponent === 'application-master' &&
+        ev.toComponent === 'resource-manager' &&
+        /unregister/i.test(`${ev.label} ${ev.command ?? ''}`));
+    if (isUnreg) {
+      assert.equal(
+        registeredAms.has(ev.fromInstance),
+        true,
+        `${label}: unregister event "${ev.label}" from ${ev.fromInstance} emitted without preceding registerAM in same attempt`,
+      );
+    }
+  }
+}
+
+function assertUniqueExecutorContainerIds(run: ExecutionRun, label: string) {
+  const seenByAttempt = new Map<string, string>();
+  for (const inst of Object.values(run.instances)) {
+    if (inst.componentId !== 'executor-backend' || !inst.containerId) continue;
+    const key = inst.containerId;
+    assert.equal(
+      seenByAttempt.has(key),
+      false,
+      `${label}: duplicate containerId ${key} shared by ${seenByAttempt.get(key)} and ${inst.id}`,
+    );
+    seenByAttempt.set(key, inst.id);
+  }
+}
+
+test('Astra regression: AM registration invariant & unique container IDs hold across all 53 faults in cluster & client modes', () => {
+  for (const fault of SIMULATED_FAULTS) {
+    for (const deployMode of ['cluster', 'client'] as const) {
+      if (deployMode === 'cluster' && fault.requires?.clientMode) continue;
+      if (deployMode === 'client' && fault.requires?.clusterMode) continue;
+      const cfg = resolveValidSimulationConfig({
+        ...DEFAULT_SIMULATION_CONFIG,
+        deployMode,
+        fault: fault.id,
+      });
+      assert.equal(cfg.deployMode, deployMode, `${fault.id} must stay in ${deployMode} mode`);
+      const run = buildSimulatedRun(cfg);
+      assertValidSimulatedRun(run, `am-inv-${deployMode}-${fault.id}`);
+      assertAmRegistrationInvariant(run, `am-inv-${deployMode}-${fault.id}`);
+      assertUniqueExecutorContainerIds(run, `cid-inv-${deployMode}-${fault.id}`);
+
+      // Client-mode Spark Netty RPC must never target a fabricated driver-1:dynamic listening AM port
+      if (deployMode === 'client') {
+        assert.equal(
+          run.events.some(e => e.protocol.includes('Spark Netty RPC') && e.port === 'driver-1:dynamic'),
+          false,
+          `client-${fault.id}: Spark Netty RPC must use AM outbound channel, never driver-1:dynamic`,
+        );
+      }
+
+      // Terminal fault AM disposition invariant by deploy mode:
+      // - Cluster mode terminal faults NEVER emit unregisterAM(SUCCEEDED)
+      // - Client mode AM/RM-terminated & pre-AM faults NEVER emit unregisterAM(SUCCEEDED)
+      // - Client mode SparkContext.stop() teardown on Python/init exceptions emits orders.py exits 1
+      //   AND Shutdown(exit=0) -> AM -> unregisterAM(SUCCEEDED)
+      if (fault.severity === 'terminal') {
+        const hasSucceededUnreg = run.events.some(e => e.label === 'unregisterAM(SUCCEEDED)');
+        if (deployMode === 'cluster') {
+          assert.equal(
+            hasSucceededUnreg,
+            false,
+            `cluster-${fault.id}: cluster terminal fault must NEVER emit unregisterAM(SUCCEEDED)`,
+          );
+        } else {
+          const amOrPreAmClientFaults = new Set([
+            'oversized-request',
+            'am-invalid-java-opts',
+            'port-bind-exhausted',
+            'client-disconnect',
+            'yarn-app-kill',
+            'max-executor-failures',
+            'all-nodes-excluded',
+          ]);
+          if (amOrPreAmClientFaults.has(fault.id)) {
+            assert.equal(
+              hasSucceededUnreg,
+              false,
+              `client-${fault.id}: AM/RM/pre-AM terminal fault must NEVER emit unregisterAM(SUCCEEDED)`,
+            );
+          } else {
+            assert.equal(
+              run.events.some(e => e.label === 'orders.py exits 1' && e.isError === true),
+              true,
+              `client-${fault.id}: client SparkContext.stop() teardown must record orders.py exits 1`,
+            );
+            assert.equal(
+              run.events.some(e => e.label === 'Shutdown(exit=0) -> AM'),
+              true,
+              `client-${fault.id}: default SparkContext.stop() must send Shutdown(exit=0) -> AM`,
+            );
+            assert.equal(
+              hasSucceededUnreg,
+              true,
+              `client-${fault.id}: client AM must finish SUCCEEDED on default SparkContext.stop() -> Shutdown(0)`,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // Direct SimRunBuilder unit test: registeredAmIds tracks AM registration per RuntimeInstance ID
+  const builder = new SimRunBuilder({ ...DEFAULT_SIMULATION_CONFIG, deployMode: 'cluster' });
+  const am1 = builder.std('application-master');
+  const rm = builder.std('resource-manager');
+  const amNm = builder.amNmInstance();
+  const am2 = builder.ensureInstance('am-attempt-2', {
+    componentId: 'application-master',
+    label: 'ApplicationMaster (Attempt 2)',
+    shortLabel: 'AM Attempt 2',
+    hostZone: 'driver-jvm',
+    hostLabel: 'driver-1 (Attempt 2)',
+    processId: 'AM JVM Attempt 2',
+    containerId: 'container_e02_000001',
+    attemptNumber: 2,
+  });
+  const testStep = builder.addStep({
+    id: 'test-step-am-guard',
+    title: 'Test AM registration guard',
+    explanation: 'Verifies per-instance registeredAmIds enforcement',
+    category: 'yarn-lifecycle',
+    keyState: 'test',
+    command: 'test',
+    detailsPassed: [],
+  });
+  assert.equal(builder.isAmRegistered(am1), false);
+  assert.throws(
+    () =>
+      builder.addEvent({
+        stepId: testStep,
+        from: am1,
+        to: rm,
+        channel: 'yarn',
+        protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
+        port: 'rm01:8030',
+        label: 'unregisterAM(SUCCEEDED)',
+        info: 'illegal unregister before register',
+        size: '920 B',
+        command: 'amClient.unregister(FinalApplicationStatus.SUCCEEDED, "")',
+        fields: [],
+        senderState: 'test',
+        receiverState: 'test',
+      }),
+    /unregister forbidden/,
+  );
+  builder.addEvent({
+    stepId: testStep,
+    from: am1,
+    to: rm,
+    channel: 'yarn',
+    protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
+    port: 'rm01:8030',
+    label: 'registerAM(driver:41000)',
+    info: 'register attempt 1',
+    size: '1.6 KB',
+    command: 'amClient.register("driver-1", 41000, conf, "http://driver-1:4040")',
+    fields: [],
+    senderState: 'test',
+    receiverState: 'test',
+  });
+  assert.equal(builder.isAmRegistered(am1), true);
+  assert.equal(builder.isAmRegistered(am2), false);
+  assert.throws(
+    () =>
+      builder.addEvent({
+        stepId: testStep,
+        from: am2,
+        to: rm,
+        channel: 'yarn',
+        protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
+        port: 'rm01:8030',
+        label: 'unregisterAM(SUCCEEDED)',
+        info: 'illegal attempt-2 unregister before attempt-2 register',
+        size: '920 B',
+        command: 'amClient.unregister(FinalApplicationStatus.SUCCEEDED, "")',
+        fields: [],
+        senderState: 'test',
+        receiverState: 'test',
+      }),
+    /unregister forbidden/,
+  );
+  builder.addEvent({
+    stepId: testStep,
+    from: amNm,
+    to: rm,
+    channel: 'error',
+    protocol: 'Hadoop RPC (ResourceTracker :8031)',
+    port: 'rm01:8031',
+    label: 'AM Cont #1 exit (137)',
+    info: 'attempt 1 died',
+    size: 'ContainerStatus',
+    command: 'nodeHeartbeat -> ContainerStatus(container_e01_000001, COMPLETE, exitStatus=137)',
+    fields: [],
+    senderState: 'test',
+    receiverState: 'test',
+    isError: true,
+  });
+  assert.equal(builder.isAmRegistered(am1), false);
+  assert.throws(
+    () =>
+      builder.addEvent({
+        stepId: testStep,
+        from: am1,
+        to: rm,
+        channel: 'yarn',
+        protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
+        port: 'rm01:8030',
+        label: 'unregisterAM(FAILED)',
+        info: 'dead attempt 1 cannot unregister',
+        size: '920 B',
+        command: 'amClient.unregister(FinalApplicationStatus.FAILED, "")',
+        fields: [],
+        senderState: 'test',
+        receiverState: 'test',
+      }),
+    /unregister forbidden/,
+  );
+
+  // Specific duplicate-container regression: 1 initial executor + DA + disk-dir-create-fail
+  const daDiskFail = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    jobType: 'wide-shuffle',
+    numExecutors: 1,
+    executorCores: 1,
+    numPartitions: 24,
+    dynamicAllocation: true,
+    fault: 'disk-dir-create-fail',
+  });
+  assertValidSimulatedRun(daDiskFail, 'da-1exec-disk-dir-fail');
+  assertUniqueExecutorContainerIds(daDiskFail, 'da-1exec-disk-dir-fail');
+  const execInstances = Object.values(daDiskFail.instances).filter(
+    i => i.componentId === 'executor-backend',
+  );
+  assert.ok(execInstances.length >= 6, 'Expected initial, replacement, and DA ramped executors');
+  const cids = execInstances.map(i => i.containerId);
+  assert.equal(new Set(cids).size, cids.length, `Duplicate container IDs found: ${cids.join(', ')}`);
+});
+
+test('Astra regression: disk-dir-create-fail timing, exitCausedByApp=true, and live shuffle producer', () => {
+  for (const [numExecutors, dynamicAllocation, expectedLiveExecNum] of [
+    [3, false, 4],
+    [1, true, 2],
+  ] as const) {
+    const run = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      jobType: 'wide-shuffle',
+      numExecutors,
+      executorCores: 1,
+      numPartitions: 12,
+      externalShuffleService: false,
+      dynamicAllocation,
+      fault: 'disk-dir-create-fail',
+    });
+    assertValidSimulatedRun(run, `disk-dir-e${numExecutors}-da${dynamicAllocation}`);
+    assertUniqueExecutorContainerIds(run, `disk-dir-e${numExecutors}-da${dynamicAllocation}`);
+
+    // Exec-1 must NEVER register its Executor, register its BlockManager, or send Heartbeats
+    assert.equal(
+      run.events.some(e => e.fromInstance === 'exec-1' && e.label.includes('RegisterExecutor')),
+      false,
+      'Dead Exec-1 must fail before RegisterExecutor',
+    );
+    assert.equal(
+      run.events.some(e => e.fromInstance === 'exec-1/bm' && e.label.includes('RegisterBM')),
+      false,
+      'Dead Exec-1 must fail before RegisterBM',
+    );
+    assert.equal(
+      run.events.some(e => e.fromInstance === 'exec-1' && e.label.includes('Heartbeat')),
+      false,
+      'Dead Exec-1 must fail before sending any Heartbeat',
+    );
+
+    // Attribution must be exitCausedByApp=true (NOT false)
+    const dirEvents = run.events.filter(e => e.stepId === 'sim-step-disk-dir-fail');
+    const removeEv = dirEvents.find(e => (e.command ?? '').includes('RemoveExecutor'));
+    assert.ok(removeEv, 'Expected RemoveExecutor event for exit 53');
+    assert.ok(
+      (removeEv.command ?? '').includes('exitCausedByApp=true'),
+      `Expected exitCausedByApp=true for exit 53, got: ${removeEv.command}`,
+    );
+    assert.equal(
+      (removeEv.command ?? '').includes('exitCausedByApp=false'),
+      false,
+      'Unexpected exit 53 must NOT be attributed as exitCausedByApp=false',
+    );
+
+    // Shuffle fetch must reference LIVE replacement executor, NEVER dead "1"
+    const fetchEv = run.events.find(e => e.label === 'FetchShuffleBlocks(0)');
+    assert.ok(fetchEv, 'Expected FetchShuffleBlocks(0) event');
+    assert.equal(fetchEv.toInstance, 'exec-repl/bm', 'Shuffle fetch must target live exec-repl/bm');
+    assert.ok(
+      (fetchEv.command ?? '').includes(`"${expectedLiveExecNum}"`),
+      `Shuffle fetch must reference live replacement exec "${expectedLiveExecNum}", got: ${fetchEv.command}`,
+    );
+    assert.equal(
+      (fetchEv.command ?? '').includes('FetchShuffleBlocks(appId, "1"'),
+      false,
+      'Shuffle fetch must NEVER hardcode dead executor "1"',
+    );
+  }
+});
+
+test('Astra regression: am-crash-retry NM->RM :8031 exit 137, zero shutdown hook, and Attempt-2 bindings', () => {
+  const run = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    jobType: 'wide-shuffle',
+    deployMode: 'cluster',
+    numExecutors: 2,
+    fault: 'am-crash-retry',
+  });
+  assertValidSimulatedRun(run, 'am-crash-retry-astra');
+  assertAmRegistrationInvariant(run, 'am-crash-retry-astra');
+
+  const nmExit137 = run.events.find(
+    e =>
+      e.fromComponent === 'node-manager' &&
+      e.toComponent === 'resource-manager' &&
+      e.port === 'rm01:8031' &&
+      (e.command ?? '').includes('exitStatus=137'),
+  );
+  assert.ok(nmExit137, 'AM Attempt 1 SIGKILL exit 137 must be reported by node-manager -> resource-manager on :8031');
+
+  const bogusDeadAmReport = run.events.find(
+    e =>
+      e.fromInstance === 'application-master' &&
+      e.toInstance === 'resource-manager' &&
+      e.port === 'rm01:8030' &&
+      (e.isError || (e.command ?? '').includes('137')),
+  );
+  assert.equal(bogusDeadAmReport, undefined, 'Dead AM must NEVER report its own SIGKILL on :8030');
+
+  const crashStep = run.steps.find(s => s.id === 'sim-step-am-crash');
+  assert.ok(crashStep && crashStep.explanation.includes('ZERO JVM shutdown hooks'));
+  assert.equal(
+    run.instances['yarn-allocator-a2']?.attemptNumber,
+    2,
+    'Attempt 2 must bind its own Attempt-2 yarn-allocator',
+  );
+
+  // Item 8: Attempt 2 must launch via resource-manager -> am-nm (ContainerManagementProtocol.startContainers),
+  // then local am-nm -> am-attempt-2, without claiming RM preserves .sparkStaging
+  const rmToAmNmIdx = run.events.findIndex(
+    e =>
+      e.stepId === 'sim-step-am-crash' &&
+      e.fromInstance === 'resource-manager' &&
+      e.toInstance === 'am-nm' &&
+      e.protocol.includes('ContainerManagementProtocol') &&
+      (e.command ?? '').includes('startContainers'),
+  );
+  const amNmToAm2Idx = run.events.findIndex(
+    e =>
+      e.stepId === 'sim-step-am-crash' &&
+      e.fromInstance === 'am-nm' &&
+      e.toInstance === 'am-attempt-2' &&
+      e.kind === 'local',
+  );
+  const am2RegIdx = run.events.findIndex(
+    e =>
+      e.stepId === 'sim-step-am-crash' &&
+      e.fromInstance === 'am-attempt-2' &&
+      e.toInstance === 'resource-manager' &&
+      e.port === 'rm01:8030',
+  );
+  assert.ok(
+    rmToAmNmIdx >= 0 && amNmToAm2Idx > rmToAmNmIdx && am2RegIdx > amNmToAm2Idx,
+    `Expected RM->am-nm (${rmToAmNmIdx}) < am-nm->am-attempt-2 (${amNmToAm2Idx}) < am-attempt-2 register (${am2RegIdx})`,
+  );
+  const crashText = collectRunText(run);
+  assert.ok(crashText.includes('ShutdownHookManager'), 'am-crash-retry must explain .sparkStaging stays intact because SIGKILLed Attempt 1 AM never ran ShutdownHookManager');
+  assert.equal(crashText.includes('RM preserves .sparkStaging'), false, 'am-crash-retry must NOT claim RM preserves .sparkStaging');
+  assert.equal(crashText.includes('RM skips staging'), false, 'am-crash-retry must NOT claim RM skips staging deletion');
+  assert.equal(crashText.includes('RM keeps staging'), false, 'am-crash-retry must NOT claim RM keeps staging dir');
+});
+
+test('Astra regression: task-result-lost (TaskState.FINISHED) & task-spill-oom happen BEFORE action completion', () => {
+  // 1. collect-action + task-result-lost
+  const trl = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    jobType: 'collect-action',
+    dataProfile: 'large-result',
+    numExecutors: 3,
+    fault: 'task-result-lost',
+  });
+  assertValidSimulatedRun(trl, 'collect-task-result-lost');
+  const indirectIdx = trl.events.findIndex(e => e.label.startsWith('IndirectTaskResult'));
+  const lostIdx = trl.events.findIndex(e => e.label === 'getRemoteBytes -> LOST');
+  const retryIdx = trl.events.findIndex(e => e.label === 'TaskResultLost -> retry');
+  const launchRetryIdx = trl.events.findIndex(e => e.label === 'LaunchTask (attempt 1)');
+  const deliveredIdx = trl.events.findIndex(e => (e.senderState ?? '').includes('Result delivered'));
+  assert.ok(indirectIdx >= 0 && lostIdx >= 0 && retryIdx >= 0 && launchRetryIdx >= 0 && deliveredIdx >= 0);
+  assert.ok(
+    indirectIdx < lostIdx && lostIdx < retryIdx && retryIdx < launchRetryIdx && launchRetryIdx < deliveredIdx,
+    `Expected IndirectTaskResult(${indirectIdx}) < LOST(${lostIdx}) < retry(${retryIdx}) < launchRetry(${launchRetryIdx}) < delivered(${deliveredIdx})`,
+  );
+  const trlText = collectRunText(trl);
+  assert.ok(trlText.includes('MEMORY_AND_DISK_SER'), 'TaskResultLost must note StorageLevel.MEMORY_AND_DISK_SER');
+  assert.ok(trlText.includes('TaskState.FINISHED, TaskResultLost'), 'TaskResultLost must use TaskState.FINISHED, TaskResultLost');
+  assert.equal(trlText.includes('TaskState.FAILED, TaskResultLost'), false, 'TaskResultLost must NOT use TaskState.FAILED');
+  assert.equal(trlText.includes('evicted under memory pressure'), false, 'TaskResultLost must not claim plain memory eviction');
+
+  // 2. cached-rdd + task-result-lost: loss + TaskState.FINISHED, TaskResultLost + retry ALL occur BEFORE Action 2 completion
+  const cachedTrl = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    jobType: 'cached-rdd',
+    numExecutors: 2,
+    numPartitions: 12,
+    fault: 'task-result-lost',
+  });
+  assertValidSimulatedRun(cachedTrl, 'cached-rdd-task-result-lost');
+  const cIndirectIdx = cachedTrl.events.findIndex(e => e.label.startsWith('IndirectTaskResult'));
+  const cLostIdx = cachedTrl.events.findIndex(e => e.label === 'getRemoteBytes -> LOST');
+  const cRetryIdx = cachedTrl.events.findIndex(e => e.label === 'TaskResultLost -> retry');
+  const cLaunchIdx = cachedTrl.events.findIndex(e => e.label === 'LaunchTask (attempt 1)');
+  const cFetchIdx = cachedTrl.events.findIndex(e => e.label === 'getRemoteBytes(taskres)');
+  const cActionDoneIdx = cachedTrl.events.findIndex(e => e.label === 'Action 2 completed');
+  assert.ok(
+    cIndirectIdx >= 0 &&
+      cLostIdx > cIndirectIdx &&
+      cRetryIdx > cLostIdx &&
+      cLaunchIdx > cRetryIdx &&
+      cFetchIdx > cLaunchIdx &&
+      cActionDoneIdx > cFetchIdx,
+    `cached-rdd task-result-lost ordering violated: indirect=${cIndirectIdx} lost=${cLostIdx} retry=${cRetryIdx} launch=${cLaunchIdx} fetch=${cFetchIdx} done=${cActionDoneIdx}`,
+  );
+  assert.equal(
+    cachedTrl.events
+      .slice(0, cActionDoneIdx)
+      .some(e => `${e.label} ${e.senderState ?? ''} ${e.receiverState ?? ''}`.includes('Action 2 completed')),
+    false,
+    'cached-rdd + task-result-lost must NEVER report Action 2 completed before TaskResultLost retry finishes',
+  );
+  const cachedTrlText = collectRunText(cachedTrl);
+  assert.ok(cachedTrlText.includes('TaskState.FINISHED, TaskResultLost'));
+  assert.equal(cachedTrlText.includes('TaskState.FAILED, TaskResultLost'), false);
+
+  // 3. All file-write jobs with task-result-lost: loss + retry occur BEFORE commitJob()
+  for (const jobType of [
+    'narrow-filter',
+    'wide-shuffle',
+    'sort-merge-skew',
+    'broadcast-join',
+    'python-udf',
+  ] as const) {
+    const run = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      jobType,
+      dataProfile: jobType === 'broadcast-join' ? 'small-dim' : 'uniform',
+      fault: 'task-result-lost',
+    });
+    assertValidSimulatedRun(run, `${jobType}-task-result-lost`);
+    const lIdx = run.events.findIndex(e => e.label === 'getRemoteBytes -> LOST');
+    const rIdx = run.events.findIndex(e => e.label === 'TaskResultLost -> retry');
+    const fIdx = run.events.findIndex(e => e.label === 'getRemoteBytes(taskres)');
+    const cIdx = run.events.findIndex(e => e.label === 'commitJob() + _SUCCESS');
+    assert.ok(
+      lIdx >= 0 && rIdx > lIdx && fIdx > rIdx && cIdx > fIdx,
+      `${jobType}: task-result-lost (${lIdx}/${rIdx}/${fIdx}) must complete BEFORE commitJob (${cIdx})`,
+    );
+    assert.ok(collectRunText(run).includes('TaskState.FINISHED, TaskResultLost'));
+  }
+
+  // 3b. narrow-filter + DA + 2 initial execs + 1 core + 24 partitions + task-result-lost:
+  // ResultStage 0 must stay pending until TaskResultLost retry completes!
+  const narrowDaTrl = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    jobType: 'narrow-filter',
+    dataProfile: 'uniform',
+    numExecutors: 2,
+    executorCores: 1,
+    numPartitions: 24,
+    dynamicAllocation: true,
+    fault: 'task-result-lost',
+  });
+  assertValidSimulatedRun(narrowDaTrl, 'narrow-da-task-result-lost');
+  const ndLostStepIdx = narrowDaTrl.steps.findIndex(s => s.id === 'sim-step-task-result-lost');
+  assert.ok(ndLostStepIdx >= 0, 'Expected sim-step-task-result-lost step');
+  assert.equal(
+    narrowDaTrl.steps
+      .slice(0, ndLostStepIdx)
+      .some(s => `${s.title} ${s.keyState ?? ''}`.includes('ResultStage 0 completed')),
+    false,
+    'narrow-filter + DA + task-result-lost must NOT claim ResultStage 0 completed before TaskResultLost retry',
+  );
+
+  // 3c. Custom AM runtime ID ("attempt2-on-driver-1") resolved by containerId on COMPLETE(137)
+  const customBuilder = new SimRunBuilder(DEFAULT_SIMULATION_CONFIG);
+  const customRm = customBuilder.std('resource-manager');
+  const customAmNm = customBuilder.amNmInstance();
+  const customAm = customBuilder.ensureInstance('attempt2-on-driver-1', {
+    componentId: 'application-master',
+    label: 'ApplicationMaster (Custom Attempt 2)',
+    shortLabel: 'AM Custom',
+    hostZone: 'driver-jvm',
+    hostLabel: 'driver-1',
+    processId: 'AM JVM Custom',
+    containerId: 'container_e02_000001',
+    attemptNumber: 2,
+  });
+  const sCustom = customBuilder.addStep({
+    id: 's-custom-am',
+    title: 'Custom AM registration lifecycle',
+    explanation: 'Verifies containerId-based AM deregistration on COMPLETE exit.',
+    category: 'yarn-lifecycle',
+  });
+  customBuilder.addEvent({
+    stepId: sCustom,
+    from: customAm,
+    to: customRm,
+    channel: 'yarn',
+    protocol: 'ApplicationMasterProtocol',
+    port: 'rm01:8030',
+    label: 'registerApplicationMaster',
+    info: 'Register custom AM instance.',
+    size: '1 KB',
+    command: 'amClient.register("driver-1", 41000)',
+    fields: [],
+  });
+  assert.equal(customBuilder.isAmRegistered(customAm), true);
+  // Non-terminal RUNNING heartbeat for AM paired with ANOTHER container's COMPLETE must NOT clear AM registration
+  customBuilder.addEvent({
+    stepId: sCustom,
+    from: customAmNm,
+    to: customRm,
+    channel: 'yarn',
+    protocol: 'ResourceTracker',
+    port: 'rm01:8031',
+    label: 'AM RUNNING + Exec COMPLETE',
+    info: 'Heartbeat reports container_e02_000001 RUNNING while container_e02_000002 COMPLETE (exit 1).',
+    size: 'ContainerStatus',
+    command: 'nodeHeartbeat -> ContainerStatus(container_e02_000001, RUNNING), ContainerStatus(container_e02_000002, COMPLETE, exitStatus=1)',
+    fields: [],
+  });
+  assert.equal(customBuilder.isAmRegistered(customAm), true);
+  // Terminal COMPLETE(137) removes exact custom AM ID and blocks unregister
+  customBuilder.addEvent({
+    stepId: sCustom,
+    from: customAmNm,
+    to: customRm,
+    channel: 'error',
+    protocol: 'ResourceTracker',
+    port: 'rm01:8031',
+    label: 'AM Cont COMPLETE(137)',
+    info: 'Heartbeat reports container_e02_000001 COMPLETE (exit 137).',
+    size: 'ContainerStatus',
+    command: 'nodeHeartbeat -> ContainerStatus(container_e02_000001, COMPLETE, exitStatus=137)',
+    fields: [],
+    isError: true,
+  });
+  assert.equal(customBuilder.isAmRegistered(customAm), false);
+  assert.throws(
+    () =>
+      customBuilder.addEvent({
+        stepId: sCustom,
+        from: customAm,
+        to: customRm,
+        channel: 'yarn',
+        protocol: 'ApplicationMasterProtocol',
+        port: 'rm01:8030',
+        label: 'unregisterAM(FAILED)',
+        info: 'Must fail because custom AM already died.',
+        size: '1 KB',
+        command: 'amClient.unregisterApplicationMaster(FAILED)',
+        fields: [],
+      }),
+    /AM unregister forbidden/,
+  );
+
+  // 4. collect-action + task-spill-oom
+  const spill = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    jobType: 'collect-action',
+    dataProfile: 'large-result',
+    numExecutors: 3,
+    fault: 'task-spill-oom',
+  });
+  assertValidSimulatedRun(spill, 'collect-task-spill-oom');
+  const spillIdx = spill.events.findIndex(e => e.label === 'SPILL_OUT_OF_MEMORY');
+  const spillDeliveredIdx = spill.events.findIndex(e => (e.senderState ?? '').includes('Result delivered'));
+  assert.ok(spillIdx >= 0 && spillDeliveredIdx >= 0 && spillIdx < spillDeliveredIdx,
+    `task-spill-oom (${spillIdx}) must occur BEFORE Result delivered (${spillDeliveredIdx})`);
+});
+
+test('Astra regression: terminal faults emit centralized AM disposition & exact exit codes', () => {
+  // task-exception, max-result-size, commit-job-failure:
+  // - cluster mode: SparkUserAppException(exitCode=1) -> unregisterAM(FAILED) (NOT exit 15, NEVER SUCCEEDED)
+  // - client mode: orders.py exits 1, while default SparkContext.stop() sends Shutdown(0) -> unregisterAM(SUCCEEDED)
+  for (const [faultId, jobType, dataProfile] of [
+    ['task-exception', 'narrow-filter', 'corrupt-record'],
+    ['max-result-size', 'collect-action', 'large-result'],
+    ['commit-job-failure', 'wide-shuffle', 'uniform'],
+  ] as const) {
+    const clusterRun = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      jobType,
+      dataProfile,
+      deployMode: 'cluster',
+      fault: faultId,
+    });
+    assertValidSimulatedRun(clusterRun, `terminal-${faultId}-cluster`);
+    assertAmRegistrationInvariant(clusterRun, `terminal-${faultId}-cluster`);
+    const unregFail = clusterRun.events.find(e => e.label === 'unregisterAM(FAILED)');
+    assert.ok(unregFail, `${faultId}/cluster must end with unregisterAM(FAILED)`);
+    assert.ok((unregFail.command ?? '').includes('exitCode=1'), `${faultId}/cluster must propagate exitCode=1`);
+    assert.equal((unregFail.command ?? '').includes('exitCode=15'), false, `${faultId}/cluster must NOT use exitCode=15`);
+    assert.equal(clusterRun.events.some(e => e.label === 'unregisterAM(SUCCEEDED)'), false);
+
+    const clientRun = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      jobType,
+      dataProfile,
+      deployMode: 'client',
+      fault: faultId,
+    });
+    assertValidSimulatedRun(clientRun, `terminal-${faultId}-client`);
+    assertAmRegistrationInvariant(clientRun, `terminal-${faultId}-client`);
+    const pyExit = clientRun.events.find(e => e.label === 'orders.py exits 1' && e.isError === true);
+    const shut0 = clientRun.events.find(e => e.label === 'Shutdown(exit=0) -> AM');
+    const unregOk = clientRun.events.find(e => e.label === 'unregisterAM(SUCCEEDED)');
+    assert.ok(pyExit && shut0 && unregOk, `${faultId}/client must show orders.py exits 1 + Shutdown(0) + unregisterAM(SUCCEEDED)`);
+    assert.ok((shut0.command ?? '').includes('Shutdown(exitCode=0)'));
+    assert.ok(collectRunText(clientRun).includes('stop(0)'));
+  }
+
+  // port-bind-exhausted exits directly with System.exit(1) and ZERO unregisterAM in both modes
+  for (const deployMode of ['cluster', 'client'] as const) {
+    const run = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      deployMode,
+      fault: 'port-bind-exhausted',
+    });
+    assertValidSimulatedRun(run, `port-bind-${deployMode}`);
+    assertAmRegistrationInvariant(run, `port-bind-${deployMode}`);
+    const text = collectRunText(run);
+    assert.ok(text.includes('System.exit(1)'), `port-bind-${deployMode} must show System.exit(1)`);
+    assert.equal(run.events.some(e => e.label.toLowerCase().includes('unregister')), false);
+  }
+
+  // dynalloc-no-shuffle-service:
+  // - client: AM registers first, validateSettings throws SparkException, SparkContext.scala:789 catch calls stop()
+  //   sending Shutdown(0) -> AM unregisters SUCCEEDED on YARN while orders.py exits 1!
+  // - cluster: exits 13 (EXIT_SC_NOT_INITED) with zero unregisterAM
+  const daClient = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    deployMode: 'client',
+    dynamicAllocation: true,
+    externalShuffleService: false,
+    fault: 'dynalloc-no-shuffle-service',
+  });
+  assertValidSimulatedRun(daClient, 'dynalloc-no-ess-client');
+  assertAmRegistrationInvariant(daClient, 'dynalloc-no-ess-client');
+  const daClientRegIdx = daClient.events.findIndex(e => e.label === 'registerAM(port=-1)');
+  const daClientFailIdx = daClient.events.findIndex(e => e.label === 'validateSettings() FAIL');
+  const daClientShut0Idx = daClient.events.findIndex(e => e.label === 'Shutdown(exit=0) -> AM');
+  const daClientUnregIdx = daClient.events.findIndex(e => e.label === 'unregisterAM(SUCCEEDED)');
+  const daClientPyExitIdx = daClient.events.findIndex(e => e.label === 'orders.py exits 1' && e.isError === true);
+  assert.ok(
+    daClientRegIdx >= 0 &&
+      daClientFailIdx > daClientRegIdx &&
+      daClientShut0Idx > daClientFailIdx &&
+      daClientUnregIdx > daClientShut0Idx &&
+      daClientPyExitIdx > daClientUnregIdx,
+    `Expected register(${daClientRegIdx}) < validateFail(${daClientFailIdx}) < Shutdown(0)(${daClientShut0Idx}) < unregisterAM(SUCCEEDED)(${daClientUnregIdx}) < orders.py exits 1(${daClientPyExitIdx})`,
+  );
+  const daClientText = collectRunText(daClient);
+  assert.ok(
+    daClientText.includes('spark.shuffle.service.enabled') &&
+      daClientText.includes('spark.dynamicAllocation.shuffleTracking.enabled') &&
+      daClientText.includes('spark.storage.decommission.shuffleBlocks.enabled') &&
+      daClientText.includes('ShuffleDataIO') &&
+      daClientText.includes('Shutdown(exitCode=0)') &&
+      daClientText.includes('stop(0)'),
+  );
+
+  const daCluster = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    deployMode: 'cluster',
+    dynamicAllocation: true,
+    externalShuffleService: false,
+    fault: 'dynalloc-no-shuffle-service',
+  });
+  assertValidSimulatedRun(daCluster, 'dynalloc-no-ess-cluster');
+  assertAmRegistrationInvariant(daCluster, 'dynalloc-no-ess-cluster');
+  assert.equal(daCluster.events.some(e => e.label.toLowerCase().includes('unregister')), false);
+  assert.ok(collectRunText(daCluster).includes('EXIT_SC_NOT_INITED=13'));
+
+  // am-invalid-java-opts contacts RM :8032 getNewApplication BEFORE failing with ZERO submitApplication
+  const amOpts = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    deployMode: 'client',
+    fault: 'am-invalid-java-opts',
+  });
+  assertValidSimulatedRun(amOpts, 'am-invalid-java-opts');
+  assert.equal(
+    amOpts.events.some(e => e.fromInstance === 'yarn-client' && e.toInstance === 'resource-manager' && e.port === 'rm01:8032' && e.label.includes('getNewApplication')),
+    true,
+    'am-invalid-java-opts must contact RM :8032 getNewApplication before failing',
+  );
+  assert.equal(amOpts.events.some(e => e.label.includes('submitApplication')), false);
+  assert.equal(collectRunText(amOpts).includes('without contacting YARN RM'), false);
+});
+
+test('Astra regression: exec-intentional-remove, ess-unavailable, codegen-huge-method, multiple-spark-contexts & torrent-piece-corrupt', () => {
+  // 1. exec-intentional-remove (DA off & DA on): NO bogus replacement container, ABORTED (-100)
+  for (const dynamicAllocation of [false, true]) {
+    const run = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      jobType: 'wide-shuffle',
+      numExecutors: 2,
+      dynamicAllocation,
+      fault: 'exec-intentional-remove',
+    });
+    assertValidSimulatedRun(run, `exec-remove-da-${dynamicAllocation}`);
+    assert.equal(
+      run.events.some(e => e.label.includes('Exec-repl') || e.toInstance === 'exec-repl'),
+      false,
+      `exec-intentional-remove (DA=${dynamicAllocation}) must NOT allocate a bogus replacement container`,
+    );
+    const text = collectRunText(run);
+    assert.ok(text.includes('ABORTED') && text.includes('-100') && text.includes('exitCausedByApp=false'));
+    if (dynamicAllocation) {
+      assert.ok(text.includes('adjustTargetNumExecutors=false'));
+    }
+  }
+
+  // 2. ess-unavailable keeps worker executor JVMs alive
+  const essDown = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    jobType: 'wide-shuffle',
+    numExecutors: 4,
+    externalShuffleService: true,
+    fault: 'ess-unavailable',
+  });
+  assertValidSimulatedRun(essDown, 'ess-unavailable-alive');
+  const stoppedExecs = essDown.events.filter(e => e.label.startsWith('StopExecutor')).map(e => e.toInstance);
+  assert.deepEqual(
+    stoppedExecs,
+    ['exec-1', 'exec-2', 'exec-3', 'exec-4'],
+    'ess-unavailable must keep all worker executor JVMs alive through shutdown',
+  );
+  assert.ok(collectRunText(essDown).includes('spark.files.fetchFailure.unRegisterOutputOnHost'));
+
+  // 3. codegen-huge-method rejects cached-rdd and uses valid bytecode size < 65535 (9420 > 8000 INFO)
+  const badCodegen = validateSimulationConfig({
+    ...DEFAULT_SIMULATION_CONFIG,
+    jobType: 'cached-rdd',
+    fault: 'codegen-huge-method',
+  });
+  assert.equal(badCodegen.valid, false, 'codegen-huge-method must reject cached-rdd');
+  const fixedCodegen = resolveValidSimulationConfig({
+    ...DEFAULT_SIMULATION_CONFIG,
+    jobType: 'cached-rdd',
+    fault: 'codegen-huge-method',
+  });
+  assert.equal(fixedCodegen.jobType, 'wide-shuffle');
+  const cgRun = buildSimulatedRun(fixedCodegen);
+  assertValidSimulatedRun(cgRun, 'codegen-huge-method-valid');
+  const cgText = collectRunText(cgRun);
+  assert.ok(cgText.includes('9420') && cgText.includes('8000') && cgText.includes('INFO'));
+  assert.equal(cgText.includes('71420') || cgText.includes('71,420'), false);
+
+  // 4. multiple-spark-contexts: registered AM & active SC #1 before rejecting SC #2, never mentions allowMultipleContexts
+  for (const deployMode of ['cluster', 'client'] as const) {
+    const msc = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      deployMode,
+      fault: 'multiple-spark-contexts',
+    });
+    assertValidSimulatedRun(msc, `multi-sc-${deployMode}`);
+    assertAmRegistrationInvariant(msc, `multi-sc-${deployMode}`);
+    const regIdx = msc.events.findIndex(e => e.fromComponent === 'application-master' && e.toComponent === 'resource-manager' && e.label.includes('registerAM'));
+    const rejectIdx = msc.events.findIndex(e => e.stepId === 'sim-step-multi-sc');
+    const expectedUnregLabel = deployMode === 'cluster' ? 'unregisterAM(FAILED)' : 'unregisterAM(SUCCEEDED)';
+    const unregIdx = msc.events.findIndex(e => e.label === expectedUnregLabel);
+    assert.ok(regIdx >= 0 && rejectIdx > regIdx && unregIdx > rejectIdx, `${deployMode}: expected registerAM < reject < ${expectedUnregLabel}`);
+    const mscText = collectRunText(msc);
+    assert.ok(mscText.includes('_ensure_initialized') && mscText.includes('assertNoOtherContextIsRunning'));
+    assert.equal(mscText.includes('allowMultipleContexts'), false);
+  }
+
+  // 5. torrent-piece-corrupt fails task attempt with IOException and retries rather than continuing in-place
+  const tpc = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    jobType: 'broadcast-join',
+    dataProfile: 'small-dim',
+    numExecutors: 2,
+    fault: 'torrent-piece-corrupt',
+  });
+  assertValidSimulatedRun(tpc, 'torrent-piece-corrupt-retry');
+  const ioeIdx = tpc.events.findIndex(e => (e.command ?? '').includes('IOException') && e.stepId === 'sim-step-torrent-corrupt');
+  const taskFailIdx = tpc.events.findIndex(e => e.label === 'Task attempt 0 FAIL (IOE)');
+  const retryLaunchIdx = tpc.events.findIndex(e => e.label === 'LaunchTask (attempt 1)');
+  const cleanFetchIdx = tpc.events.findIndex(e => e.label === 'Retry piece1 OK (Driver)');
+  assert.ok(ioeIdx >= 0 && taskFailIdx > ioeIdx && retryLaunchIdx > taskFailIdx && cleanFetchIdx > retryLaunchIdx);
+});
+
+test('Astra regression: remaining YARN/Broadcast/DAG/RPC/Observability/PySpark precision fixes', () => {
+  // Item 5: yarn-app-kill uses Hadoop 3.4.1 AMLauncher.stopContainers -> am-nm (NEVER AM_SHUTDOWN) + worker NM :8031
+  for (const deployMode of ['cluster', 'client'] as const) {
+    const appKill = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, deployMode, fault: 'yarn-app-kill' });
+    assertValidSimulatedRun(appKill, `yarn-app-kill-${deployMode}`);
+    const killText = collectRunText(appKill);
+    assert.equal(killText.includes('AM_SHUTDOWN'), false, `yarn-app-kill (${deployMode}) must NEVER mention deprecated AM_SHUTDOWN`);
+    assert.equal(appKill.events.some(e => e.label.includes('KillApplication')), false);
+    assert.equal(
+      appKill.events.some(
+        e =>
+          e.fromInstance === 'resource-manager' &&
+          e.toInstance === 'am-nm' &&
+          e.protocol.includes('ContainerManagementProtocol') &&
+          (e.command ?? '').includes('stopContainers'),
+      ),
+      true,
+      `yarn-app-kill (${deployMode}) must stop AM via RM AMLauncher -> am-nm stopContainers`,
+    );
+    assert.equal(
+      appKill.events.some(
+        e => e.fromInstance === 'am-nm' && e.toInstance === 'application-master' && e.kind === 'local',
+      ),
+      true,
+      `yarn-app-kill (${deployMode}) must show am-nm stopping AM container locally`,
+    );
+    assert.equal(
+      appKill.events.some(e => e.fromInstance === 'resource-manager' && e.toComponent === 'node-manager' && e.port === 'rm01:8031'),
+      true,
+    );
+    assert.ok(killText.includes('-106') && killText.includes('-107') && killText.includes('AMLauncher'));
+  }
+  const yarnKillMeta = FAULT_MAP['yarn-app-kill'];
+  assert.equal(JSON.stringify(yarnKillMeta).includes('AM_SHUTDOWN'), false);
+
+  // sigterm-escalated-sigkill: never claims exit 143
+  const sigterm = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, fault: 'sigterm-escalated-sigkill' });
+  assert.equal(collectRunText(sigterm).includes('SIGTERM(143)'), false);
+  assert.equal(collectRunText(sigterm).includes('exit 143'), false);
+
+  // node-crash-power-loss: distinguishes no OS exit code from RM synthesized ABORTED (-100)
+  const ncText = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, fault: 'node-crash-power-loss' }));
+  assert.ok(ncText.includes('ABORTED') && ncText.includes('-100') && ncText.includes('NMLivelinessMonitor'));
+
+  // max-executor-failures: uses exit 1 (NOT -104 PMEM) and DA uses maxExecutors=6 -> 12
+  const mefDa = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, numExecutors: 2, dynamicAllocation: true, fault: 'max-executor-failures' });
+  const mefText = collectRunText(mefDa);
+  assert.ok(mefText.includes('exitStatus=1') && mefText.includes('12/12'));
+  assert.equal(mefText.includes('exitStatus=-104'), false);
+
+  // Item 6: all-nodes-excluded uses strict > check (3 > 2 per host, 6 total < global budget >= 8, queue default-node-label-expression=workers -> 2/2 RM cluster nodes)
+  const ane = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, fault: 'all-nodes-excluded' });
+  const aneText = collectRunText(ane);
+  assert.ok(aneText.includes('spark.yarn.executor.launch.excludeOnFailure.enabled=true'));
+  assert.ok(aneText.includes('default-node-label-expression=workers'));
+  assert.ok(aneText.includes('spark.yarn.am.nodeLabelExpression=am-nodes'));
+  assert.ok(aneText.includes('3 > 2') && aneText.includes('6 / 8') && aneText.includes('2/2 RM cluster nodes in label=workers'));
+  assert.ok(aneText.includes('amClient.getClusterNodeCount()=2'));
+  assert.equal(aneText.includes('failures=2/2'), false, 'all-nodes-excluded must use strict > (3 > 2), NOT 2/2');
+  assert.equal(aneText.includes('2 / 2 (excluded)'), false, 'all-nodes-excluded must NOT exclude on 2/2');
+  assert.equal(ane.events.some(e => e.fromInstance === 'nm-a' && e.toInstance === 'resource-manager' && e.label === 'worker-a fail (3>2, ex=1)'), true);
+  assert.equal(ane.events.some(e => e.fromInstance === 'nm-b' && e.toInstance === 'resource-manager' && e.label === 'worker-b fail (3>2, ex=1)'), true);
+
+  // Item 9: broadcast-over-8gb cites 357,913,941 ((1 << 29) / 1.5) and 512,000,000 (NEVER 341,333,333)
+  const b8g = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, jobType: 'broadcast-join', dataProfile: 'small-dim', fault: 'broadcast-over-8gb' }));
+  assert.ok(
+    b8g.includes('512,000,000') &&
+      b8g.includes('357,913,941') &&
+      b8g.includes('1 << 29') &&
+      b8g.includes('_LEGACY_ERROR_TEMP_2248') &&
+      b8g.includes('_LEGACY_ERROR_TEMP_2249'),
+  );
+  assert.equal(b8g.includes('341,333,333') || b8g.includes('341.3'), false, 'broadcast-over-8gb must NOT cite stale 341,333,333');
+  const b8gMeta = JSON.stringify(FAULT_MAP['broadcast-over-8gb']);
+  assert.ok(b8gMeta.includes('357,913,941') && b8gMeta.includes('512,000,000'));
+  assert.equal(b8gMeta.includes('341,333,333') || b8gMeta.includes('341.3'), false);
+
+  const bto = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, jobType: 'broadcast-join', dataProfile: 'small-dim', fault: 'broadcast-timeout' }));
+  assert.ok(bto.includes('cancelJobsWithTag') && bto.includes('relationFuture.cancel(true)'));
+
+  const boom = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, jobType: 'broadcast-join', dataProfile: 'small-dim', fault: 'broadcast-driver-oom' }));
+  assert.ok(boom.includes('_LEGACY_ERROR_TEMP_2250') && boom.includes('Not enough memory to build and broadcast the table to all worker nodes'));
+
+  // Item 10: indeterminate-stage-rollback cites spark.sql.shuffle.orderIndependentChecksum.enableFullRetryOnMismatch=false
+  const indet = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, fault: 'indeterminate-stage-rollback' }));
+  assert.ok(
+    indet.includes('checksumMismatchFullRetryEnabled') &&
+      indet.includes('spark.sql.shuffle.orderIndependentChecksum.enableFullRetryOnMismatch=false') &&
+      indet.includes('does NOT unset checksumMismatchFullRetryEnabled'),
+  );
+  const indetMeta = JSON.stringify(FAULT_MAP['indeterminate-stage-rollback']);
+  assert.ok(indetMeta.includes('spark.sql.shuffle.orderIndependentChecksum.enableFullRetryOnMismatch'));
+
+  // rpc-ask-timeout: timeout expires ON caller executor (worker-a), not inside driver
+  const rpcTo = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, fault: 'rpc-ask-timeout' });
+  const rpcExpireEv = rpcTo.events.find(e => e.label === 'RpcTimeoutException 120s');
+  assert.ok(rpcExpireEv && rpcExpireEv.fromInstance === 'exec-1/bm' && rpcExpireEv.toInstance === 'exec-1/bm');
+
+  // listener-bus-overflow: separate appStatus vs eventLog queues
+  const lbo = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, fault: 'listener-bus-overflow' }));
+  assert.ok(lbo.includes('queue.appStatus.numDroppedEvents=1420') && lbo.includes('queue.eventLog.numDroppedEvents=0'));
+
+  // python-daemon-stdout-corrupt: fails before any worker process spawned (no python-worker instance)
+  const pyDaemon = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, jobType: 'python-udf', fault: 'python-daemon-stdout-corrupt' });
+  assert.equal(Object.values(pyDaemon.instances).some(i => i.componentId === 'python-worker'), false);
+
+  // python-version-mismatch: split_index then python_version, error via report_init_response
+  const pyVer = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, jobType: 'python-udf', fault: 'python-version-mismatch' }));
+  assert.ok(pyVer.includes('split_index') && pyVer.includes('report_init_response'));
+
+  // python-idle-timeout: uses ProcessHandle.destroy()
+  const pyIdle = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, jobType: 'python-udf', fault: 'python-idle-timeout' }));
+  assert.ok(pyIdle.includes('ProcessHandle.destroy()'));
+  assert.equal(pyIdle.includes('destroyForcibly() -> retry'), false);
+
+  // all-executors-excluded: branches on dynamicAllocation
+  const exclOff = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, dynamicAllocation: false, fault: 'all-executors-excluded' }));
+  assert.ok(exclOff.includes('Immediate abort'));
+  const exclOn = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, dynamicAllocation: true, fault: 'all-executors-excluded' }));
+  assert.ok(exclOn.includes('unschedulableTaskSetTimeout') && exclOn.includes('120s'));
+
+  // jvm-heap-oom & closure-not-serializable cleanups
+  const heapText = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, fault: 'jvm-heap-oom' }));
+  assert.equal(heapText.includes('if hook hangs'), false);
+  const closText = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, fault: 'closure-not-serializable' }));
+  assert.equal(closText.includes('spark.closure.serializer') || closText.includes('Kryo'), false);
+});
+

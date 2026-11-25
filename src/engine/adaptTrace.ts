@@ -108,6 +108,10 @@ export function inferStepCategory(
     to === 'spark-ui' ||
     from === 'history-server' ||
     to === 'history-server' ||
+    from === 'metrics-system' ||
+    to === 'metrics-system' ||
+    from === 'executor-metrics-poller' ||
+    to === 'executor-metrics-poller' ||
     hay.includes('heartbeat')
   ) {
     return 'heartbeats-metrics';
@@ -166,6 +170,7 @@ const CLIENT_HOST_DRIVER_COMPONENTS = new Set<ComponentId>([
   'listener-bus',
   'event-log',
   'spark-ui',
+  'metrics-system',
 ]);
 
 function hostLabelForZone(zone: HostZoneId): string {

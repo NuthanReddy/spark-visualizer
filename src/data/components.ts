@@ -1292,7 +1292,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     docFile: 'rpc-env.md',
   },
 
-  // 6. Capacity & Observability (7)
+  // 6. Capacity & Observability (9)
   'executor-allocation-manager': {
     id: 'executor-allocation-manager',
     name: 'ExecutorAllocationManager',
@@ -1455,7 +1455,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'observability',
     hostZone: 'driver-jvm',
     subZone: 'OBSERVABILITY & LIVE UI',
-    clusterPos: [1554, 334],
+    clusterPos: [1554, 298],
     process: 'Driver JVM asynchronous event dispatcher (named AsyncEventQueue daemon threads)',
     role: 'Decouples scheduler threads from observers by offering posted SparkListenerEvents into isolated, bounded per-queue FIFOs (appStatus, eventLog, executorManagement, shared) for serial per-queue delivery.',
     keyDistinction:
@@ -1505,7 +1505,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'observability',
     hostZone: 'driver-jvm',
     subZone: 'OBSERVABILITY & LIVE UI',
-    clusterPos: [1554, 434],
+    clusterPos: [1554, 382],
     process: 'Driver JVM EventLoggingListener (eventLog queue) writing JSONL files to shared storage',
     role: 'Serializes selected SparkListenerEvents via JsonProtocol as UTF-8 JSON lines (optionally compressed and rolled into eventlog_v2 segments) to shared HDFS/filesystem storage for offline History Server replay.',
     keyDistinction:
@@ -1556,7 +1556,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'observability',
     hostZone: 'driver-jvm',
     subZone: 'OBSERVABILITY & LIVE UI',
-    clusterPos: [1554, 534],
+    clusterPos: [1554, 466],
     port: ':4040',
     process: 'Embedded Jetty HTTP server + AppStatusStore inside the driver JVM',
     role: 'Serves live web tabs (Jobs, Stages, Storage, Environment, Executors, SQL) and /api/v1 REST endpoints directly from the driver in-memory/local KV AppStatusStore updated by AppStatusListener and SQLAppStatusListener.',
@@ -1649,6 +1649,111 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
       },
     ],
     docFile: 'history-server.md',
+  },
+
+  'metrics-system': {
+    id: 'metrics-system',
+    name: 'Dropwizard MetricsSystem',
+    shortName: 'MetricsSystem',
+    subsystem: 'observability',
+    hostZone: 'driver-jvm',
+    subZone: 'OBSERVABILITY & LIVE UI',
+    clusterPos: [1554, 550],
+    port: '/metrics/*',
+    process: 'Per-JVM Dropwizard MetricRegistry engine (driver, each executor, and YARN ApplicationMaster)',
+    role: 'Instantiates a per-JVM Dropwizard MetricRegistry via MetricsSystem.createMetricsSystem(instance, conf), loads metrics.properties sources and sinks, registers internal Spark Sources (DAGSchedulerSource, BlockManagerSource, ExecutorMetricsSource, ApplicationMasterSource), runs periodic Sink reporters, and exposes /metrics/json and /metrics/prometheus servlets on SparkUI.',
+    keyDistinction:
+      'MetricsSystem is a live Dropwizard push/scrape telemetry plane running independently inside every Spark JVM (driver, executors, AM) with its own sinks—completely separate from LiveListenerBus, AppStatusStore, and offline History Server event logs.',
+    startedBy: 'SparkEnv.create (driver defers start() until SparkContext gets appId; executors start immediately after setting spark.executor.id) and ApplicationMaster.createAllocator (start(false))',
+    monitoredBy: 'Configured Dropwizard Sinks (JmxSink, GraphiteSink, CsvSink, Slf4jSink), Prometheus scrapers on /metrics/prometheus, and /metrics/json probes',
+    stoppedBy: 'SparkContext.stop() (report() flush) then SparkEnv.stop() calling metricsSystem.stop(), and ApplicationMaster shutdown',
+    inputs: [
+      'metrics.properties / spark.metrics.conf.* sink & source definitions keyed by instance (driver, executor, applicationMaster, *)',
+      'registerSource(Source) calls from SparkContext (DAGSchedulerSource, BlockManagerSource, LiveListenerBusMetrics), Executor (ExecutorMetricsSource), and ApplicationMaster (ApplicationMasterSource)',
+      'Periodic Sink reporter timers and HTTP GET scrapes to /metrics/json or /metrics/prometheus',
+    ],
+    outputs: [
+      'Namespaced Dropwizard MetricRegistry gauges, counters, timers, and histograms (<appId>.<execId>.<sourceName>)',
+      'ServletContextHandlers returned by getServletHandlers and mounted on SparkUI Jetty :4040',
+      'Periodic push exports to external TSDBs (Graphite, JMX, CSV, SLF4J) and final report() flush on stop',
+    ],
+    internalState: [
+      'Per-JVM com.codahale.metrics.MetricRegistry, sources ArrayBuffer[Source], and sinks ArrayBuffer[Sink]',
+      'Special UI-attached servlet handles: metricsServlet (/metrics/json) and prometheusServlet (/metrics/prometheus)',
+      'running lifecycle flag guarding getServletHandlers, start(), report(), and registry cleanup in stop()',
+    ],
+    failureClues: [
+      'Calling getServletHandlers before start() throws IllegalArgumentException; driver defers start() so spark.app.id prefixes registry names',
+      'Executor Dropwizard sinks report directly from each worker JVM—Prometheus scraping only driver :4040 will not see executor-only sources unless configured or proxied',
+      'MetricsSystem time-series vanish with the JVM and are never replayed by History Server (unlike HDFS event logs)',
+    ],
+    sourceLinks: [
+      {
+        label: 'MetricsSystem lifecycle, servlets & report',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/metrics/MetricsSystem.scala#L68-L120',
+      },
+      {
+        label: 'SparkEnv driver vs executor MetricsSystem startup',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/SparkEnv.scala#L825-L840',
+      },
+      {
+        label: 'ApplicationMaster MetricsSystem & AM source',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/ApplicationMaster.scala#L485-L495',
+      },
+    ],
+    docFile: 'metrics-system.md',
+  },
+
+  'executor-metrics-poller': {
+    id: 'executor-metrics-poller',
+    name: 'ExecutorMetricsPoller',
+    shortName: 'ExecMetricsPoller',
+    subsystem: 'observability',
+    hostZone: 'worker-node-b',
+    clusterPos: [1652, 950],
+    port: 'in-JVM poll',
+    process: 'Per-executor JVM sampler (ExecutorMetricsPoller + ExecutorMetricsSource)',
+    role: 'Samples live JVM heap/off-heap, direct/mapped buffer, UnifiedMemoryManager, and optional Linux /proc process-tree metrics via ExecutorMetrics.getCurrentMetrics(memoryManager), maintains atomic per-stage (stageTCMP) and per-task (taskMetricPeaks) high-water marks, updates ExecutorMetricsSource Dropwizard gauges, and drains stage peaks into Executor.reportHeartBeat().',
+    keyDistinction:
+      'One poll() feeds two separate observability pipelines: locally updating ExecutorMetricsSource gauges in the executor MetricsSystem, while also shipping per-stage peak deltas over Heartbeat RPC (and per-task peaks in TaskResult) for driver SparkUI and EventLoggingListener.',
+    startedBy: 'Executor construction creates metricsPoller and calls metricsPoller.start() (spawns executor-metrics-poller daemon thread when spark.executor.metrics.pollingInterval > 0; otherwise polled synchronously in reportHeartBeat)',
+    monitoredBy: 'Executor.reportHeartBeat() calling getExecutorUpdates(), TaskRunner calling getTaskMetricPeaks(taskId), and ExecutorMetricsSource Dropwizard gauges',
+    stoppedBy: 'Executor.stop() calling metricsPoller.stop() (shuts down scheduled executor with 10s awaitTermination)',
+    inputs: [
+      'TaskRunner lifecycle hooks: onTaskStart(taskId, stageId, stageAttemptId) and onTaskCompletion(...)',
+      'ExecutorMetrics.getCurrentMetrics(memoryManager) reading JVM MXBeans, UnifiedMemoryManager, and optional /proc RSS',
+      'Scheduled polling ticks (spark.executor.metrics.pollingInterval) or heartbeat-driven poll() calls',
+    ],
+    outputs: [
+      'ExecutorMetricsSource.updateMetricsSnapshot(latestMetrics) refreshing Dropwizard ExecutorMetrics gauges',
+      'getExecutorUpdates() returning per-(stageId, stageAttemptId) ExecutorMetrics peak deltas for Heartbeat RPC',
+      'getTaskMetricPeaks(taskId) Array[Long] embedded in TaskResult / TaskFailedReason for short tasks',
+    ],
+    internalState: [
+      'stageTCMP: ConcurrentHashMap[(stageId, stageAttemptId), TCMP(count, AtomicLongArray peaks)]',
+      'taskMetricPeaks: ConcurrentHashMap[Long, AtomicLongArray] tracking lock-free math.max per-task peaks',
+      'Optional ScheduledExecutorService ("executor-metrics-poller") and ExecutorMetricsSource volatile metricsSnapshot',
+    ],
+    failureClues: [
+      'Zeroed stage memory peaks for very short tasks indicate default heartbeat-only polling (pollingInterval=0) missed brief spikes; lower spark.executor.metrics.pollingInterval',
+      'Missing ProcessTree* RSS metrics requires Linux /proc plus spark.executor.processTreeMetrics.enabled=true',
+      'getExecutorUpdates() resets stageTCMP peak arrays after every heartbeat and prunes entries whose task count reached zero',
+    ],
+    sourceLinks: [
+      {
+        label: 'ExecutorMetricsPoller stageTCMP, taskMetricPeaks & poll',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/executor/ExecutorMetricsPoller.scala#L49-L150',
+      },
+      {
+        label: 'ExecutorMetricsSource Dropwizard snapshot gauges',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/executor/ExecutorMetricsSource.scala#L35-L66',
+      },
+      {
+        label: 'Executor.reportHeartBeat polling & Heartbeat dispatch',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/executor/Executor.scala#L1544-L1590',
+      },
+    ],
+    docFile: 'executor-metrics-poller.md',
   },
 
   // 7. Block Storage (5)

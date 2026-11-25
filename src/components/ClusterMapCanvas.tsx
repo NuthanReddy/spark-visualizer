@@ -280,7 +280,7 @@ export default function ClusterMapCanvas({
     }
   };
 
-  // Compute safe card dimensions from actual clusterPos spacings so 54 cards never overlap
+  // Compute safe card dimensions from actual clusterPos spacings so cards never overlap
   const { cardW, cardH } = useMemo(() => {
     let minSameRowDx = 190;
     let minSameColDy = 60;
@@ -680,7 +680,7 @@ export default function ClusterMapCanvas({
           type="button"
           style={hudBtnStyle}
           onClick={handleResetView}
-          title="Reset pan and zoom to show all 54 components"
+          title={`Reset pan and zoom to show all ${COMPONENT_LIST.length} components`}
         >
           Reset view
         </button>
@@ -692,7 +692,7 @@ export default function ClusterMapCanvas({
         viewBox={`${vx.toFixed(1)} ${vy.toFixed(1)} ${vw.toFixed(1)} ${vh.toFixed(1)}`}
         preserveAspectRatio="xMidYMid meet"
         role="group"
-        aria-label={`All-54 PySpark-on-YARN cluster architecture map for ${run.name}`}
+        aria-label={`All-${COMPONENT_LIST.length} PySpark-on-YARN cluster architecture map for ${run.name}`}
         data-event-id={activeEventId ?? ''}
         data-progress={progress}
         onPointerDown={handlePointerDown}
@@ -947,7 +947,7 @@ export default function ClusterMapCanvas({
           })}
         </g>
 
-        {/* All 54 Components */}
+        {/* All Components */}
         <g className="sv-map-nodes">
           {COMPONENT_LIST.map((spec) => {
             const [cx, cy] = spec.clusterPos;
@@ -1128,7 +1128,7 @@ export default function ClusterMapCanvas({
           })}
         </g>
 
-        {/* Active Glowing Trail across the 54-node map */}
+        {/* Active Glowing Trail across the cluster map */}
         {activeEvent && activeRoute && packetState && (
           <g
             className="sv-map-active-trail"
@@ -1401,7 +1401,7 @@ export default function ClusterMapCanvas({
             letterSpacing="0.08em"
             fontFamily="var(--font-mono, 'IBM Plex Mono', ui-monospace, monospace)"
           >
-            ALL-54 CLUSTER MAP {'\u00B7'} DRAG TO PAN {'\u00B7'} CTRL+SCROLL OR BUTTONS TO ZOOM {'\u00B7'} CLICK ANY COMPONENT TO INSPECT
+            {`ALL-${COMPONENT_LIST.length} CLUSTER MAP \u00B7 DRAG TO PAN \u00B7 CTRL+SCROLL OR BUTTONS TO ZOOM \u00B7 CLICK ANY COMPONENT TO INSPECT`}
           </text>
           <text
             x={MASTER_CANVAS.width - 24}

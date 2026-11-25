@@ -1,3 +1,33 @@
+import {
+  FAULT_CATEGORIES,
+  FAULT_CATEGORY_MAP,
+  FAULT_MAP,
+  FAULTS_BY_CATEGORY,
+  SIMULATED_FAULTS,
+} from './faultCatalog.ts';
+import type {
+  FaultCategoryId,
+  FaultCategoryMeta,
+  FaultMeta,
+  FaultRequirements,
+  SimulatedFault,
+} from './faultCatalog.ts';
+
+export {
+  FAULT_CATEGORIES,
+  FAULT_CATEGORY_MAP,
+  FAULT_MAP,
+  FAULTS_BY_CATEGORY,
+  SIMULATED_FAULTS,
+};
+export type {
+  FaultCategoryId,
+  FaultCategoryMeta,
+  FaultMeta,
+  FaultRequirements,
+  SimulatedFault,
+};
+
 export type SimulatedJobType =
   | 'narrow-filter'
   | 'wide-shuffle'
@@ -13,21 +43,6 @@ export type SimulatedDataProfile =
   | 'small-dim'
   | 'large-result'
   | 'corrupt-record';
-
-export type SimulatedFault =
-  | 'none'
-  | 'oversized-request'
-  | 'am-sc-timeout'
-  | 'oom-pmem'
-  | 'yarn-preemption'
-  | 'shuffle-fetch-failed'
-  | 'task-exception'
-  | 'heartbeat-timeout'
-  | 'am-crash-retry'
-  | 'client-disconnect'
-  | 'commit-job-failure'
-  | 'max-result-size'
-  | 'speculation-race';
 
 export type PythonUdfMode = 'pickled' | 'arrow';
 
@@ -54,6 +69,9 @@ export interface JobTypeMeta {
   hasShuffle: boolean;
   hasFileCommit: boolean;
   hasCollect: boolean;
+  hasBroadcast: boolean;
+  hasPythonUdf: boolean;
+  hasSqlCodegen: boolean;
   summary: string;
   defaultDataProfile: SimulatedDataProfile;
 }
@@ -63,14 +81,6 @@ export interface DataProfileMeta {
   label: string;
   short: string;
   description: string;
-}
-
-export interface FaultMeta {
-  id: SimulatedFault;
-  label: string;
-  short: string;
-  severity: 'ok' | 'recoverable' | 'terminal';
-  triggerSummary: string;
 }
 
 export interface SimulationValidationIssue {
@@ -115,6 +125,9 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasShuffle: false,
     hasFileCommit: true,
     hasCollect: false,
+    hasBroadcast: false,
+    hasPythonUdf: false,
+    hasSqlCodegen: true,
     summary: 'Single ResultStage pipelining HDFS scan, predicate filter, and Parquet write with 0 shuffle exchanges.',
     defaultDataProfile: 'uniform',
   },
@@ -126,6 +139,9 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasShuffle: true,
     hasFileCommit: true,
     hasCollect: false,
+    hasBroadcast: false,
+    hasPythonUdf: false,
+    hasSqlCodegen: true,
     summary: 'Two stages separated by 1 ShuffleDependency: map writes .data/.index, reducers fetch remote shuffle slices.',
     defaultDataProfile: 'uniform',
   },
@@ -137,6 +153,9 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasShuffle: false,
     hasFileCommit: true,
     hasCollect: false,
+    hasBroadcast: true,
+    hasPythonUdf: false,
+    hasSqlCodegen: true,
     summary: 'Driver builds HashedRelation, TorrentBroadcast distributes 4 MiB pieces, streamed fact table probes with 0 large shuffle.',
     defaultDataProfile: 'small-dim',
   },
@@ -148,6 +167,9 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasShuffle: true,
     hasFileCommit: true,
     hasCollect: false,
+    hasBroadcast: false,
+    hasPythonUdf: false,
+    hasSqlCodegen: true,
     summary: 'Two materialized shuffle stages; when AQE is ON and skew exceeds both 5x median & 256 MiB, OptimizeSkewedJoin splits into PartialReducerPartitionSpec.',
     defaultDataProfile: 'skewed',
   },
@@ -159,6 +181,9 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasShuffle: false,
     hasFileCommit: true,
     hasCollect: false,
+    hasBroadcast: false,
+    hasPythonUdf: true,
+    hasSqlCodegen: true,
     summary: 'Extracts scalar PythonUDF into EvalPythonExec; executors stream batches over local sockets to pyspark.daemon workers.',
     defaultDataProfile: 'uniform',
   },
@@ -170,6 +195,9 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasShuffle: false,
     hasFileCommit: false,
     hasCollect: false,
+    hasBroadcast: false,
+    hasPythonUdf: false,
+    hasSqlCodegen: false,
     summary: 'Action 1 computes and caches partitions in executor MemoryStore (MEMORY_ONLY); Action 2 reads cache hits or recomputes evicted partitions via RDD.getOrCompute.',
     defaultDataProfile: 'uniform',
   },
@@ -181,6 +209,9 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasShuffle: false,
     hasFileCommit: false,
     hasCollect: true,
+    hasBroadcast: false,
+    hasPythonUdf: false,
+    hasSqlCodegen: true,
     summary: 'Gathers partition arrays back to driver via direct StatusUpdate or IndirectTaskResult (TaskResultBlock), guarded by spark.driver.maxResultSize.',
     defaultDataProfile: 'large-result',
   },
@@ -219,107 +250,9 @@ export const SIMULATED_DATA_PROFILES: DataProfileMeta[] = [
   },
 ];
 
-export const SIMULATED_FAULTS: FaultMeta[] = [
-  {
-    id: 'none',
-    label: 'None (Happy Path)',
-    short: 'None',
-    severity: 'ok',
-    triggerSummary: 'All stages, transfers, and cleanup succeed normally.',
-  },
-  {
-    id: 'oversized-request',
-    label: 'Pre-Submit Container Limit Exceeded',
-    short: 'Oversized Request',
-    severity: 'terminal',
-    triggerSummary: 'Client.verifyClusterResources throws BEFORE submitApplication() after querying RM max capability.',
-  },
-  {
-    id: 'am-sc-timeout',
-    label: 'AM SparkContext Init Timeout (100s)',
-    short: 'AM SC Timeout',
-    severity: 'terminal',
-    triggerSummary: 'Cluster-mode orders.py stalls before getOrCreate(); AM exits locally with EXIT_SC_NOT_INITED (13) without registering with RM.',
-  },
-  {
-    id: 'oom-pmem',
-    label: 'YARN Physical Memory Kill (PMEM / -104)',
-    short: 'YARN PMEM (-104)',
-    severity: 'recoverable',
-    triggerSummary: 'NM kills executor for exceeding container RSS (KILLED_EXCEEDED_PMEM=-104; exitCausedByApp=true; counts toward task failures).',
-  },
-  {
-    id: 'yarn-preemption',
-    label: 'YARN Container Preemption (PREEMPTED)',
-    short: 'YARN Preemption',
-    severity: 'recoverable',
-    triggerSummary: 'YARN reclaims a healthy executor (exitCausedByApp=false; retried without charging task failure budget).',
-  },
-  {
-    id: 'shuffle-fetch-failed',
-    label: 'Shuffle FetchFailed (Lost Producer / Block)',
-    short: 'FetchFailed',
-    severity: 'recoverable',
-    triggerSummary: 'Tests ESS ON (producer exit survives via :7337) vs ESS OFF (FetchFailed -> invalidate -> rerun map -> retry stage).',
-  },
-  {
-    id: 'task-exception',
-    label: 'Deterministic Task Exception (maxFailures=4)',
-    short: 'Task Exception',
-    severity: 'terminal',
-    triggerSummary: 'Same partition fails 4 counted attempts on TaskSetManager -> aborts TaskSet and fails job.',
-  },
-  {
-    id: 'heartbeat-timeout',
-    label: 'Executor Heartbeat Timeout (120s)',
-    short: 'Heartbeat Timeout',
-    severity: 'recoverable',
-    triggerSummary: 'HeartbeatReceiver.expireDeadHosts triggers killAndReplaceExecutor + RemoveExecutor independently of YARN NM.',
-  },
-  {
-    id: 'am-crash-retry',
-    label: 'Cluster-Mode AM Crash -> Attempt 2 Restart',
-    short: 'AM Crash Retry',
-    severity: 'recoverable',
-    triggerSummary: 'AM Attempt 1 dies; YARN spawns Attempt 2 with a fresh driver rerunning orders.py from line 1.',
-  },
-  {
-    id: 'client-disconnect',
-    label: 'Client-Mode External Driver Disconnect',
-    short: 'Client Disconnect',
-    severity: 'terminal',
-    triggerSummary: 'External driver on edge-01 dies; AM onDisconnected runs (default SUCCEEDED vs clientModeTreatDisconnectAsFailed=true).',
-  },
-  {
-    id: 'commit-job-failure',
-    label: 'V1 commitJob Failure After All Tasks Succeed',
-    short: 'commitJob Fail',
-    severity: 'terminal',
-    triggerSummary: 'All output tasks commit cleanly, then driver commitJob throws -> FileFormatWriter invokes best-effort abortJob.',
-  },
-  {
-    id: 'max-result-size',
-    label: 'collect() Exceeds spark.driver.maxResultSize',
-    short: 'maxResultSize Abort',
-    severity: 'terminal',
-    triggerSummary: 'IndirectTaskResult transport succeeds individually, but cumulative size exceeds 512 MiB -> TaskSetManager aborts.',
-  },
-  {
-    id: 'speculation-race',
-    label: 'Speculative Copy + OutputCommitCoordinator Race',
-    short: 'Speculation Race',
-    severity: 'recoverable',
-    triggerSummary: 'Speculative Attempt 1 wins canCommit; Attempt 0 gets TaskCommitDenied (not charged to task failures).',
-  },
-];
-
 export const JOB_TYPE_MAP: Record<SimulatedJobType, JobTypeMeta> = Object.fromEntries(
-  SIMULATED_JOBS.map(j => [j.id, j]),
+  SIMULATED_JOBS.map((j) => [j.id, j]),
 ) as Record<SimulatedJobType, JobTypeMeta>;
-
-export const FAULT_MAP: Record<SimulatedFault, FaultMeta> = Object.fromEntries(
-  SIMULATED_FAULTS.map(f => [f.id, f]),
-) as Record<SimulatedFault, FaultMeta>;
 
 export const SIMULATION_PRESETS: SimulationPreset[] = [
   {
@@ -370,71 +303,133 @@ export const SIMULATION_PRESETS: SimulationPreset[] = [
     badge: 'LIMIT',
     config: { ...DEFAULT_SIMULATION_CONFIG, jobType: 'collect-action', dataProfile: 'large-result', numExecutors: 3, fault: 'max-result-size' },
   },
+  {
+    id: 'preset-kernel-oom',
+    label: 'Kernel Node OOM (SIGKILL 137)',
+    badge: 'SIGKILL 137',
+    config: { ...DEFAULT_SIMULATION_CONFIG, jobType: 'wide-shuffle', numExecutors: 3, fault: 'kernel-node-oom' },
+  },
+  {
+    id: 'preset-jvm-heap-oom',
+    label: 'JVM Heap OOM (Exit 52 != 137)',
+    badge: 'EXIT 52',
+    config: { ...DEFAULT_SIMULATION_CONFIG, jobType: 'wide-shuffle', numExecutors: 3, fault: 'jvm-heap-oom' },
+  },
+  {
+    id: 'preset-sigterm-sigkill',
+    label: 'SIGTERM -> SIGKILL Escalation',
+    badge: 'TERM -> 137',
+    config: { ...DEFAULT_SIMULATION_CONFIG, jobType: 'wide-shuffle', numExecutors: 3, fault: 'sigterm-escalated-sigkill' },
+  },
+  {
+    id: 'preset-broadcast-8gb',
+    label: 'Broadcast > 8 GiB Guard',
+    badge: '8 GiB LIMIT',
+    config: { ...DEFAULT_SIMULATION_CONFIG, jobType: 'broadcast-join', dataProfile: 'small-dim', numExecutors: 3, fault: 'broadcast-over-8gb' },
+  },
 ];
 
 export function validateSimulationConfig(config: SimulationConfig): SimulationValidation {
   const job = JOB_TYPE_MAP[config.jobType];
+  const fault = FAULT_MAP[config.fault];
+  const req = fault.requires;
   const blockers: SimulationValidationIssue[] = [];
   const notes: string[] = [];
 
-  if (config.fault === 'shuffle-fetch-failed' && !job.hasShuffle) {
-    blockers.push({
-      field: 'fault',
-      reason: `${job.short} has no ShuffleDependency; switch to Shuffle Aggregation or Skewed SMJ to trigger FetchFailed.`,
-      suggestedPatch: { jobType: 'wide-shuffle' },
-    });
-  }
-  if (config.fault === 'shuffle-fetch-failed' && config.numExecutors < 2) {
-    blockers.push({
-      field: 'numExecutors',
-      reason: 'Remote shuffle FetchFailed + surviving-host recomputation requires >= 2 executors.',
-      suggestedPatch: { numExecutors: 2 },
-    });
-  }
-  if (config.fault === 'commit-job-failure' && !job.hasFileCommit) {
-    blockers.push({
-      field: 'fault',
-      reason: `${job.short} does not run a V1 file commit; switch to a Parquet write job to simulate commitJob failure.`,
-      suggestedPatch: { jobType: 'wide-shuffle' },
-    });
-  }
-  if (config.fault === 'speculation-race' && !job.hasFileCommit) {
-    blockers.push({
-      field: 'fault',
-      reason: `OutputCommitCoordinator.canCommit applies to file-output commits; switch to a Parquet write job.`,
-      suggestedPatch: { jobType: 'narrow-filter' },
-    });
-  }
-  if (config.fault === 'speculation-race' && config.numExecutors < 2) {
-    blockers.push({
-      field: 'numExecutors',
-      reason: 'Spark TaskSetManager excludes hosts that already ran the speculative task; requires >= 2 executors.',
-      suggestedPatch: { numExecutors: 2 },
-    });
-  }
-  if (config.fault === 'max-result-size' && !job.hasCollect) {
-    blockers.push({
-      field: 'fault',
-      reason: `spark.driver.maxResultSize aborts result-gathering actions like collect(), not executor-to-HDFS writes.`,
-      suggestedPatch: { jobType: 'collect-action', dataProfile: 'large-result' },
-    });
-  }
-  if (
-    (config.fault === 'am-sc-timeout' || config.fault === 'am-crash-retry') &&
-    config.deployMode !== 'cluster'
-  ) {
-    blockers.push({
-      field: 'deployMode',
-      reason: `${FAULT_MAP[config.fault].short} applies to cluster mode where the driver runs inside the AM container.`,
-      suggestedPatch: { deployMode: 'cluster' },
-    });
-  }
-  if (config.fault === 'client-disconnect' && config.deployMode !== 'client') {
-    blockers.push({
-      field: 'deployMode',
-      reason: `Client-mode driver disconnect requires deployMode = client (external driver on edge-01).`,
-      suggestedPatch: { deployMode: 'client' },
-    });
+  if (req) {
+    if (req.shuffle && !job.hasShuffle) {
+      blockers.push({
+        field: 'fault',
+        reason: `${job.short} has no ShuffleDependency; switch to Shuffle Aggregation or Skewed SMJ to trigger ${fault.short}.`,
+        suggestedPatch: { jobType: 'wide-shuffle' },
+      });
+    }
+    if (req.fileCommit && !job.hasFileCommit) {
+      blockers.push({
+        field: 'fault',
+        reason: `${job.short} does not run a file-output commit; switch to a Parquet write job to trigger ${fault.short}.`,
+        suggestedPatch: {
+          jobType: config.fault === 'speculation-race' ? 'narrow-filter' : 'wide-shuffle',
+        },
+      });
+    }
+    if (req.collect && !job.hasCollect) {
+      blockers.push({
+        field: 'fault',
+        reason: `${fault.short} applies to driver result-gathering actions like collect(), not executor-to-HDFS writes.`,
+        suggestedPatch: { jobType: 'collect-action', dataProfile: 'large-result' },
+      });
+    }
+    if (req.broadcast && !job.hasBroadcast) {
+      blockers.push({
+        field: 'fault',
+        reason: `${job.short} has no BroadcastExchangeExec / TorrentBroadcast; switch to Broadcast Join to trigger ${fault.short}.`,
+        suggestedPatch: { jobType: 'broadcast-join', dataProfile: 'small-dim' },
+      });
+    }
+    if (req.pythonUdf && !job.hasPythonUdf) {
+      blockers.push({
+        field: 'fault',
+        reason: `${job.short} does not spawn pyspark.daemon / Python workers; switch to Python UDF to trigger ${fault.short}.`,
+        suggestedPatch: { jobType: 'python-udf', dataProfile: 'uniform' },
+      });
+    }
+    if (req.sqlCodegen && !job.hasSqlCodegen) {
+      blockers.push({
+        field: 'fault',
+        reason: `${job.short} uses the RDD API rather than Catalyst WholeStageCodegenExec; switch to a SQL DataFrame job to trigger ${fault.short}.`,
+        suggestedPatch: { jobType: 'wide-shuffle', dataProfile: 'uniform' },
+      });
+    }
+    if (req.clusterMode && config.deployMode !== 'cluster') {
+      blockers.push({
+        field: 'deployMode',
+        reason: `${fault.short} applies to cluster mode where the driver runs inside the AM container.`,
+        suggestedPatch: { deployMode: 'cluster' },
+      });
+    }
+    if (req.clientMode && config.deployMode !== 'client') {
+      blockers.push({
+        field: 'deployMode',
+        reason: `${fault.short} requires deployMode = client (external driver on edge-01 / yarn-client AM).`,
+        suggestedPatch: { deployMode: 'client' },
+      });
+    }
+    if (req.minExecutors !== undefined && config.numExecutors < req.minExecutors) {
+      blockers.push({
+        field: 'numExecutors',
+        reason: `${fault.short} requires >= ${req.minExecutors} executors for peer or surviving-host execution.`,
+        suggestedPatch: { numExecutors: req.minExecutors },
+      });
+    }
+    if (req.essEnabled === true && !config.externalShuffleService) {
+      blockers.push({
+        field: 'externalShuffleService',
+        reason: `${fault.short} requires External Shuffle Service (:7337) to be enabled.`,
+        suggestedPatch: { externalShuffleService: true },
+      });
+    }
+    if (req.essEnabled === false && config.externalShuffleService) {
+      blockers.push({
+        field: 'externalShuffleService',
+        reason: `${fault.short} requires External Shuffle Service (:7337) to be disabled (with shuffle tracking, decommission shuffle fallback, and reliable ShuffleDataIO storage also off) so ExecutorAllocationManager rejects startup.`,
+        suggestedPatch: { externalShuffleService: false },
+      });
+    }
+    if (req.dynamicAllocation === true && !config.dynamicAllocation) {
+      blockers.push({
+        field: 'dynamicAllocation',
+        reason: `${fault.short} requires spark.dynamicAllocation.enabled = true.`,
+        suggestedPatch: { dynamicAllocation: true },
+      });
+    }
+    if (req.dynamicAllocation === false && config.dynamicAllocation) {
+      blockers.push({
+        field: 'dynamicAllocation',
+        reason: `${fault.short} requires spark.dynamicAllocation.enabled = false.`,
+        suggestedPatch: { dynamicAllocation: false },
+      });
+    }
   }
 
   // Nuanced behavioral notes (valid combinations with important Spark semantics)
@@ -460,6 +455,21 @@ export function validateSimulationConfig(config: SimulationConfig): SimulationVa
   if (config.dynamicAllocation) {
     notes.push(
       `Dynamic allocation ON: ${config.numExecutors} is the initial executor target (ramps up on pending task backlog, scales down on idle timeout).`,
+    );
+  }
+  if (config.fault === 'exec-intentional-remove' && !config.dynamicAllocation) {
+    notes.push(
+      'Dynamic allocation is OFF: simulates explicit SparkContext.killExecutors -> YarnAllocator.internalReleaseContainer -> YARN ContainerExitStatus.ABORTED (-100), Spark exitCausedByApp=false, while surviving executor(s) finish the job.',
+    );
+  }
+  if (config.fault === 'jvm-heap-oom') {
+    notes.push(
+      'Distinction: Java heap OutOfMemoryError exits via SparkUncaughtExceptionHandler calling System.exit(52) (or Runtime.halt(52) if the handler itself hits OOM), not SIGKILL 137 / YARN -104.',
+    );
+  }
+  if (config.fault === 'node-crash-power-loss') {
+    notes.push(
+      'Distinction: Hard worker node crash leaves NO OS process exit code (not 137 or 52); RM NMLivelinessMonitor (:8031) later synthesizes ContainerExitStatus.ABORTED (-100, exitCausedByApp=false).',
     );
   }
 

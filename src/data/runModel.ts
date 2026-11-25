@@ -219,7 +219,7 @@ export interface RunEvent {
   senderState?: string;
   receiverState?: string;
   isError?: boolean;
-  /** Shown on All-54 map when two distinct runtime instances share the same ComponentId (e.g. 'E1 -> E2'). */
+  /** Shown on All-components map when two distinct runtime instances share the same ComponentId (e.g. 'E1 -> E2'). */
   peerTag?: string;
 }
 

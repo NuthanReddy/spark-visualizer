@@ -7,14 +7,17 @@ import {
   COMPONENT_TRACE_BY_ID,
   LIFECYCLE_TRACES,
   SCENARIO_TRACES,
+  TRACE_BY_ID,
 } from '../src/data/traces.ts';
 import { HOST_ZONES, MASTER_CANVAS } from '../src/data/types.ts';
+import { adaptTraceToRun, inferStepCategory } from '../src/engine/adaptTrace.ts';
+import { computePeerInteractions } from '../src/engine/peerInteractions.ts';
 import { advanceTimeline, buildEdgeCurve, MESSAGE_DURATION_MS } from '../src/playback.ts';
 
-test('catalog defines all 54 components with non-overlapping Master Canvas coordinates', () => {
-  assert.equal(COMPONENT_LIST.length, 54);
+test('catalog defines all 56 components with non-overlapping Master Canvas coordinates', () => {
+  assert.equal(COMPONENT_LIST.length, 56);
   const ids = new Set(COMPONENT_LIST.map(c => c.id));
-  assert.equal(ids.size, 54);
+  assert.equal(ids.size, 56);
 
   for (const comp of COMPONENT_LIST) {
     const [x, y] = comp.clusterPos;
@@ -53,11 +56,11 @@ test('catalog defines all 54 components with non-overlapping Master Canvas coord
   }
 });
 
-test('traces cover 6 lifecycle flows, 20 scenarios, and all 54 components', () => {
-  assert.equal(LIFECYCLE_TRACES.length, 6);
+test('traces cover 7 lifecycle flows, 20 scenarios, and all 56 components', () => {
+  assert.equal(LIFECYCLE_TRACES.length, 7);
   assert.equal(SCENARIO_TRACES.length, 20);
-  assert.equal(COMPONENT_TRACES.length, 54);
-  assert.equal(ALL_TRACES.length, 80);
+  assert.equal(COMPONENT_TRACES.length, 56);
+  assert.equal(ALL_TRACES.length, 83);
 
   const scenarioNums = SCENARIO_TRACES.map(t => t.scenarioNumber).sort((a, b) => (a ?? 0) - (b ?? 0));
   assert.deepEqual(
@@ -119,4 +122,58 @@ test('playback clock and curve sampler behave deterministically', () => {
   const loop = buildEdgeCurve([200, 200], [200, 200]);
   assert.ok(loop.path.includes('A '));
   assert.ok(loop.midpoint[1] < 200);
+});
+
+test('observability components, traces, categories, and peer interactions are wired cleanly', () => {
+  assert.deepEqual(COMPONENTS['listener-bus'].clusterPos, [1554, 298]);
+  assert.deepEqual(COMPONENTS['event-log'].clusterPos, [1554, 382]);
+  assert.deepEqual(COMPONENTS['spark-ui'].clusterPos, [1554, 466]);
+  assert.deepEqual(COMPONENTS['metrics-system'].clusterPos, [1554, 550]);
+  assert.deepEqual(COMPONENTS['executor-metrics-poller'].clusterPos, [1652, 950]);
+
+  const msTrace = TRACE_BY_ID['comp-metrics-system'];
+  const empTrace = TRACE_BY_ID['comp-executor-metrics-poller'];
+  const obsFlow = TRACE_BY_ID['flow-observability-lifecycles'];
+  assert.ok(msTrace && msTrace.steps.length === 5 && msTrace.messages.length === 6);
+  assert.ok(empTrace && empTrace.steps.length === 5 && empTrace.messages.length === 6);
+  assert.ok(
+    obsFlow &&
+      obsFlow.kind === 'lifecycle' &&
+      obsFlow.deployMode === 'cluster' &&
+      obsFlow.steps.length === 6 &&
+      obsFlow.messages.length >= 10 &&
+      obsFlow.messages.length <= 12,
+  );
+
+  assert.equal(
+    inferStepCategory('spark-env', 'metrics-system', msTrace.messages[0]),
+    'heartbeats-metrics',
+  );
+  assert.equal(
+    inferStepCategory('executor', 'executor-metrics-poller', empTrace.messages[0]),
+    'heartbeats-metrics',
+  );
+
+  const clientObsRun = adaptTraceToRun({ ...obsFlow, deployMode: 'client' });
+  assert.equal(clientObsRun.instances['metrics-system'].hostZone, 'submit-host');
+  assert.equal(clientObsRun.instances['executor-metrics-poller'].hostZone, 'worker-node-b');
+
+  for (const comp of COMPONENT_LIST) {
+    const peers = computePeerInteractions(comp.id);
+    assert.ok(
+      peers.receivesFrom.every(p => p.peerId !== comp.id),
+      `${comp.id}: self-loop leaked into receivesFrom`,
+    );
+    assert.ok(
+      peers.sendsTo.every(p => p.peerId !== comp.id),
+      `${comp.id}: self-loop leaked into sendsTo`,
+    );
+    assert.ok(
+      peers.receivesFrom.length + peers.sendsTo.length > 0,
+      `${comp.id}: expected at least one peer interaction`,
+    );
+  }
+  const msPeers = computePeerInteractions('metrics-system');
+  assert.ok(msPeers.receivesFrom.some(p => p.peerId === 'executor-metrics-poller'));
+  assert.ok(msPeers.sendsTo.some(p => p.peerId === 'spark-ui'));
 });

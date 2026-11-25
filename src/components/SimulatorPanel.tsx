@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
@@ -12,7 +12,10 @@ import {
 } from 'lucide-react';
 import {
   DEFAULT_SIMULATION_CONFIG,
+  FAULT_CATEGORIES,
+  FAULT_CATEGORY_MAP,
   FAULT_MAP,
+  FAULTS_BY_CATEGORY,
   JOB_TYPE_MAP,
   SIMULATED_DATA_PROFILES,
   SIMULATED_FAULTS,
@@ -21,6 +24,8 @@ import {
   validateSimulationConfig,
 } from '../engine/simulatorTypes';
 import type {
+  FaultCategoryId,
+  FaultMeta,
   PythonUdfMode,
   SimulatedDataProfile,
   SimulatedFault,
@@ -58,33 +63,67 @@ function configsEqual(a: SimulationConfig, b: SimulationConfig): boolean {
   );
 }
 
+function formatSeverityLabel(severity: FaultMeta['severity']): string {
+  switch (severity) {
+    case 'ok':
+      return 'OK';
+    case 'degraded':
+      return 'DEGRADED';
+    case 'recoverable':
+      return 'RECOVERABLE';
+    case 'terminal':
+      return 'TERMINAL';
+  }
+}
+
 function getFaultRequirementHint(
   faultId: SimulatedFault,
   draft: SimulationConfig,
 ): string | null {
+  const req = FAULT_MAP[faultId].requires;
+  if (!req) return null;
+
   const job = JOB_TYPE_MAP[draft.jobType];
-  if (faultId === 'shuffle-fetch-failed' && !job.hasShuffle) {
-    return '[requires Shuffle job]';
+  const unmet: string[] = [];
+
+  if (req.shuffle && !job.hasShuffle) {
+    unmet.push('Shuffle job');
   }
-  if (
-    (faultId === 'commit-job-failure' || faultId === 'speculation-race') &&
-    !job.hasFileCommit
-  ) {
-    return '[requires Parquet write]';
+  if (req.fileCommit && !job.hasFileCommit) {
+    unmet.push('Parquet write');
   }
-  if (faultId === 'max-result-size' && !job.hasCollect) {
-    return '[requires collect()]';
+  if (req.collect && !job.hasCollect) {
+    unmet.push('collect()');
   }
-  if (
-    (faultId === 'am-sc-timeout' || faultId === 'am-crash-retry') &&
-    draft.deployMode !== 'cluster'
-  ) {
-    return '[requires Cluster mode]';
+  if (req.broadcast && !job.hasBroadcast) {
+    unmet.push('Broadcast join');
   }
-  if (faultId === 'client-disconnect' && draft.deployMode !== 'client') {
-    return '[requires Client mode]';
+  if (req.pythonUdf && !job.hasPythonUdf) {
+    unmet.push('Python UDF');
   }
-  return null;
+  if (req.clusterMode && draft.deployMode !== 'cluster') {
+    unmet.push('Cluster mode');
+  }
+  if (req.clientMode && draft.deployMode !== 'client') {
+    unmet.push('Client mode');
+  }
+  if (req.minExecutors !== undefined && draft.numExecutors < req.minExecutors) {
+    unmet.push(`>= ${req.minExecutors} execs`);
+  }
+  if (req.essEnabled === true && !draft.externalShuffleService) {
+    unmet.push('ESS ON');
+  }
+  if (req.essEnabled === false && draft.externalShuffleService) {
+    unmet.push('ESS OFF');
+  }
+  if (req.dynamicAllocation === true && !draft.dynamicAllocation) {
+    unmet.push('DynAlloc ON');
+  }
+  if (req.dynamicAllocation === false && draft.dynamicAllocation) {
+    unmet.push('DynAlloc OFF');
+  }
+
+  return unmet.length > 0 ? `[requires ${unmet.join(', ')}]` : null;
 }
 
 export default function SimulatorPanel({
@@ -100,6 +139,24 @@ export default function SimulatorPanel({
   const validation = useMemo(() => validateSimulationConfig(draft), [draft]);
   const jobMeta = JOB_TYPE_MAP[draft.jobType];
   const faultMeta = FAULT_MAP[draft.fault];
+  const activeCategory: FaultCategoryId = faultMeta.category;
+  const activeCategoryMeta = FAULT_CATEGORY_MAP[activeCategory];
+
+  const [showAllCategories, setShowAllCategories] = useState(false);
+  const selectChangeInFlightRef = useRef(false);
+  const prevFaultRef = useRef<SimulatedFault>(draft.fault);
+
+  useEffect(() => {
+    if (prevFaultRef.current !== draft.fault) {
+      prevFaultRef.current = draft.fault;
+      if (selectChangeInFlightRef.current) {
+        selectChangeInFlightRef.current = false;
+      } else {
+        setShowAllCategories(false);
+      }
+    }
+  }, [draft.fault]);
+
   const dataProfileMeta = useMemo(
     () =>
       SIMULATED_DATA_PROFILES.find((p) => p.id === draft.dataProfile) ??
@@ -125,6 +182,23 @@ export default function SimulatorPanel({
       jobType: nextJobType,
       dataProfile: nextJob.defaultDataProfile,
     });
+  }
+
+  function handleSelectCategory(catId: FaultCategoryId) {
+    setShowAllCategories(false);
+    if (activeCategory === catId) {
+      return;
+    }
+    const firstFault: SimulatedFault =
+      catId === 'none'
+        ? 'none'
+        : (FAULTS_BY_CATEGORY[catId][0]?.id ?? 'none');
+    updateDraft({ fault: firstFault });
+  }
+
+  function handleFaultSelectChange(nextFault: SimulatedFault) {
+    selectChangeInFlightRef.current = true;
+    updateDraft({ fault: nextFault });
   }
 
   function clampExecutors(next: number): number {
@@ -165,7 +239,9 @@ export default function SimulatorPanel({
       </div>
 
       <div className="sim-presets-row">
-        <span className="sim-presets-label">Quick run presets:</span>
+        <span className="sim-presets-label">
+          Quick run presets ({SIMULATION_PRESETS.length}):
+        </span>
         <div className="sim-presets-list" role="group" aria-label="Quick run scenario presets">
           {SIMULATION_PRESETS.map((preset) => {
             const isMatched = configsEqual(draft, preset.config);
@@ -182,7 +258,10 @@ export default function SimulatorPanel({
                   .filter(Boolean)
                   .join(' ')}
                 title={`Load & immediately run "${preset.label}"`}
-                onClick={() => onRunPreset({ ...preset.config })}
+                onClick={() => {
+                  setShowAllCategories(false);
+                  onRunPreset({ ...preset.config });
+                }}
               >
                 <span className="sim-preset-name">{preset.label}</span>
                 <span className="sim-preset-badge">{preset.badge}</span>
@@ -422,41 +501,180 @@ export default function SimulatorPanel({
           </div>
         </div>
 
-        {/* Column 3: Inject Fault / Exception & Live Telemetry */}
-        <div className="sim-col">
-          <div className="sim-col-heading">3. INJECT FAULT &amp; TELEMETRY</div>
+        {/* Column 3: Categorized Fault Injection, Diagnostic Reference Card & Telemetry */}
+        <div className="sim-col sim-col-fault">
+          <div className="sim-col-heading">
+            3. INJECT FAULT ({SIMULATED_FAULTS.length} PATHS / {FAULT_CATEGORIES.length} CATEGORIES) &amp; TELEMETRY
+          </div>
+
+          <div className="sim-field">
+            <span className="sim-label">Fault Category</span>
+            <div
+              className="sim-cat-pills"
+              role="group"
+              aria-label="Fault category filter"
+            >
+              <button
+                type="button"
+                className={`sim-cat-pill ${showAllCategories ? 'is-active' : ''}`}
+                aria-pressed={showAllCategories}
+                title={`Browse all ${SIMULATED_FAULTS.length} faults grouped by category`}
+                onClick={() => setShowAllCategories(true)}
+              >
+                <span>All</span>
+                <span className="sim-cat-count">{SIMULATED_FAULTS.length}</span>
+              </button>
+              {FAULT_CATEGORIES.map((cat) => {
+                const count = FAULTS_BY_CATEGORY[cat.id].length;
+                const isActive = !showAllCategories && activeCategory === cat.id;
+                const isCurrentInAll =
+                  showAllCategories && activeCategory === cat.id;
+                return (
+                  <button
+                    key={cat.id}
+                    type="button"
+                    className={[
+                      'sim-cat-pill',
+                      cat.id === 'none' ? 'is-none-cat' : '',
+                      cat.id === 'sigkill-137' ? 'is-sigkill-cat' : '',
+                      isActive ? 'is-active' : '',
+                      isCurrentInAll ? 'is-current-in-all' : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' ')}
+                    aria-pressed={isActive}
+                    title={`${cat.label}: ${cat.description}`}
+                    onClick={() => handleSelectCategory(cat.id)}
+                  >
+                    <span>{cat.short}</span>
+                    <span className="sim-cat-count">{count}</span>
+                  </button>
+                );
+              })}
+            </div>
+            <p className="sim-cat-desc">
+              {showAllCategories
+                ? `All ${SIMULATED_FAULTS.length} fault paths grouped across ${FAULT_CATEGORIES.length} categories -- active: ${activeCategoryMeta.label}.`
+                : activeCategoryMeta.description}
+            </p>
+          </div>
 
           <div className="sim-field">
             <div className="sim-label-row">
               <label className="sim-label" htmlFor="sim-fault">
                 Fault / Exception
               </label>
-              <span className={`sim-severity-pill sev-${faultMeta.severity}`}>
-                {faultMeta.severity === 'ok'
-                  ? 'HAPPY PATH'
-                  : faultMeta.severity === 'recoverable'
-                    ? 'RECOVERABLE'
-                    : 'TERMINAL'}
+              <span className="sim-fault-scope-readout">
+                {showAllCategories
+                  ? `All ${SIMULATED_FAULTS.length} faults`
+                  : `${FAULTS_BY_CATEGORY[activeCategory].length} in ${activeCategoryMeta.short}`}
               </span>
             </div>
             <select
               id="sim-fault"
-              className={`sim-select ${draft.fault !== 'none' ? 'is-fault-selected' : ''}`}
+              className={[
+                'sim-select',
+                draft.fault !== 'none'
+                  ? `is-fault-selected sev-${faultMeta.severity}`
+                  : '',
+              ]
+                .filter(Boolean)
+                .join(' ')}
               value={draft.fault}
               onChange={(e) =>
-                updateDraft({ fault: e.target.value as SimulatedFault })
+                handleFaultSelectChange(e.target.value as SimulatedFault)
               }
             >
-              {SIMULATED_FAULTS.map((f) => {
-                const reqHint = getFaultRequirementHint(f.id, draft);
-                return (
-                  <option key={f.id} value={f.id}>
-                    {reqHint ? `${f.label} ${reqHint}` : f.label}
-                  </option>
-                );
-              })}
+              {showAllCategories
+                ? FAULT_CATEGORIES.map((cat) => (
+                    <optgroup key={cat.id} label={cat.label}>
+                      {FAULTS_BY_CATEGORY[cat.id].map((f) => {
+                        const reqHint = getFaultRequirementHint(f.id, draft);
+                        return (
+                          <option key={f.id} value={f.id}>
+                            {reqHint ? `${f.label} ${reqHint}` : f.label}
+                          </option>
+                        );
+                      })}
+                    </optgroup>
+                  ))
+                : FAULTS_BY_CATEGORY[activeCategory].map((f) => {
+                    const reqHint = getFaultRequirementHint(f.id, draft);
+                    return (
+                      <option key={f.id} value={f.id}>
+                        {reqHint ? `${f.label} ${reqHint}` : f.label}
+                      </option>
+                    );
+                  })}
             </select>
-            <p className="sim-field-hint">{faultMeta.triggerSummary}</p>
+
+            <section
+              className={`sim-diag-card sev-${faultMeta.severity}`}
+              aria-label="Diagnostic reference card"
+            >
+              <div className="sim-diag-header">
+                <strong className="sim-diag-title">{faultMeta.label}</strong>
+                <div className="sim-diag-badges">
+                  <span
+                    className={`sim-severity-pill sev-${faultMeta.severity}`}
+                  >
+                    {formatSeverityLabel(faultMeta.severity)}
+                  </span>
+                  <span className="sim-diag-cat-tag">
+                    {activeCategoryMeta.short}
+                  </span>
+                </div>
+              </div>
+
+              {draft.fault === 'none' ? (
+                <p className="sim-diag-baseline">{faultMeta.triggerSummary}</p>
+              ) : (
+                <>
+                  <dl className="sim-diag-grid">
+                    <div className="sim-diag-item">
+                      <dt className="sim-diag-key">Who kills / detects</dt>
+                      <dd className="sim-diag-val">
+                        {faultMeta.whoKillsOrDetects}
+                      </dd>
+                    </div>
+                    <div className="sim-diag-item">
+                      <dt className="sim-diag-key">Exit / Exception</dt>
+                      <dd className="sim-diag-val is-mono">
+                        {faultMeta.exitCodeOrException}
+                      </dd>
+                    </div>
+                    <div className="sim-diag-item">
+                      <dt className="sim-diag-key">Config / Limit</dt>
+                      <dd className="sim-diag-val is-mono">
+                        {faultMeta.configOrLimit}
+                      </dd>
+                    </div>
+                    <div className="sim-diag-item">
+                      <dt className="sim-diag-key">Evidence to look for</dt>
+                      <dd className="sim-diag-val">{faultMeta.evidence}</dd>
+                    </div>
+                    <div className="sim-diag-item full-width">
+                      <dt className="sim-diag-key">Source</dt>
+                      <dd className="sim-diag-val is-mono">
+                        {faultMeta.sourceRef}
+                      </dd>
+                    </div>
+                  </dl>
+
+                  {faultMeta.category === 'sigkill-137' && (
+                    <div className="sim-sigkill-callout" role="note">
+                      <Info size={12} aria-hidden="true" />
+                      <span>
+                        137 = 128 + 9 (SIGKILL) tells how the process died, not
+                        who sent it. Confirm with YARN diagnostics + NodeManager
+                        logs + kernel/cgroup OOM records. Note: Java Heap OOM
+                        exits 52 (not 137); node crash leaves no exit status.
+                      </span>
+                    </div>
+                  )}
+                </>
+              )}
+            </section>
           </div>
 
           <div className="sim-telemetry-chips" aria-label="Live cluster sizing telemetry">
@@ -538,17 +756,20 @@ export default function SimulatorPanel({
           {!validation.valid
             ? 'Fix compatibility blocker above to run simulation'
             : hasUnappliedChanges
-              ? 'Draft updated — run simulation to project new trace'
+              ? 'Draft updated -- run simulation to project new trace'
               : activeConfig !== null
                 ? 'Draft matches currently active simulation'
-                : `${jobMeta.short} · ${draft.deployMode.toUpperCase()} · ${containers} containers`}
+                : `${jobMeta.short} | ${draft.deployMode.toUpperCase()} | ${containers} containers`}
         </span>
         <div className="sim-footer-actions">
           <button
             type="button"
             className="sim-secondary-btn"
             disabled={isDefaultDraft}
-            onClick={onResetDraft}
+            onClick={() => {
+              setShowAllCategories(false);
+              onResetDraft();
+            }}
           >
             <RotateCcw size={11} aria-hidden="true" />
             <span>Reset Draft</span>

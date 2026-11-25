@@ -10,6 +10,7 @@ import {
   STEP_CATEGORIES,
   detectCategoryPreset,
   type ExecutionRun,
+  type RunEvent,
   type StepCategory,
 } from '../src/data/runModel.ts';
 import { ALL_TRACES, SCENARIO_TRACES } from '../src/data/traces.ts';
@@ -816,7 +817,7 @@ test('all enriched catalog traces adapt cleanly with valid trees, instances, and
   }
 });
 
-test('local port normalization classifies all qualified in-JVM/OS/local-dir events as local across all 80 traces and 7 enriched runs', () => {
+test('local port normalization classifies all qualified in-JVM/OS/local-dir events as local across all 83 traces and 7 enriched runs', () => {
   // Direct unit checks for qualified local ports vs real network/socket endpoints
   for (const localPort of [
     'in-JVM',
@@ -845,7 +846,7 @@ test('local port normalization classifies all qualified in-JVM/OS/local-dir even
     assert.equal(isLocalPort(wirePort), false, `Expected ${JSON.stringify(wirePort)} to stay wire`);
   }
 
-  assert.equal(ALL_TRACES.length, 80);
+  assert.equal(ALL_TRACES.length, 83);
   assert.equal(Object.keys(DEEP_STEP_ENRICHMENTS).length, 7);
 
   const qualifiedLocalRe =
@@ -1649,3 +1650,163 @@ test('computeHiddenCategoriesForStep is depth-aware and excludes collapsed grand
     ['heartbeats-metrics', 'yarn-lifecycle'],
   );
 });
+
+test('all 83 curated traces enforce same-hostZone invariant for local/in-JVM/loopback hops and validate observability + scenario-03 + locality fixes', () => {
+  assert.equal(ALL_TRACES.length, 83);
+
+  const sameHostPortRe =
+    /127\.0\.0\.1|\blocalhost\b|loopback|in-?jvm|\bjvm\b|os proc|unix socket|\blocal\b/i;
+  const sameHostProtocolRe =
+    /127\.0\.0\.1|\blocalhost\b|loopback|in-?jvm|\bjvm\b|os proc|unix socket|\blocal\b|in-?memory|local[- ]disk|\bpipe\b/i;
+
+  const violations: string[] = [];
+  const checkEvent = (traceId: string, mode: string, run: ExecutionRun, ev: RunEvent) => {
+    const fromInst = run.instances[ev.fromInstance];
+    const toInst = run.instances[ev.toInstance];
+    assert.ok(fromInst, `${traceId} (${mode})/${ev.id}: missing fromInstance ${ev.fromInstance}`);
+    assert.ok(toInst, `${traceId} (${mode})/${ev.id}: missing toInstance ${ev.toInstance}`);
+    const sameHostShortCircuitRe = /short-circuit|BlockReaderLocal/i;
+    const requiresSameHost =
+      ev.kind === 'local' ||
+      isLocalPort(ev.port) ||
+      sameHostPortRe.test(ev.port) ||
+      sameHostProtocolRe.test(ev.protocol) ||
+      sameHostShortCircuitRe.test(`${ev.protocol} ${ev.command ?? ''}`) ||
+      ev.channel === 'internal';
+    if (requiresSameHost && fromInst.hostZone !== toInst.hostZone) {
+      violations.push(
+        `${mode}:${ev.id} (${ev.fromInstance}@${fromInst.hostZone} -> ${ev.toInstance}@${toInst.hostZone}, port=${ev.port}, protocol=${ev.protocol})`,
+      );
+    }
+  };
+
+  for (const trace of ALL_TRACES) {
+    const run = adaptTraceToRun(trace);
+    for (const ev of run.events) {
+      checkEvent(trace.id, 'raw', run, ev);
+    }
+    const collapsed = projectRun(run, new Set(), ALL_STEP_CATEGORIES);
+    for (const frame of collapsed.visibleFrames) {
+      checkEvent(trace.id, 'collapsed', run, frame.event);
+    }
+    const expanded = projectRun(run, new Set(getExpandableStepIds(run)), ALL_STEP_CATEGORIES);
+    for (const frame of expanded.visibleFrames) {
+      checkEvent(trace.id, 'expanded', run, frame.event);
+    }
+  }
+
+  assert.deepEqual(
+    violations,
+    [],
+    `Unexpected cross-host local/in-JVM/loopback events: ${violations.join(', ')}`,
+  );
+
+  // Worker-side in-JVM hops keep driver-side singletons in driver-jvm and worker instances in worker-node-a
+  const envRun = adaptTraceToRun(ALL_TRACES.find(t => t.id === 'comp-spark-env')!);
+  assert.equal(envRun.instances['spark-env']?.hostZone, 'driver-jvm');
+  assert.equal(envRun.instances['exec-spark-env']?.hostZone, 'worker-node-a');
+  const envCreateExec = envRun.events.find(e => e.id === 'comp-spark-env:c-env-4')!;
+  assert.equal(envCreateExec.fromInstance, 'executor-backend');
+  assert.equal(envCreateExec.toInstance, 'exec-spark-env');
+  assert.equal(envRun.instances[envCreateExec.fromInstance]?.hostZone, 'worker-node-a');
+  assert.equal(envRun.instances[envCreateExec.toInstance]?.hostZone, 'worker-node-a');
+
+  const ebRun = adaptTraceToRun(ALL_TRACES.find(t => t.id === 'comp-executor-backend')!);
+  assert.equal(ebRun.instances['exec-spark-env']?.hostZone, 'worker-node-a');
+  const ebSetup = ebRun.events.find(e => e.id === 'comp-executor-backend:c-eb-3')!;
+  assert.equal(ebSetup.fromInstance, 'executor-backend');
+  assert.equal(ebSetup.toInstance, 'exec-spark-env');
+  assert.equal(ebRun.instances[ebSetup.fromInstance]?.hostZone, 'worker-node-a');
+  assert.equal(ebRun.instances[ebSetup.toInstance]?.hostZone, 'worker-node-a');
+
+  const rpcRun = adaptTraceToRun(ALL_TRACES.find(t => t.id === 'comp-rpc-env')!);
+  assert.equal(rpcRun.instances['rpc-env']?.hostZone, 'driver-jvm');
+  assert.equal(rpcRun.instances['exec-rpc-env']?.hostZone, 'worker-node-a');
+  const rpcReverse = rpcRun.events.find(e => e.id === 'comp-rpc-env:c-rpc-3')!;
+  assert.equal(rpcReverse.fromInstance, 'driver-scheduler-backend');
+  assert.equal(rpcReverse.toInstance, 'exec-rpc-env');
+  const rpcInbox = rpcRun.events.find(e => e.id === 'comp-rpc-env:c-rpc-4')!;
+  assert.equal(rpcInbox.fromInstance, 'exec-rpc-env');
+  assert.equal(rpcInbox.toInstance, 'executor-backend');
+  assert.equal(rpcRun.instances[rpcInbox.fromInstance]?.hostZone, 'worker-node-a');
+  assert.equal(rpcRun.instances[rpcInbox.toInstance]?.hostZone, 'worker-node-a');
+
+  // Scenario 12: Attempt 0 Python loopback + TaskRunner failure share worker-node-b; retries run on worker-node-a
+  const s12Run = adaptTraceToRun(SCENARIO_TRACES.find(t => t.id === 'scenario-12')!);
+  const s12PyErr = s12Run.events.find(e => e.id === 'scenario-12:s12-1')!;
+  assert.equal(s12PyErr.fromInstance, 'python-worker');
+  assert.equal(s12PyErr.toInstance, 'exec-2/task-attempt');
+  assert.equal(s12Run.instances[s12PyErr.fromInstance]?.hostZone, 'worker-node-b');
+  assert.equal(s12Run.instances[s12PyErr.toInstance]?.hostZone, 'worker-node-b');
+  const s12Fail = s12Run.events.find(e => e.id === 'scenario-12:s12-2')!;
+  assert.equal(s12Fail.fromInstance, 'exec-2/task-attempt');
+  assert.equal(s12Fail.toInstance, 'exec-2/executor-backend');
+  const s12Status = s12Run.events.find(e => e.id === 'scenario-12:s12-3')!;
+  assert.equal(s12Status.fromInstance, 'exec-2/executor-backend');
+  assert.equal(s12Status.toInstance, 'task-set-manager');
+  const s12Retry = s12Run.events.find(e => e.id === 'scenario-12:s12-4')!;
+  assert.equal(s12Retry.toInstance, 'exec-1/task-attempt');
+  assert.equal(s12Run.instances['exec-1/task-attempt']?.hostZone, 'worker-node-a');
+
+  // comp-rdd-cache: driver Py4J persist stays in driver-jvm; executor getOrCompute stays in worker-node-a
+  const rcRun = adaptTraceToRun(ALL_TRACES.find(t => t.id === 'comp-rdd-cache')!);
+  const rcPersist = rcRun.events.find(e => e.id === 'comp-rdd-cache:rc-1')!;
+  assert.equal(rcPersist.fromInstance, 'python-driver');
+  assert.equal(rcPersist.toInstance, 'driver-rdd-cache');
+  assert.equal(rcRun.instances['driver-rdd-cache']?.hostZone, 'driver-jvm');
+  assert.equal(rcRun.instances['rdd-cache']?.hostZone, 'worker-node-a');
+  const rcCompute = rcRun.events.find(e => e.id === 'comp-rdd-cache:rc-3')!;
+  assert.equal(rcCompute.fromInstance, 'task-attempt');
+  assert.equal(rcCompute.toInstance, 'rdd-cache');
+
+  // comp-history-server: read-only SparkUI(sc=None) mounts in-JVM inside HistoryServer (storage-history)
+  const hsRun = adaptTraceToRun(ALL_TRACES.find(t => t.id === 'comp-history-server')!);
+  const hsMount = hsRun.events.find(e => e.id === 'comp-history-server:hs-6')!;
+  assert.equal(hsMount.fromInstance, 'history-server');
+  assert.equal(hsMount.toInstance, 'history-spark-ui');
+  assert.equal(hsRun.instances['history-spark-ui']?.hostZone, 'storage-history');
+
+  // Observability traces: driver MetricsSystem stays in driver-jvm; executor-side components share one worker hostZone
+  const obsRun = adaptTraceToRun(ALL_TRACES.find(t => t.id === 'flow-observability-lifecycles')!);
+  assert.equal(obsRun.instances['metrics-system']?.hostZone, 'driver-jvm');
+  assert.equal(obsRun.instances['exec-2']?.hostZone, 'worker-node-b');
+  assert.equal(obsRun.instances['executor-metrics-poller']?.hostZone, 'worker-node-b');
+  assert.equal(obsRun.instances['exec-metrics-system']?.hostZone, 'worker-node-b');
+  const obsHb = obsRun.events.find(e => e.id === 'flow-observability-lifecycles:obs-5')!;
+  assert.equal(obsHb.kind, 'wire');
+  assert.equal(obsHb.port, 'driver-1:41000');
+
+  const msRun = adaptTraceToRun(ALL_TRACES.find(t => t.id === 'comp-metrics-system')!);
+  assert.equal(msRun.instances['metrics-system']?.hostZone, 'driver-jvm');
+  assert.equal(msRun.instances['executor']?.hostZone, 'worker-node-a');
+  assert.equal(msRun.instances['exec-metrics-system']?.hostZone, 'worker-node-a');
+
+  const empTrace = ALL_TRACES.find(t => t.id === 'comp-executor-metrics-poller')!;
+  const empRun = adaptTraceToRun(empTrace);
+  assert.equal(empRun.instances['executor']?.hostZone, 'worker-node-a');
+  assert.equal(empRun.instances['task-attempt']?.hostZone, 'worker-node-a');
+  assert.equal(empRun.instances['exec-poller']?.hostZone, 'worker-node-a');
+  assert.equal(empRun.instances['exec-metrics-system']?.hostZone, 'worker-node-a');
+  const empHb = empRun.events.find(e => e.id === 'comp-executor-metrics-poller:emp-5')!;
+  assert.equal(empHb.kind, 'wire');
+  assert.equal(empHb.port, 'driver-1:41000');
+  const empEventLogMsg = empTrace.messages.find(m => m.id === 'emp-6')!;
+  assert.match(empEventLogMsg.info, /spark\.eventLog\.logStageExecutorMetrics=true/);
+
+  // Scenario 03: client-mode split-network firewall failure faithful to ApplicationMaster.scala:564-581
+  const s03Trace = SCENARIO_TRACES.find(t => t.id === 'scenario-03')!;
+  const s03Run = adaptTraceToRun(s03Trace);
+  assert.equal(s03Run.instances['yarn-scheduler-backend']?.hostZone, 'submit-host');
+  assert.equal(s03Run.instances['driver-scheduler-backend']?.hostZone, 'submit-host');
+  assert.equal(s03Run.instances['application-master']?.hostZone, 'driver-jvm');
+  const s03Req = s03Run.events.find(e => e.id === 'scenario-03:s03-1')!;
+  assert.equal(s03Req.kind, 'wire');
+  assert.equal(isLocalPort(s03Req.port), false);
+  assert.equal(s03Req.port, 'edge-01.dmz:41000');
+  const s03Alloc = s03Run.events.find(e => e.id === 'scenario-03:s03-1b')!;
+  assert.equal(s03Alloc.kind, 'local');
+  const s03Fail = s03Run.events.find(e => e.id === 'scenario-03:s03-5')!;
+  assert.equal(s03Fail.kind, 'wire');
+  assert.equal(s03Fail.port, 'edge-01.dmz:41000');
+});
+

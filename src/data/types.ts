@@ -29,7 +29,7 @@ export type ComponentId =
   | 'task-attempt'
   | 'task-result-getter'
   | 'rpc-env'
-  // 6. Capacity & Observability (7)
+  // 6. Capacity & Observability (9)
   | 'executor-allocation-manager'
   | 'executor-monitor'
   | 'heartbeat-receiver'
@@ -37,6 +37,8 @@ export type ComponentId =
   | 'event-log'
   | 'spark-ui'
   | 'history-server'
+  | 'metrics-system'
+  | 'executor-metrics-poller'
   // 7. Block Storage (5)
   | 'block-manager'
   | 'block-manager-master'

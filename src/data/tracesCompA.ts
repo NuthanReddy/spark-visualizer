@@ -20,6 +20,26 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
       'python-driver',
       'yarn-scheduler-backend',
     ],
+    customInstances: [
+      {
+        id: 'client-python-driver',
+        componentId: 'python-driver',
+        label: 'Python Driver (edge-01 client)',
+        shortLabel: 'PyDriver (client)',
+        hostZone: 'submit-host',
+        hostLabel: 'edge-01',
+        processId: 'Client Python Driver',
+      },
+      {
+        id: 'client-yarn-scheduler-backend',
+        componentId: 'yarn-scheduler-backend',
+        label: 'YarnClientSchedulerBackend (edge-01)',
+        shortLabel: 'YarnSched (client)',
+        hostZone: 'submit-host',
+        hostLabel: 'edge-01:41000',
+        processId: 'Client Driver JVM',
+      },
+    ],
     steps: [
       {
         title: 'Parse CLI boundary & map YARN SparkConf',
@@ -157,6 +177,7 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
         step: 3,
         from: 'spark-submit',
         to: 'python-driver',
+        toInstance: 'client-python-driver',
         channel: 'python',
         protocol: 'Local PythonRunner Subprocess',
         port: 'edge-01 local',
@@ -178,6 +199,8 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
         step: 4,
         from: 'python-driver',
         to: 'yarn-scheduler-backend',
+        fromInstance: 'client-python-driver',
+        toInstance: 'client-yarn-scheduler-backend',
         channel: 'internal',
         protocol: 'Py4J -> YarnClientSchedulerBackend',
         port: 'edge-01:41000',
@@ -435,6 +458,17 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
       'resource-manager',
       'yarn-allocator',
     ],
+    customInstances: [
+      {
+        id: 'nm-driver-host',
+        componentId: 'node-manager',
+        label: 'NodeManager (driver-1)',
+        shortLabel: 'NodeMgr (AM)',
+        hostZone: 'driver-jvm',
+        hostLabel: 'driver-1:dynamic',
+        processId: 'NodeManager JVM',
+      },
+    ],
     steps: [
       {
         title: 'Bootstrap attempt & launch cluster Driver thread',
@@ -503,6 +537,7 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
         step: 0,
         from: 'node-manager',
         to: 'application-master',
+        fromInstance: 'nm-driver-host',
         channel: 'internal',
         protocol: 'YARN Container JVM Launch',
         port: 'driver-1 OS proc',
@@ -2948,6 +2983,18 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
       'block-manager-master',
       'executor-backend',
     ],
+    customInstances: [
+      {
+        id: 'exec-spark-env',
+        componentId: 'spark-env',
+        label: 'SparkEnv (Executor 1)',
+        shortLabel: 'Exec SparkEnv',
+        hostZone: 'worker-node-a',
+        hostLabel: 'worker-a',
+        processId: 'Executor 1 JVM (worker-a)',
+        executorNumber: 1,
+      },
+    ],
     steps: [
       {
         title: 'Create driver SparkEnv & bind NettyRpcEnv (:41000)',
@@ -3080,6 +3127,7 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
         step: 2,
         from: 'executor-backend',
         to: 'spark-env',
+        toInstance: 'exec-spark-env',
         channel: 'internal',
         protocol: 'In-JVM Executor Factory',
         port: 'worker-a JVM',
@@ -4221,6 +4269,18 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
       'spark-env',
       'executor',
     ],
+    customInstances: [
+      {
+        id: 'exec-spark-env',
+        componentId: 'spark-env',
+        label: 'SparkEnv (Executor 3)',
+        shortLabel: 'Exec SparkEnv',
+        hostZone: 'worker-node-a',
+        hostLabel: 'worker-a',
+        processId: 'Executor 3 JVM (worker-a)',
+        executorNumber: 3,
+      },
+    ],
     steps: [
       {
         title: 'Launch JVM & fetch SparkAppConfig via temporary driverPropsFetcher',
@@ -4332,6 +4392,7 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
         step: 1,
         from: 'executor-backend',
         to: 'spark-env',
+        toInstance: 'exec-spark-env',
         channel: 'internal',
         protocol: 'In-JVM Executor Setup',
         port: 'worker-a JVM',
@@ -4433,6 +4494,17 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
       'task-attempt',
       'python-runner',
       'heartbeat-receiver',
+    ],
+    customInstances: [
+      {
+        id: 'worker-a-python-runner',
+        componentId: 'python-runner',
+        label: 'PythonRunner (worker-a)',
+        shortLabel: 'PyRunner (A)',
+        hostZone: 'worker-node-a',
+        hostLabel: 'worker-a',
+        processId: 'Executor JVM',
+      },
     ],
     steps: [
       {
@@ -4587,6 +4659,7 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
         step: 3,
         from: 'task-attempt',
         to: 'python-runner',
+        toInstance: 'worker-a-python-runner',
         channel: 'python',
         protocol: 'In-JVM -> Local Worker Socket',
         port: 'worker-a local',
@@ -5072,6 +5145,18 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
       'task-result-getter',
       'block-transfer-service',
     ],
+    customInstances: [
+      {
+        id: 'exec-rpc-env',
+        componentId: 'rpc-env',
+        label: 'NettyRpcEnv (Executor 3)',
+        shortLabel: 'Exec RpcEnv',
+        hostZone: 'worker-node-a',
+        hostLabel: 'worker-a',
+        processId: 'Executor 3 JVM (clientMode=true)',
+        executorNumber: 3,
+      },
+    ],
     steps: [
       {
         title: 'Executor (clientMode=true) verifies driver endpoint name',
@@ -5182,6 +5267,7 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
         step: 2,
         from: 'driver-scheduler-backend',
         to: 'rpc-env',
+        toInstance: 'exec-rpc-env',
         channel: 'rpc',
         protocol: 'Spark Netty RPC (Reverse Send)',
         port: 'driver-1:41000',
@@ -5202,6 +5288,7 @@ export const COMPONENT_TRACES_A: TraceLesson[] = [
         id: 'c-rpc-4',
         step: 3,
         from: 'rpc-env',
+        fromInstance: 'exec-rpc-env',
         to: 'executor-backend',
         channel: 'internal',
         protocol: 'In-JVM Dispatcher -> Inbox',

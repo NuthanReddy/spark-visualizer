@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
+  ArrowDownLeft,
   ArrowRight,
+  ArrowUpRight,
   BookOpen,
   Check,
   ChevronLeft,
@@ -23,7 +25,7 @@ import {
   Terminal,
   X,
 } from 'lucide-react';
-import { COMPONENTS } from '../data/components';
+import { COMPONENT_LIST, COMPONENTS } from '../data/components';
 import { STEP_CATEGORIES, STEP_CATEGORY_MAP } from '../data/runModel';
 import type {
   ExecutionRun,
@@ -33,6 +35,7 @@ import type {
 } from '../data/runModel';
 import { CHANNEL_META, HOST_ZONES, SUBSYSTEM_META } from '../data/types';
 import type { ComponentId, TraceField } from '../data/types';
+import { computePeerInteractions } from '../engine/peerInteractions';
 
 export type InspectorTab = 'step' | 'component' | 'overview';
 
@@ -208,6 +211,11 @@ export default function InspectorPanel({
     'spark-driver';
 
   const inspectedComponent = COMPONENTS[inspectedComponentId];
+
+  const peerInteractions = useMemo(
+    () => computePeerInteractions(inspectedComponentId),
+    [inspectedComponentId],
+  );
 
   const { runtimeHostOverrides, actualRuntimeHosts } = useMemo(() => {
     if (!inspectedComponent) {
@@ -947,7 +955,7 @@ export default function InspectorPanel({
                   onClick={() => onViewOnClusterMap(inspectedComponent.id)}
                 >
                   <MapIcon size={13} />
-                  <span>Locate on All 54 Map</span>
+                  <span>Locate on All {COMPONENT_LIST.length} Map</span>
                 </button>
               </div>
             </div>
@@ -961,6 +969,133 @@ export default function InspectorPanel({
               <div className="distinction-card">
                 <span className="micro-label">KEY DISTINCTION</span>
                 <p>{inspectedComponent.keyDistinction}</p>
+              </div>
+            </section>
+
+            <section className="inspector-section">
+              <div className="section-subhead">
+                <h3>PEER INTERACTIONS</h3>
+                <span>
+                  {peerInteractions.receivesFrom.length} in ·{' '}
+                  {peerInteractions.sendsTo.length} out
+                </span>
+              </div>
+              <div className="peer-interactions-grid">
+                <div className="peer-group">
+                  <div className="peer-group-header">
+                    <ArrowDownLeft size={12} aria-hidden="true" />
+                    <span>RECEIVES FROM</span>
+                    <span className="peer-group-count">
+                      {peerInteractions.receivesFrom.length}
+                    </span>
+                  </div>
+                  {peerInteractions.receivesFrom.length === 0 ? (
+                    <p className="peer-empty">No inbound peers in catalog traces.</p>
+                  ) : (
+                    <div className="peer-cards-list">
+                      {peerInteractions.receivesFrom.map((peer) => (
+                        <button
+                          key={`in-${peer.peerId}`}
+                          type="button"
+                          className="peer-card"
+                          title={`Jump to ${peer.fullName} (${peer.hostZoneLabel}) · ${peer.labels.join(', ')}`}
+                          onClick={() => onSelectComponent(peer.peerId)}
+                        >
+                          <div className="peer-card-top">
+                            <span
+                              className="peer-channel-dot"
+                              style={{
+                                background:
+                                  CHANNEL_META[peer.primaryChannel].cssVar,
+                              }}
+                              aria-hidden="true"
+                            />
+                            <strong className="peer-card-name">
+                              {peer.shortName}
+                            </strong>
+                            <span className="peer-card-zone">
+                              {peer.hostZoneShort}
+                            </span>
+                            <ArrowUpRight
+                              size={11}
+                              className="peer-jump-icon"
+                              aria-hidden="true"
+                            />
+                          </div>
+                          <div className="peer-card-proto">
+                            {peer.primaryProtocol}
+                          </div>
+                          <div className="peer-card-labels">
+                            <span>{peer.labels.slice(0, 3).join(', ')}</span>
+                            {peer.labels.length > 3 && (
+                              <span className="peer-more-pill">
+                                +{peer.labels.length - 3} more
+                              </span>
+                            )}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="peer-group">
+                  <div className="peer-group-header">
+                    <ArrowUpRight size={12} aria-hidden="true" />
+                    <span>SENDS TO</span>
+                    <span className="peer-group-count">
+                      {peerInteractions.sendsTo.length}
+                    </span>
+                  </div>
+                  {peerInteractions.sendsTo.length === 0 ? (
+                    <p className="peer-empty">No outbound peers in catalog traces.</p>
+                  ) : (
+                    <div className="peer-cards-list">
+                      {peerInteractions.sendsTo.map((peer) => (
+                        <button
+                          key={`out-${peer.peerId}`}
+                          type="button"
+                          className="peer-card"
+                          title={`Jump to ${peer.fullName} (${peer.hostZoneLabel}) · ${peer.labels.join(', ')}`}
+                          onClick={() => onSelectComponent(peer.peerId)}
+                        >
+                          <div className="peer-card-top">
+                            <span
+                              className="peer-channel-dot"
+                              style={{
+                                background:
+                                  CHANNEL_META[peer.primaryChannel].cssVar,
+                              }}
+                              aria-hidden="true"
+                            />
+                            <strong className="peer-card-name">
+                              {peer.shortName}
+                            </strong>
+                            <span className="peer-card-zone">
+                              {peer.hostZoneShort}
+                            </span>
+                            <ArrowUpRight
+                              size={11}
+                              className="peer-jump-icon"
+                              aria-hidden="true"
+                            />
+                          </div>
+                          <div className="peer-card-proto">
+                            {peer.primaryProtocol}
+                          </div>
+                          <div className="peer-card-labels">
+                            <span>{peer.labels.slice(0, 3).join(', ')}</span>
+                            {peer.labels.length > 3 && (
+                              <span className="peer-more-pill">
+                                +{peer.labels.length - 3} more
+                              </span>
+                            )}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             </section>
 

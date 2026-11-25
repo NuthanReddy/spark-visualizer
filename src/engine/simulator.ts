@@ -10,6 +10,21 @@ import type {
 import type { ChannelKind, ComponentId, HostZoneId, TraceField } from '../data/types.ts';
 import { isLocalPort } from './adaptTrace.ts';
 import {
+  emitTerminalAppOutcome,
+  injectExecutorStartupFault,
+  injectPostWorkloadMidRunFault,
+  injectTaskResultLostStep,
+  injectTaskSpillOomStep,
+  injectTorrentPieceCorruptStep,
+  tryInjectBroadcastFault,
+  tryInjectClientDynAllocNoEssFault,
+  tryInjectPreDriverStartupFault,
+  tryInjectPreSubmitFault,
+  tryInjectPreWorkloadFault,
+  tryInjectPythonUdfFault,
+  tryInjectShuffleReduceFault,
+} from './faultInjectors.ts';
+import {
   FAULT_MAP,
   JOB_TYPE_MAP,
   validateSimulationConfig,
@@ -29,6 +44,7 @@ const CLIENT_HOST_COMPONENTS = new Set<ComponentId>([
   'driver-scheduler-backend',
   'yarn-scheduler-backend',
   'task-result-getter',
+  'rpc-env',
   'sql-planner',
   'adaptive-query-execution',
   'broadcast-exchange',
@@ -42,7 +58,40 @@ const CLIENT_HOST_COMPONENTS = new Set<ComponentId>([
   'listener-bus',
   'event-log',
   'spark-ui',
+  'metrics-system',
 ]);
+
+export interface SimRunMeta {
+  runId: string;
+  runName: string;
+  runSubtitle: string;
+  runSummary: string;
+  telemetry: RunTelemetry;
+}
+
+export interface SimRuntimeState {
+  cfg: SimulationConfig;
+  totalSlots: number;
+  idealWavesPerStage: number;
+  targetPart: number;
+  initialMapId: number;
+  recomputedMapId: number;
+  activeAm: string;
+  activeAttempt: number;
+  amRegistered: boolean;
+  amNm: string | null;
+  liveExecs: string[];
+  liveBms: string[];
+  liveExecNums: number[];
+  nextExecNum: number;
+  abortedByFault: boolean;
+  submit: string;
+  rm: string;
+  alloc: string;
+  schedBackend: string;
+  bmm: string;
+  hbRx: string;
+}
 
 function clampExecutors(n: number): number {
   if (!Number.isFinite(n)) return 2;
@@ -98,13 +147,17 @@ function computeDynamicAllocationRamp(
   return rounds;
 }
 
-class SimRunBuilder {
-  private readonly cfg: SimulationConfig;
+export class SimRunBuilder {
+  readonly cfg: SimulationConfig;
   private readonly instances: Record<string, RuntimeInstance> = {};
   private readonly steps: RunStep[] = [];
   private readonly events: RunEvent[] = [];
   private readonly stepIds = new Set<string>();
   private eventSeq = 0;
+  private readonly registeredAmIds = new Set<string>();
+  private readonly nextExecNumByAttempt = new Map<number, number>();
+  private readonly nextContainerSeqByAttempt = new Map<number, number>();
+  private readonly execContainerByKey = new Map<string, string>();
   readonly isClient: boolean;
   readonly driverHost: string;
   readonly driverRpc: string;
@@ -118,6 +171,33 @@ class SimRunBuilder {
     this.driverRpc = `${this.driverHost}:41000`;
     this.driverBmPort = `${this.driverHost}:41001`;
     this.driverUiUrl = `http://${this.driverHost}:4040`;
+  }
+
+  isAmRegistered(amId?: string): boolean {
+    return amId ? this.registeredAmIds.has(amId) : this.registeredAmIds.size > 0;
+  }
+
+  resetForAttempt(attempt: number): void {
+    this.nextExecNumByAttempt.set(attempt, 1);
+    this.nextContainerSeqByAttempt.set(attempt, 2);
+  }
+
+  allocateExec(attempt = 1): { execNum: number; containerId: string } {
+    const execNum = this.nextExecNumByAttempt.get(attempt) ?? 1;
+    const containerSeq = this.nextContainerSeqByAttempt.get(attempt) ?? 2;
+    this.nextExecNumByAttempt.set(attempt, execNum + 1);
+    this.nextContainerSeqByAttempt.set(attempt, containerSeq + 1);
+    const containerId = `container_e0${attempt}_${String(containerSeq).padStart(6, '0')}`;
+    this.execContainerByKey.set(`${attempt}:${execNum}`, containerId);
+    return { execNum, containerId };
+  }
+
+  peekNextExecNum(attempt = 1): number {
+    return this.nextExecNumByAttempt.get(attempt) ?? 1;
+  }
+
+  instanceExecutorNumber(id: string): number {
+    return this.instances[id]?.executorNumber ?? 1;
   }
 
   ensureInstance(id: string, spec: Omit<RuntimeInstance, 'id'>): string {
@@ -153,14 +233,22 @@ class SimRunBuilder {
       hostZone,
       hostLabel,
       processId: meta.process,
+      ...(compId === 'application-master'
+        ? { containerId: 'container_e01_000001', attemptNumber: 1 }
+        : {}),
     });
   }
 
   workerStd(compId: ComponentId, hostZone: 'worker-node-a' | 'worker-node-b'): string {
-    if (this.instances[compId]) return compId;
+    const existing = this.instances[compId];
+    if (existing && existing.hostZone === hostZone) return compId;
+    const id = existing
+      ? `${compId}-${hostZone === 'worker-node-a' ? 'a' : 'b'}`
+      : compId;
+    if (this.instances[id]) return id;
     const meta = COMPONENTS[compId];
     const hostLabel = hostZone === 'worker-node-a' ? 'worker-a' : 'worker-b';
-    return this.ensureInstance(compId, {
+    return this.ensureInstance(id, {
       componentId: compId,
       label: meta.name,
       shortLabel: meta.shortName,
@@ -193,6 +281,30 @@ class SimRunBuilder {
     };
   }
 
+  instanceHostLabel(id: string): string {
+    return this.instances[id]?.hostLabel ?? 'worker-a:42001';
+  }
+
+  instanceContainerId(id: string): string {
+    return this.instances[id]?.containerId ?? this.execContainerId(1);
+  }
+
+  driverToAmLink(): { kind: 'local' | 'wire'; protocol: string; port: string } {
+    return this.isClient
+      ? {
+          kind: 'wire',
+          protocol: 'Spark Netty RPC (AM outbound)',
+          port: `${this.driverRpc} (AM outbound RPC)`,
+        }
+      : { kind: 'local', protocol: 'In-JVM AMEndpoint', port: 'driver-1 in-JVM' };
+  }
+
+  amToDriverLink(): { kind: 'local' | 'wire'; protocol: string; port: string } {
+    return this.isClient
+      ? { kind: 'wire', protocol: 'Spark Netty RPC', port: this.driverRpc }
+      : { kind: 'local', protocol: 'In-JVM DriverRef', port: 'driver-1 in-JVM' };
+  }
+
   execHostZone(execNum: number): 'worker-node-a' | 'worker-node-b' {
     return execNum % 2 === 1 ? 'worker-node-a' : 'worker-node-b';
   }
@@ -206,12 +318,16 @@ class SimRunBuilder {
   }
 
   execContainerId(execNum: number, attempt = 1): string {
-    return `container_e0${attempt}_${String(execNum + 1).padStart(6, '0')}`;
+    return (
+      this.execContainerByKey.get(`${attempt}:${execNum}`) ??
+      `container_e0${attempt}_${String(execNum + 1).padStart(6, '0')}`
+    );
   }
 
-  execInstance(execNum: number, attempt = 1): string {
+  execInstance(execNum: number, attempt = 1, containerId?: string): string {
     const id = attempt === 1 ? `exec-${execNum}` : `exec-a${attempt}-${execNum}`;
     const host = this.execHostName(execNum);
+    const cid = containerId ?? this.execContainerId(execNum, attempt);
     return this.ensureInstance(id, {
       componentId: 'executor-backend',
       label: attempt === 1 ? `Executor ${execNum} Backend` : `Attempt ${attempt} Exec-${execNum}`,
@@ -219,16 +335,17 @@ class SimRunBuilder {
       hostZone: this.execHostZone(execNum),
       hostLabel: `${host} (${this.cfg.executorCores}c)`,
       processId: attempt === 1 ? `Executor ${execNum} JVM` : `Attempt ${attempt} Exec-${execNum} JVM`,
-      containerId: this.execContainerId(execNum, attempt),
+      containerId: cid,
       executorNumber: execNum,
       ...(attempt > 1 ? { attemptNumber: attempt } : {}),
     });
   }
 
-  execBmInstance(execNum: number, attempt = 1): string {
+  execBmInstance(execNum: number, attempt = 1, containerId?: string): string {
     const id = attempt === 1 ? `exec-${execNum}/bm` : `exec-a${attempt}-${execNum}/bm`;
     const host = this.execHostName(execNum);
     const port = this.execDataPort(execNum);
+    const cid = containerId ?? this.execContainerId(execNum, attempt);
     return this.ensureInstance(id, {
       componentId: 'block-manager',
       label: attempt === 1 ? `Executor ${execNum} BlockManager` : `Attempt ${attempt} Exec-${execNum} BM`,
@@ -236,15 +353,24 @@ class SimRunBuilder {
       hostZone: this.execHostZone(execNum),
       hostLabel: `${host}:${port}`,
       processId: attempt === 1 ? `Executor ${execNum} JVM` : `Attempt ${attempt} Exec-${execNum} JVM`,
-      containerId: this.execContainerId(execNum, attempt),
+      containerId: cid,
       executorNumber: execNum,
       ...(attempt > 1 ? { attemptNumber: attempt } : {}),
     });
   }
 
-  execReplInstance(execNum: number, hostZone: 'worker-node-a' | 'worker-node-b', attempt = 1): string {
-    const id = attempt === 1 ? 'exec-repl' : `exec-a${attempt}-repl`;
+  execReplInstance(
+    execNum: number,
+    hostZone: 'worker-node-a' | 'worker-node-b',
+    attempt = 1,
+    containerId?: string,
+  ): string {
+    const baseId = attempt === 1 ? 'exec-repl' : `exec-a${attempt}-repl`;
+    const id = this.instances[baseId] && this.instances[baseId].executorNumber !== execNum
+      ? `${baseId}-${execNum}`
+      : baseId;
     const host = hostZone === 'worker-node-a' ? 'worker-a' : 'worker-b';
+    const cid = containerId ?? this.execContainerId(execNum, attempt);
     return this.ensureInstance(id, {
       componentId: 'executor-backend',
       label: `Replacement Exec-${execNum} Backend`,
@@ -252,16 +378,25 @@ class SimRunBuilder {
       hostZone,
       hostLabel: `${host} (${this.cfg.executorCores}c)`,
       processId: `Executor ${execNum} JVM`,
-      containerId: this.execContainerId(execNum, attempt),
+      containerId: cid,
       executorNumber: execNum,
       ...(attempt > 1 ? { attemptNumber: attempt } : {}),
     });
   }
 
-  execReplBmInstance(execNum: number, hostZone: 'worker-node-a' | 'worker-node-b', attempt = 1): string {
-    const id = attempt === 1 ? 'exec-repl/bm' : `exec-a${attempt}-repl/bm`;
+  execReplBmInstance(
+    execNum: number,
+    hostZone: 'worker-node-a' | 'worker-node-b',
+    attempt = 1,
+    containerId?: string,
+  ): string {
+    const baseId = attempt === 1 ? 'exec-repl/bm' : `exec-a${attempt}-repl/bm`;
+    const id = this.instances[baseId] && this.instances[baseId].executorNumber !== execNum
+      ? `exec-repl-${execNum}/bm`
+      : baseId;
     const host = hostZone === 'worker-node-a' ? 'worker-a' : 'worker-b';
     const port = this.execDataPort(execNum);
+    const cid = containerId ?? this.execContainerId(execNum, attempt);
     return this.ensureInstance(id, {
       componentId: 'block-manager',
       label: `Replacement Exec-${execNum} BM`,
@@ -269,7 +404,7 @@ class SimRunBuilder {
       hostZone,
       hostLabel: `${host}:${port}`,
       processId: `Executor ${execNum} JVM`,
-      containerId: this.execContainerId(execNum, attempt),
+      containerId: cid,
       executorNumber: execNum,
       ...(attempt > 1 ? { attemptNumber: attempt } : {}),
     });
@@ -373,6 +508,59 @@ class SimRunBuilder {
       (isLocalPort(opts.port) || (opts.from === opts.to && opts.channel === 'internal')
         ? 'local'
         : 'wire');
+    if (
+      fromInst.hostZone !== toInst.hostZone &&
+      (derivedKind === 'local' || isLocalPort(opts.port))
+    ) {
+      throw new Error(
+        `Cross-host local event forbidden: ${opts.from} (${fromInst.hostZone}) -> ${opts.to} (${toInst.hostZone}) via port "${opts.port}"`,
+      );
+    }
+    const isRegisterAmEvent =
+      fromInst.componentId === 'application-master' &&
+      toInst.componentId === 'resource-manager' &&
+      opts.port === 'rm01:8030' &&
+      !opts.isError &&
+      /register/i.test(`${opts.label} ${opts.command}`) &&
+      !/unregister/i.test(`${opts.label} ${opts.command}`);
+    if (isRegisterAmEvent) {
+      this.registeredAmIds.add(opts.from);
+    }
+    if (
+      fromInst.componentId === 'node-manager' &&
+      toInst.componentId === 'resource-manager' &&
+      opts.port === 'rm01:8031'
+    ) {
+      const hbText = `${opts.command}; ${opts.info}`;
+      const completedContainers = new Set<string>();
+      for (const m of hbText.matchAll(
+        /\b(container_e\d+_\d+)\b(?:(?![);\n]|\bcontainer_e\d+_\d+\b|\bRUNNING\b)[\s\S])*?\bCOMPLETE\b/gi,
+      )) {
+        completedContainers.add(m[1]);
+      }
+      if (completedContainers.size > 0) {
+        for (const inst of Object.values(this.instances)) {
+          if (
+            inst.componentId === 'application-master' &&
+            inst.containerId &&
+            completedContainers.has(inst.containerId)
+          ) {
+            this.registeredAmIds.delete(inst.id);
+          }
+        }
+      }
+    }
+    const isUnregisterEvent =
+      /(?:^|\b)(?:amclient\.)?unregister(?:am|applicationmaster)?\s*\(/i.test(opts.label) ||
+      /(?:^|\b)(?:amclient\.)?unregister(?:am|applicationmaster)?\s*\(/i.test(opts.command) ||
+      (fromInst.componentId === 'application-master' &&
+        toInst.componentId === 'resource-manager' &&
+        /unregister/i.test(`${opts.label} ${opts.command}`));
+    if (isUnregisterEvent && !this.registeredAmIds.has(opts.from)) {
+      throw new Error(
+        `AM unregister forbidden before registerApplicationMaster for ${opts.from}: ${opts.from} -> ${opts.to} (${opts.label})`,
+      );
+    }
     const safeLabel = opts.label.length > 26 ? `${opts.label.slice(0, 25)}.` : opts.label;
     this.events.push({
       id,
@@ -459,9 +647,6 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
   };
 
   const b = new SimRunBuilder(cfg);
-  const submit = b.std('spark-submit');
-  const yClient = b.std('yarn-client');
-  const rm = b.std('resource-manager');
 
   const runId = [
     'sim',
@@ -483,109 +668,37 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
   const runSummary =
     `${job.summary} Configured with ${cfg.numExecutors} ${cfg.dynamicAllocation ? 'initial ' : ''}executor(s) x ${cfg.executorCores} core(s) (${totalSlots} slots; ideal ${idealWavesPerStage} wave(s)/stage for ${cfg.numPartitions} partitions under fixed capacity), ESS ${cfg.externalShuffleService ? 'ON (:7337)' : 'OFF'}, AQE ${cfg.aqeEnabled ? 'ON' : 'OFF'}.${cfg.deployMode === 'client' ? ' Driver runs outside YARN on edge-01.' : ''}`;
 
-  // =========================================================================
-  // FAULT SHORT-CIRCUIT 1: Pre-submit Oversized Container Request
-  // =========================================================================
-  if (cfg.fault === 'oversized-request') {
-    const s1 = b.addStep({
-      id: 'sim-s1-oversize',
-      title: 'CLI invokes yarn.Client & queries RM maximum container capability',
-      explanation:
-        'spark-submit launches yarn.Client, which calls yarnClient.createApplication() on RM :8032 and receives yarn.scheduler.maximum-allocation-mb = 8192 MiB.',
-      category: 'yarn-lifecycle',
-      keyState: 'RM max container memory = 8192 MiB; app ID reserved but not submitted',
-      command: `spark-submit --master yarn --deploy-mode ${cfg.deployMode} --executor-memory 8g --num-executors ${cfg.numExecutors} orders.py`,
-      detailsPassed: [
-        { name: 'executorMemory', value: '8192 MiB (--executor-memory 8g)' },
-        { name: 'executorOverhead', value: '819 MiB (10% overhead)' },
-        { name: 'rmMaxAllocationMb', value: '8192 MiB (yarn.scheduler.maximum-allocation-mb)' },
-      ],
-      deepDiveComponentId: 'yarn-client',
-    });
-    b.addEvent({
-      stepId: s1,
-      from: submit,
-      to: yClient,
-      channel: 'internal',
-      protocol: 'In-JVM SparkSubmit',
-      port: 'edge-01 in-JVM',
-      label: 'Invoke yarn.Client',
-      info: 'spark-submit parses --executor-memory 8g and invokes yarn.Client.',
-      size: 'in-memory',
-      command: 'new Client(args, sparkConf).run()',
-      fields: [
-        { name: 'spark.executor.memory', value: '8g' },
-        { name: 'spark.executor.instances', value: String(cfg.numExecutors) },
-      ],
-      senderState: 'Parsed CLI flags',
-      receiverState: 'Starting YarnClient RPC to RM :8032',
-    });
-    b.addEvent({
-      stepId: s1,
-      from: yClient,
-      to: rm,
-      channel: 'yarn',
-      protocol: 'Hadoop RPC (ApplicationClientProtocol)',
-      port: 'rm01:8032',
-      label: 'createApplication()',
-      info: 'Client reserves an application ID and receives RM maximumResourceCapability (8192 MiB).',
-      size: '1.1 KB',
-      command: 'val newApp = yarnClient.createApplication()',
-      fields: [
-        { name: 'applicationId', value: 'application_1740_0099' },
-        { name: 'maxMemoryMb', value: '8192' },
-      ],
-      senderState: 'Checking requested container size against RM max',
-      receiverState: 'Returned GetNewApplicationResponse (not yet submitted)',
-    });
+  const runMeta: SimRunMeta = {
+    runId,
+    runName,
+    runSubtitle,
+    runSummary,
+    telemetry,
+  };
 
-    const s2 = b.addStep({
-      id: 'sim-s2-oversize-fail',
-      title: 'Client.verifyClusterResources throws BEFORE submitApplication()',
-      explanation:
-        'yarn.Client sums heap (8192 MiB) + overhead (819 MiB) = 9011 MiB > 8192 MiB and throws IllegalArgumentException locally on edge-01. No AM or executor container is ever requested.',
-      category: 'yarn-lifecycle',
-      keyState: 'FAILED pre-submit on edge-01 | 0 YARN containers allocated',
-      command: 'Client.verifyClusterResources(newAppResponse) // throws IllegalArgumentException',
-      detailsPassed: [
-        { name: 'totalRequestedMb', value: '9011 MiB (8192 heap + 819 overhead)' },
-        { name: 'clusterMaxMb', value: '8192 MiB' },
-        { name: 'submitCalled', value: 'false (failed fast on edge-01)' },
-      ],
-      deepDiveComponentId: 'yarn-client',
-    });
-    b.addEvent({
-      stepId: s2,
-      from: yClient,
-      to: yClient,
-      kind: 'local',
-      channel: 'error',
-      protocol: 'In-JVM Validation Throw',
-      port: 'edge-01 in-JVM',
-      label: 'Exceeds maxMem (9011>8192)',
-      info: 'IllegalArgumentException: Required executor memory + overhead (9011 MB) is above cluster max threshold (8192 MB).',
-      size: 'Exception',
-      command: 'throw new IllegalArgumentException("...above the max threshold (8192 MB)")',
-      fields: [
-        { name: 'exception', value: 'IllegalArgumentException' },
-        { name: 'containersLaunched', value: '0' },
-      ],
-      senderState: 'Aborted before submitApplication()',
-      receiverState: 'spark-submit exits non-zero on edge-01',
-      isError: true,
-    });
-    return b.finalize(runId, runName, runSubtitle, runSummary, 'PRE-SUBMIT FAIL', telemetry);
+  // =========================================================================
+  // PHASE 1: Pre-submit & Client-mode local startup short-circuits
+  // =========================================================================
+  const preSubmitShortCircuit = tryInjectPreSubmitFault(b, cfg, runMeta);
+  if (preSubmitShortCircuit) {
+    return preSubmitShortCircuit;
   }
+
+  const submit = b.std('spark-submit');
+  const yClient = b.std('yarn-client');
+  const rm = b.std('resource-manager');
 
   // =========================================================================
   // MACRO STEP 1: Submit & Stage (+ Expandable Staging Sub-Steps)
   // =========================================================================
   const am = b.std('application-master');
   const pyDriver = b.std('python-driver');
+  let amNmInstanceId: string | null = null;
 
   if (cfg.deployMode === 'cluster') {
     const nn = b.std('hdfs-namenode');
     const amNm = b.amNmInstance();
+    amNmInstanceId = amNm;
     const amCont = b.amContainerInstance(1);
 
     const sSubmit = b.addStep({
@@ -774,84 +887,11 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     });
 
     // =========================================================================
-    // FAULT SHORT-CIRCUIT 2: Cluster-Mode AM SparkContext Init Timeout
+    // PHASE 2: Cluster-Mode Pre-Driver Startup Short-Circuits
     // =========================================================================
-    if (cfg.fault === 'am-sc-timeout') {
-      const sTimeout = b.addStep({
-        id: 'sim-step-am-timeout',
-        title: 'orders.py stalls before getOrCreate(); AM times out at 100s',
-        explanation:
-          'ApplicationMaster starts deploy.PythonRunner and python3 orders.py, then blocks on sparkContextPromise.future up to spark.yarn.am.waitTime (100s). Because AM never registered with RM (registered==false, ApplicationMaster.scala:367 skips finishApplicationMaster), AM exits locally with EXIT_SC_NOT_INITED (13) and driver-1 NM reports container exit status 13 to RM with 0 executors ever requested.',
-        category: 'driver-python-bridge',
-        keyState: 'FAILED (EXIT_SC_NOT_INITED=13, registered=false) | 0 executors ever requested',
-        command: 'ThreadUtils.awaitResult(sparkContextPromise.future, 100s) // TimeoutException',
-        detailsPassed: [
-          { name: 'spark.yarn.am.waitTime', value: '100s' },
-          { name: 'registeredWithRM', value: 'false (ApplicationMaster.scala:367 skips finishApplicationMaster)' },
-          { name: 'exitCode', value: '13 (EXIT_SC_NOT_INITED)' },
-          { name: 'executorsRequested', value: '0' },
-        ],
-        deepDiveComponentId: 'application-master',
-      });
-      b.addEvent({
-        stepId: sTimeout,
-        from: am,
-        to: pyDriver,
-        kind: 'local',
-        channel: 'python',
-        protocol: 'ProcessBuilder (PythonRunner)',
-        port: 'driver-1 OS',
-        label: 'Spawn orders.py (stalls)',
-        info: 'AM launches orders.py, which hangs waiting on an external service before SparkSession.builder.getOrCreate().',
-        size: 'OS fork/exec',
-        command: 'PythonRunner.main(Array("orders.py", ""))',
-        fields: [
-          { name: 'PYSPARK_GATEWAY_PORT', value: '43122' },
-          { name: 'scriptState', value: 'Blocked before SparkContext init' },
-        ],
-        senderState: 'AM awaiting sparkContextPromise (100s)',
-        receiverState: 'Python driver stalled before Py4J call',
-      });
-      b.addEvent({
-        stepId: sTimeout,
-        from: am,
-        to: am,
-        kind: 'local',
-        channel: 'error',
-        protocol: 'In-JVM ApplicationMaster.finish',
-        port: 'driver-1 in-JVM',
-        label: 'finish(FAILED, exit=13)',
-        info: '100s waitTime expires; AM dumps driver thread stacks and calls local finish(FAILED, EXIT_SC_NOT_INITED=13). Because registered==false, ApplicationMaster.scala:367 skips RM finishApplicationMaster.',
-        size: 'exit code 13',
-        command: 'finish(FinalApplicationStatus.FAILED, EXIT_SC_NOT_INITED=13, "Timed out waiting for SparkContext.")',
-        fields: [
-          { name: 'registered', value: 'false (no RM finish RPC sent)' },
-          { name: 'exitCode', value: '13 (EXIT_SC_NOT_INITED)' },
-        ],
-        senderState: 'AM exiting locally with code 13',
-        receiverState: 'AM JVM terminating inside container_e01_000001',
-        isError: true,
-      });
-      b.addEvent({
-        stepId: sTimeout,
-        from: amNm,
-        to: rm,
-        channel: 'error',
-        protocol: 'Hadoop RPC (ResourceTracker)',
-        port: 'rm01:8031',
-        label: 'AM container exit (13)',
-        info: 'driver-1 NodeManager reports AM container exitStatus=13 to RM :8031; RM marks Attempt 1 FAILED with 0 executors ever requested.',
-        size: 'ContainerStatus',
-        command: 'NM ContainerStatus(container_e01_000001, COMPLETE, exitStatus=13)',
-        fields: [
-          { name: 'containerId', value: 'container_e01_000001' },
-          { name: 'exitStatus', value: '13 (EXIT_SC_NOT_INITED)' },
-        ],
-        senderState: 'AM container exited on driver-1',
-        receiverState: 'RM marks Attempt 1 FAILED (0 executor containers allocated)',
-        isError: true,
-      });
-      return b.finalize(runId, runName, runSubtitle, runSummary, 'SC INIT TIMEOUT', telemetry);
+    const preDriverShortCircuit = tryInjectPreDriverStartupFault(b, cfg, am, amNm, runMeta);
+    if (preDriverShortCircuit) {
+      return preDriverShortCircuit;
     }
 
     // =========================================================================
@@ -1174,22 +1214,41 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
   }
 
   // =========================================================================
+  // PHASE 3: Client-Mode Post-AM-Submit Startup Faults (dynalloc-no-shuffle-service)
+  // =========================================================================
+  if (cfg.deployMode === 'client') {
+    const clientDynAllocShortCircuit = tryInjectClientDynAllocNoEssFault(b, cfg, am, runMeta);
+    if (clientDynAllocShortCircuit) {
+      return clientDynAllocShortCircuit;
+    }
+  }
+
+  // =========================================================================
   // MACRO STEP 3: AM Registers with RM, Allocates & Launches N Executors
   // =========================================================================
   const alloc = b.std('yarn-allocator');
   const schedBackend = b.std('driver-scheduler-backend');
   const bmm = b.std('block-manager-master');
   const hbRx = b.std('heartbeat-receiver');
-  const execIds = Array.from({ length: cfg.numExecutors }, (_, i) => b.execInstance(i + 1));
-  const execBms = Array.from({ length: cfg.numExecutors }, (_, i) => b.execBmInstance(i + 1));
+  b.resetForAttempt(1);
+  const initialAllocations = Array.from({ length: cfg.numExecutors }, () => b.allocateExec(1));
+  const execIds = initialAllocations.map(a => b.execInstance(a.execNum, 1, a.containerId));
+  const execBms = initialAllocations.map(a => b.execBmInstance(a.execNum, 1, a.containerId));
+  const isDiskDirFail = cfg.fault === 'disk-dir-create-fail';
 
   const sAlloc = b.addStep({
     id: 'sim-step-alloc',
-    title: `AM registers with RM & launches ${cfg.numExecutors} executor(s) (${totalSlots} slots)`,
-    explanation: `ApplicationMaster registers with RM :8030 (${cfg.deployMode === 'client' ? 'port=-1, then createAllocator before RegisterClusterManager' : 'driver RPC port 41000'}), YarnAllocator requests ${cfg.numExecutors} container(s) (${cfg.executorCores} cores each = ${totalSlots} total slots), NodeManagers boot Exec-1..Exec-${cfg.numExecutors}, and executors register with the driver & BlockManagerMaster.`,
+    title: isDiskDirFail
+      ? `AM registers with RM & launches ${cfg.numExecutors} executor container(s) (Exec-1 fails local dir init)`
+      : `AM registers with RM & launches ${cfg.numExecutors} executor(s) (${totalSlots} slots)`,
+    explanation: isDiskDirFail
+      ? `ApplicationMaster registers with RM :8030 (${cfg.deployMode === 'client' ? 'driver-1:-1, then createAllocator before RegisterClusterManager' : 'driver RPC port 41000'}), YarnAllocator requests ${cfg.numExecutors} container(s), and NodeManagers launch Exec-1..Exec-${cfg.numExecutors}. Exec-1 crashes during DiskBlockManager.createLocalDirs() (exit 53) BEFORE registering its executor or BlockManager.`
+      : `ApplicationMaster registers with RM :8030 (${cfg.deployMode === 'client' ? 'driver-1:-1, then createAllocator before RegisterClusterManager' : 'driver RPC port 41000'}), YarnAllocator requests ${cfg.numExecutors} container(s) (${cfg.executorCores} cores each = ${totalSlots} total slots), NodeManagers boot Exec-1..Exec-${cfg.numExecutors}, and executors register with the driver & BlockManagerMaster.`,
     category: 'yarn-lifecycle',
-    keyState: `${cfg.numExecutors} executor(s) registered (${totalSlots} slots | ideal ${idealWavesPerStage} wave/stage)`,
-    command: `amClient.register(...) -> amClient.allocate(${cfg.numExecutors}x ${cfg.executorCores}vcore) -> RegisterExecutor`,
+    keyState: isDiskDirFail
+      ? `AM registered; Exec-1 container launched on worker-a (pending DiskBlockManager startup)`
+      : `${cfg.numExecutors} executor(s) registered (${totalSlots} slots | ideal ${idealWavesPerStage} wave/stage)`,
+    command: `amClient.register(...) -> amClient.allocate(${cfg.numExecutors}x ${cfg.executorCores}vcore) -> startContainers`,
     detailsPassed: [
       { name: cfg.dynamicAllocation ? 'initialExecutors' : 'fixedExecutors', value: String(cfg.numExecutors) },
       { name: 'totalSlots', value: `${totalSlots} (${cfg.numExecutors} x ${cfg.executorCores} cores)` },
@@ -1210,12 +1269,12 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     label: cfg.deployMode === 'client' ? 'registerAM(port=-1)' : 'registerAM(driver:41000)',
     info:
       cfg.deployMode === 'client'
-        ? 'Client-mode AM registers with RM passing rpcPort=-1 and edge-01 UI URL.'
-        : 'Cluster-mode AM registers with RM passing driver RPC port 41000 and Spark UI trackingUrl.',
+        ? 'Client-mode AM registers with RM passing host=driver-1, rpcPort=-1 (no listening AM RPC port; outbound channel to edge-01:41000) and edge-01 UI URL.'
+        : 'Cluster-mode AM registers with RM passing driver-1:41000 and Spark UI trackingUrl.',
     size: '1.6 KB',
-    command: `amClient.register("${b.driverHost}", ${cfg.deployMode === 'client' ? -1 : 41000}, conf, "${b.driverUiUrl}")`,
+    command: `amClient.register("driver-1", ${cfg.deployMode === 'client' ? -1 : 41000}, conf, "${b.driverUiUrl}")`,
     fields: [
-      { name: 'amRpcPort', value: cfg.deployMode === 'client' ? '-1' : '41000' },
+      { name: 'amRpcAddress', value: cfg.deployMode === 'client' ? 'driver-1:-1 (client-only RPC)' : 'driver-1:41000' },
       { name: 'trackingUrl', value: b.driverUiUrl },
     ],
     senderState: 'AM registered; creating YarnAllocator',
@@ -1249,7 +1308,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     label: `Grant ${cfg.numExecutors} container${cfg.numExecutors > 1 ? 's' : ''}`,
     info: `RM returns ${cfg.numExecutors} container grant(s) with NodeManager addresses and security tokens.`,
     size: '3.2 KB',
-    command: `AllocateResponse(allocated = [container_e01_000002..00000${cfg.numExecutors + 1}])`,
+    command: `AllocateResponse(allocated = [${initialAllocations[0].containerId}..${initialAllocations[initialAllocations.length - 1].containerId}])`,
     fields: [
       { name: 'granted', value: `${cfg.numExecutors} containers` },
       { name: 'tokens', value: 'ContainerToken + NMToken' },
@@ -1258,7 +1317,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     receiverState: 'Launching ExecutorRunnable threads',
   });
   for (let i = 0; i < cfg.numExecutors; i++) {
-    const execNum = i + 1;
+    const { execNum, containerId } = initialAllocations[i];
     const nm = b.nmInstance(b.execHostZone(execNum));
     const host = b.execHostName(execNum);
     b.addEvent({
@@ -1269,35 +1328,38 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'Hadoop RPC (ContainerManagementProtocol)',
       port: `${host}:dynamic`,
       label: `startContainer(Exec-${execNum})`,
-      info: `ExecutorRunnable starts ${b.execContainerId(execNum)} on ${host} with --driver-url spark://CoarseGrainedScheduler@${b.driverRpc}.`,
+      info: `ExecutorRunnable starts ${containerId} on ${host} with --driver-url spark://CoarseGrainedScheduler@${b.driverRpc}.`,
       size: '9.4 KB',
-      command: `nmClient.startContainer(${b.execContainerId(execNum)}, ctx[exec=${execNum}])`,
+      command: `nmClient.startContainer(${containerId}, ctx[exec=${execNum}])`,
       fields: [
         { name: 'executorId', value: `"${execNum}"` },
+        { name: 'containerId', value: containerId },
         { name: 'driverUrl', value: `spark://CoarseGrainedScheduler@${b.driverRpc}` },
       ],
       senderState: `Dispatched Exec-${execNum} to ${host} NM`,
       receiverState: `Booting Exec-${execNum} JVM`,
     });
-    b.addEvent({
-      stepId: sAlloc,
-      from: execIds[i],
-      to: schedBackend,
-      channel: 'rpc',
-      protocol: 'Spark Netty RPC',
-      port: b.driverRpc,
-      label: `RegisterExecutor(id=${execNum})`,
-      info: `Exec-${execNum} on ${host} registers ${cfg.executorCores} core(s) and its BlockManager (${host}:${b.execDataPort(execNum)}) with the driver.`,
-      size: '1.8 KB',
-      command: `ref.ask[Boolean](RegisterExecutor("${execNum}", self, "${host}", ${cfg.executorCores}))`,
-      fields: [
-        { name: 'executorId', value: `"${execNum}"` },
-        { name: 'cores', value: String(cfg.executorCores) },
-        { name: 'blockMgrPort', value: `${host}:${b.execDataPort(execNum)}` },
-      ],
-      senderState: `Exec-${execNum} ready for LaunchTask`,
-      receiverState: `Registered ${execNum}/${cfg.numExecutors} executors (${execNum * cfg.executorCores} slots)`,
-    });
+    if (!(isDiskDirFail && i === 0)) {
+      b.addEvent({
+        stepId: sAlloc,
+        from: execIds[i],
+        to: schedBackend,
+        channel: 'rpc',
+        protocol: 'Spark Netty RPC',
+        port: b.driverRpc,
+        label: `RegisterExecutor(id=${execNum})`,
+        info: `Exec-${execNum} on ${host} registers ${cfg.executorCores} core(s) and its BlockManager (${host}:${b.execDataPort(execNum)}) with the driver.`,
+        size: '1.8 KB',
+        command: `ref.ask[Boolean](RegisterExecutor("${execNum}", self, "${host}", ${cfg.executorCores}))`,
+        fields: [
+          { name: 'executorId', value: `"${execNum}"` },
+          { name: 'cores', value: String(cfg.executorCores) },
+          { name: 'blockMgrPort', value: `${host}:${b.execDataPort(execNum)}` },
+        ],
+        senderState: `Exec-${execNum} ready for LaunchTask`,
+        receiverState: `Registered Exec-${execNum} (${cfg.executorCores} slots)`,
+      });
+    }
   }
 
   // Expandable sub-steps of Macro Step 3 (including client-mode createAllocator-before-RegisterClusterManager & Heartbeat)
@@ -1305,11 +1367,11 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     id: 'sim-step-alloc-a',
     parentId: sAlloc,
     title: cfg.deployMode === 'client'
-      ? 'AM registers port=-1, creates YarnAllocator, then sends RegisterClusterManager'
+      ? 'AM registers driver-1:-1, creates YarnAllocator, then sends RegisterClusterManager'
       : 'AM registers driver:41000, creates YarnAllocator & negotiates containers with RM',
     explanation:
       cfg.deployMode === 'client'
-        ? 'Client-mode AM registers with RM (port=-1), creates YarnAllocator FIRST, then AMEndpoint.onStart() sends RegisterClusterManager to edge-01:41000 before requesting containers.'
+        ? 'Client-mode AM registers with RM (driver-1:-1; no listening AM RPC port), creates YarnAllocator FIRST, then AMEndpoint.onStart() dials outbound to edge-01:41000 with RegisterClusterManager before requesting containers.'
         : 'Cluster-mode AM registers driver-1:41000 with RM :8030, instantiates YarnAllocator, and sends ResourceRequests for all executors.',
     category: 'yarn-lifecycle',
     keyState: `YarnAllocator active and negotiating ${cfg.numExecutors} container(s)`,
@@ -1327,7 +1389,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     label: cfg.deployMode === 'client' ? 'registerAM(port=-1)' : 'registerAM(driver:41000)',
     info: 'AM registers application attempt with RM :8030.',
     size: '1.6 KB',
-    command: `amClient.register("${b.driverHost}", ${cfg.deployMode === 'client' ? -1 : 41000}, ...)`,
+    command: `amClient.register("driver-1", ${cfg.deployMode === 'client' ? -1 : 41000}, ...)`,
     fields: [{ name: 'trackingUrl', value: b.driverUiUrl }],
     senderState: 'AM registered with RM',
     receiverState: 'RM transitioned app to RUNNING',
@@ -1400,10 +1462,16 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
   const s3b = b.addStep({
     id: 'sim-step-alloc-b',
     parentId: sAlloc,
-    title: `NMs launch ${cfg.numExecutors} executor(s), each registers BlockManager & starts 10s Heartbeats`,
-    explanation: `ExecutorRunnable calls NM startContainer for each of the ${cfg.numExecutors} granted containers; each executor fetches SparkAppConfig, registers with CoarseGrainedSchedulerBackend, starts NettyBlockTransferService (:42001..:4200${cfg.numExecutors}), sends RegisterBlockManager, and starts 10s heartbeats to HeartbeatReceiver.`,
+    title: isDiskDirFail
+      ? `NMs launch ${cfg.numExecutors} container(s); Exec-1 aborts before BM registration`
+      : `NMs launch ${cfg.numExecutors} executor(s), each registers BlockManager & starts 10s Heartbeats`,
+    explanation: isDiskDirFail
+      ? `ExecutorRunnable calls NM startContainer for each granted container; Exec-1 hits DiskBlockManager.createLocalDirs() failure (exit 53) BEFORE registering its Executor, BlockManager, or Heartbeats${cfg.numExecutors >= 2 ? `, while Exec-2..Exec-${cfg.numExecutors} register normally` : ''}.`
+      : `ExecutorRunnable calls NM startContainer for each of the ${cfg.numExecutors} granted containers; each executor fetches SparkAppConfig, registers with CoarseGrainedSchedulerBackend, starts NettyBlockTransferService (:42001..:4200${cfg.numExecutors}), sends RegisterBlockManager, and starts 10s heartbeats to HeartbeatReceiver.`,
     category: 'heartbeats-metrics',
-    keyState: `All ${cfg.numExecutors} executors & BlockManagers registered and heartbeating every 10s`,
+    keyState: isDiskDirFail
+      ? `Exec-1 container launched on worker-a (exits 53 before BM reg)${cfg.numExecutors >= 2 ? `; ${cfg.numExecutors - 1} other exec(s) registered` : ''}`
+      : `All ${cfg.numExecutors} executors & BlockManagers registered and heartbeating every 10s`,
     command: 'nmClient.startContainer() -> RetrieveSparkAppConfig -> RegisterExecutor -> RegisterBlockManager -> Heartbeat',
     detailsPassed: [
       { name: 'executorsLaunched', value: String(cfg.numExecutors) },
@@ -1413,7 +1481,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     deepDiveComponentId: 'heartbeat-receiver',
   });
   for (let i = 0; i < cfg.numExecutors; i++) {
-    const execNum = i + 1;
+    const { execNum, containerId } = initialAllocations[i];
     const nm = b.nmInstance(b.execHostZone(execNum));
     const host = b.execHostName(execNum);
     const dataPort = b.execDataPort(execNum);
@@ -1426,82 +1494,95 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'Hadoop RPC (ContainerManagementProtocol)',
       port: `${host}:dynamic`,
       label: `startContainer(Exec-${execNum})`,
-      info: `ExecutorRunnable launches ${b.execContainerId(execNum)} on ${host} with --driver-url spark://CoarseGrainedScheduler@${b.driverRpc}.`,
+      info: `ExecutorRunnable launches ${containerId} on ${host} with --driver-url spark://CoarseGrainedScheduler@${b.driverRpc}.`,
       size: '9.4 KB',
-      command: `nmClient.startContainer(${b.execContainerId(execNum)}, ctx[exec=${execNum}])`,
+      command: `nmClient.startContainer(${containerId}, ctx[exec=${execNum}])`,
       fields: [
         { name: 'executorId', value: `"${execNum}"` },
+        { name: 'containerId', value: containerId },
         { name: 'driverUrl', value: `spark://CoarseGrainedScheduler@${b.driverRpc}` },
       ],
       senderState: `Dispatched Exec-${execNum} to ${host} NM`,
       receiverState: `Booting Exec-${execNum} JVM`,
     });
+    if (!(isDiskDirFail && i === 0)) {
+      b.addEvent({
+        stepId: s3b,
+        from: execIds[i],
+        to: schedBackend,
+        categoryOverride: 'yarn-lifecycle',
+        channel: 'rpc',
+        protocol: 'Spark Netty RPC',
+        port: b.driverRpc,
+        label: `RegisterExecutor(id=${execNum})`,
+        info: `Exec-${execNum} fetches SparkAppConfig and registers ${cfg.executorCores} core(s) with ${b.driverRpc}.`,
+        size: '1.8 KB',
+        command: `RegisterExecutor("${execNum}", self, "${host}", ${cfg.executorCores})`,
+        fields: [
+          { name: 'executorId', value: `"${execNum}"` },
+          { name: 'cores', value: String(cfg.executorCores) },
+        ],
+        senderState: `Exec-${execNum} received RegisteredExecutor`,
+        receiverState: `Added Exec-${execNum} to executorDataMap`,
+      });
+      b.addEvent({
+        stepId: s3b,
+        from: execBms[i],
+        to: bmm,
+        categoryOverride: 'yarn-lifecycle',
+        channel: 'rpc',
+        protocol: 'Spark Netty RPC',
+        port: b.driverRpc,
+        label: `RegisterBM(Exec-${execNum})`,
+        info: `Exec-${execNum} BlockManager binds ${host}:${dataPort} and registers with driver BlockManagerMaster.`,
+        size: '1.2 KB',
+        command: `master.registerBlockManager(BlockManagerId("${execNum}", "${host}", ${dataPort}), ...)`,
+        fields: [
+          { name: 'dataPort', value: String(dataPort) },
+          { name: 'externalShuffleService', value: cfg.externalShuffleService ? 'enabled (:7337)' : 'disabled' },
+        ],
+        senderState: `Listening on ${host}:${dataPort}`,
+        receiverState: `BlockManager directory recorded Exec-${execNum}`,
+      });
+    }
+  }
+  const hbIdx = isDiskDirFail ? (cfg.numExecutors >= 2 ? 1 : -1) : 0;
+  if (hbIdx >= 0) {
+    const hbExecNum = initialAllocations[hbIdx].execNum;
     b.addEvent({
       stepId: s3b,
-      from: execIds[i],
-      to: schedBackend,
-      categoryOverride: 'yarn-lifecycle',
+      from: execIds[hbIdx],
+      to: hbRx,
       channel: 'rpc',
-      protocol: 'Spark Netty RPC',
+      protocol: 'Spark Netty RPC (Heartbeat)',
       port: b.driverRpc,
-      label: `RegisterExecutor(id=${execNum})`,
-      info: `Exec-${execNum} fetches SparkAppConfig and registers ${cfg.executorCores} core(s) with ${b.driverRpc}.`,
-      size: '1.8 KB',
-      command: `RegisterExecutor("${execNum}", self, "${host}", ${cfg.executorCores})`,
-      fields: [
-        { name: 'executorId', value: `"${execNum}"` },
-        { name: 'cores', value: String(cfg.executorCores) },
-      ],
-      senderState: `Exec-${execNum} received RegisteredExecutor`,
-      receiverState: `Added Exec-${execNum} to executorDataMap`,
-    });
-    b.addEvent({
-      stepId: s3b,
-      from: execBms[i],
-      to: bmm,
-      categoryOverride: 'yarn-lifecycle',
-      channel: 'rpc',
-      protocol: 'Spark Netty RPC',
-      port: b.driverRpc,
-      label: `RegisterBM(Exec-${execNum})`,
-      info: `Exec-${execNum} BlockManager binds ${host}:${dataPort} and registers with driver BlockManagerMaster.`,
-      size: '1.2 KB',
-      command: `master.registerBlockManager(BlockManagerId("${execNum}", "${host}", ${dataPort}), ...)`,
-      fields: [
-        { name: 'dataPort', value: String(dataPort) },
-        { name: 'externalShuffleService', value: cfg.externalShuffleService ? 'enabled (:7337)' : 'disabled' },
-      ],
-      senderState: `Listening on ${host}:${dataPort}`,
-      receiverState: `BlockManager directory recorded Exec-${execNum}`,
+      label: `Heartbeat(exec=${hbExecNum}, 10s)`,
+      info: 'Executors send liveness + task accumulator metrics every 10s to driver HeartbeatReceiver.',
+      size: '780 B',
+      command: `heartbeatReceiverRef.askSync[HeartbeatResponse](Heartbeat("${hbExecNum}", accumUpdates, bmId))`,
+      fields: [{ name: 'interval', value: '10s' }],
+      senderState: 'Heartbeat timer active',
+      receiverState: 'Updated executorLastSeen timestamps',
     });
   }
-  b.addEvent({
-    stepId: s3b,
-    from: execIds[0],
-    to: hbRx,
-    channel: 'rpc',
-    protocol: 'Spark Netty RPC (Heartbeat)',
-    port: b.driverRpc,
-    label: 'Heartbeat(exec=1, 10s)',
-    info: 'Executors send liveness + task accumulator metrics every 10s to driver HeartbeatReceiver.',
-    size: '780 B',
-    command: 'heartbeatReceiverRef.askSync[HeartbeatResponse](Heartbeat("1", accumUpdates, bmId))',
-    fields: [{ name: 'interval', value: '10s' }],
-    senderState: 'Heartbeat timer active',
-    receiverState: 'Updated executorLastSeen timestamps',
-  });
 
-  // Track live AM and live executors across faults and dynamic allocation
+  // Track live AM, active endpoints, and live executors across faults and dynamic allocation
   let activeAm = am;
+  let activeAlloc = alloc;
+  let activeSchedBackend = schedBackend;
+  let activeBmm = bmm;
+  let activeHbRx = hbRx;
   let activeAttempt = 1;
   const liveExecs: string[] = [...execIds];
   const liveBms: string[] = [...execBms];
-  let nextExecNum = cfg.numExecutors + 1;
+  const liveExecNums: number[] = initialAllocations.map(a => a.execNum);
+  let nextExecNum = b.peekNextExecNum(1);
 
   // =========================================================================
   // FAULT: Cluster-Mode AM Crash -> Attempt 2 Restart (mid-run)
   // =========================================================================
   if (cfg.fault === 'am-crash-retry') {
+    const amNm = b.amNmInstance();
     const am2 = b.ensureInstance('am-attempt-2', {
       componentId: 'application-master',
       label: 'ApplicationMaster (Attempt 2)',
@@ -1509,60 +1590,125 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       hostZone: 'driver-jvm',
       hostLabel: 'driver-1 (Attempt 2)',
       processId: 'AM JVM Attempt 2',
+      containerId: 'container_e02_000001',
       attemptNumber: 2,
     });
-    const amCont2 = b.amContainerInstance(2);
+    const alloc2 = b.ensureInstance('yarn-allocator-a2', {
+      componentId: 'yarn-allocator',
+      label: 'YarnAllocator (Attempt 2)',
+      shortLabel: 'YarnAlloc A2',
+      hostZone: 'driver-jvm',
+      hostLabel: 'driver-1 (Attempt 2)',
+      processId: 'AM JVM Attempt 2',
+      containerId: 'container_e02_000001',
+      attemptNumber: 2,
+    });
+    const schedBackend2 = b.ensureInstance('driver-scheduler-backend-a2', {
+      componentId: 'driver-scheduler-backend',
+      label: 'SchedulerBackend (Attempt 2)',
+      shortLabel: 'SchedBack A2',
+      hostZone: 'driver-jvm',
+      hostLabel: 'driver-1 (Attempt 2)',
+      processId: 'AM JVM Attempt 2',
+      containerId: 'container_e02_000001',
+      attemptNumber: 2,
+    });
+    const bmm2 = b.ensureInstance('block-manager-master-a2', {
+      componentId: 'block-manager-master',
+      label: 'BlockManagerMaster (Attempt 2)',
+      shortLabel: 'BMMaster A2',
+      hostZone: 'driver-jvm',
+      hostLabel: 'driver-1 (Attempt 2)',
+      processId: 'AM JVM Attempt 2',
+      containerId: 'container_e02_000001',
+      attemptNumber: 2,
+    });
+    const hbRx2 = b.ensureInstance('heartbeat-receiver-a2', {
+      componentId: 'heartbeat-receiver',
+      label: 'HeartbeatReceiver (Attempt 2)',
+      shortLabel: 'Heartbeat A2',
+      hostZone: 'driver-jvm',
+      hostLabel: 'driver-1 (Attempt 2)',
+      processId: 'AM JVM Attempt 2',
+      containerId: 'container_e02_000001',
+      attemptNumber: 2,
+    });
     const sCrash = b.addStep({
       id: 'sim-step-am-crash',
-      title: 'Cluster AM Attempt 1 dies; YARN spawns Attempt 2 rerunning orders.py',
+      title: 'Cluster AM Attempt 1 SIGKILL (137); YARN spawns Attempt 2 rerunning orders.py',
       explanation:
-        'AM Attempt 1 crashes before reporting SUCCEEDED. Because attempt 1 < spark.yarn.maxAppAttempts (capped by yarn.resourcemanager.am.max-attempts), YARN starts a fresh AM Attempt 2 container. The new driver reruns orders.py from line 1 (in-memory DAG and Python state are NOT resumed).',
+        'AM Attempt 1 container dies with SIGKILL (exit 137) before reporting SUCCEEDED. SIGKILL terminates the AM JVM immediately with ZERO JVM shutdown hooks; driver-1 NodeManager reports ContainerStatus(exitStatus=137) to RM on :8031. Because the SIGKILLed Attempt 1 AM JVM never ran its ShutdownHookManager cleanup hook (and YARN RM never deletes Spark user-owned .sparkStaging/<appId>), staged archives remain intact on HDFS while RM cleans up Attempt 1 executor containers and launches AM Attempt 2 (container_e02_000001) via driver-1 NodeManager (am-nm). The fresh driver reruns orders.py from line 1.',
       category: 'yarn-lifecycle',
-      keyState: 'Attempt 1 LOST -> Attempt 2 RUNNING (fresh driver, script restarts from line 1)',
-      command: 'RM Attempt 1 failed -> AMLauncher starts appattempt_1740_0051_000002',
+      keyState: 'Attempt 1 LOST (NM->RM :8031 exit 137) -> Attempt 2 launched via am-nm (fresh driver)',
+      command: 'NM nodeHeartbeat(container_e01_000001, exitStatus=137) -> RM AMLauncher -> am-nm startContainers(container_e02_000001)',
       detailsPassed: [
-        { name: 'failedAttempt', value: 'appattempt_1740_0051_000001' },
-        { name: 'newAttempt', value: 'appattempt_1740_0051_000002' },
+        { name: 'failedAttempt', value: 'appattempt_1740_0051_000001 (SIGKILL 137; 0 JVM shutdown hooks)' },
+        { name: 'newAttempt', value: 'appattempt_1740_0051_000002 (container_e02_000001 via am-nm)' },
+        {
+          name: 'stagingDirIntact',
+          value: '.sparkStaging/<appId> remains on HDFS because SIGKILLed Attempt 1 AM never ran its ShutdownHookManager cleanup hook',
+        },
         { name: 'warning', value: 'Non-idempotent appends from Attempt 1 can duplicate output' },
       ],
       deepDiveComponentId: 'application-master',
     });
     b.addEvent({
       stepId: sCrash,
-      from: activeAm,
+      from: amNm,
       to: rm,
       channel: 'error',
-      protocol: 'YARN Attempt Failure',
-      port: 'rm01:8030',
-      label: 'AM Attempt 1 crashed',
-      info: 'Attempt 1 container exits unexpectedly; AM shutdown hook preserves .sparkStaging/ since attempt 1 < maxAppAttempts.',
-      size: 'Container lost',
-      command: 'NM ContainerStatus(container_e01_000001, exitStatus=137)',
+      protocol: 'Hadoop RPC (ResourceTracker :8031)',
+      port: 'rm01:8031',
+      label: 'AM Cont #1 exit (137)',
+      info: 'driver-1 NodeManager nodeHeartbeat reports container_e01_000001 COMPLETE (exitStatus=137, SIGKILL) on :8031. ZERO JVM shutdown hooks ran, so .sparkStaging/<appId> remains intact on HDFS (Attempt 1 AM never ran ShutdownHookManager cleanup, and RM retries Attempt 2 without deleting Spark staging dir) while RM cleans up Attempt 1 executor containers.',
+      size: 'ContainerStatus',
+      command: 'nodeHeartbeat -> ContainerStatus(container_e01_000001, COMPLETE, exitStatus=137)',
       fields: [
-        { name: 'isLastAttempt', value: 'false (1 < maxAppAttempts=2)' },
-        { name: 'stagingCleaned', value: 'false (preserved for retry)' },
+        { name: 'reporter', value: 'am-nm -> resource-manager (:8031)' },
+        { name: 'shutdownHooksRan', value: 'false (SIGKILL bypasses ShutdownHookManager cleanup)' },
+        { name: 'stagingDirState', value: '.sparkStaging/<appId> intact on HDFS (Attempt 1 AM cleanup hook never ran)' },
       ],
-      senderState: 'Attempt 1 JVM dead; old executors cleaned up',
-      receiverState: 'RM schedules fresh Attempt 2 container',
+      senderState: 'Attempt 1 JVM killed abruptly; NM reaped container_e01_000001',
+      receiverState: 'RM cleans Attempt 1 executors & schedules fresh Attempt 2 container',
       isError: true,
     });
     b.addEvent({
       stepId: sCrash,
       from: rm,
-      to: amCont2,
+      to: amNm,
       channel: 'yarn',
       protocol: 'Hadoop RPC (ContainerManagementProtocol)',
       port: 'driver-1:dynamic',
-      label: 'Launch AM Attempt 2',
-      info: 'RM launches container_e02_000001 for Attempt 2 under the SAME application ID.',
+      label: 'startContainers(AM A2)',
+      info: 'RM AMLauncher sends ContainerManagementProtocol.startContainers(container_e02_000001) to driver-1 NodeManager (am-nm) for Attempt 2 under the SAME application ID.',
       size: '16.0 KB',
-      command: 'AMLauncher.launch(appattempt_1740_0051_000002)',
+      command: 'AMLauncher.launch(appattempt_1740_0051_000002) -> cmProxy.startContainers(container_e02_000001)',
       fields: [
         { name: 'sameAppId', value: 'application_1740_0051' },
         { name: 'newAttemptId', value: 'appattempt_1740_0051_000002' },
+        { name: 'containerId', value: 'container_e02_000001' },
       ],
-      senderState: 'Attempt 2 launching',
-      receiverState: 'New JVM starting orders.py from line 1',
+      senderState: 'Dispatched Attempt 2 launch to driver-1 am-nm',
+      receiverState: 'am-nm localizing intact .sparkStaging/ and launching container_e02_000001',
+    });
+    b.addEvent({
+      stepId: sCrash,
+      from: amNm,
+      to: am2,
+      kind: 'local',
+      channel: 'yarn',
+      protocol: 'ContainerExecutor + cgroups',
+      port: 'driver-1 OS',
+      label: 'Launch AM Attempt 2',
+      info: 'driver-1 NodeManager (am-nm) launches container_e02_000001 OS process on driver-1 and boots Attempt 2 ApplicationMaster JVM rerunning orders.py from line 1.',
+      size: 'OS exec',
+      command: 'ContainerExecutor.launchContainer(container_e02_000001) -> ApplicationMaster.main()',
+      fields: [
+        { name: 'containerId', value: 'container_e02_000001' },
+        { name: 'attemptNumber', value: '2' },
+      ],
+      senderState: 'Monitoring AM Attempt 2 container_e02_000001',
+      receiverState: 'New AM Attempt 2 JVM starting orders.py from line 1',
     });
     b.addEvent({
       stepId: sCrash,
@@ -1572,31 +1718,38 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
       port: 'rm01:8030',
       label: 'Register AM Attempt 2',
-      info: 'Attempt 2 re-initializes SparkContext, registers with RM, and acquires fresh executors.',
+      info: 'Attempt 2 re-initializes SparkContext, registers with RM on :8030, instantiates Attempt-2 YarnAllocator, and acquires fresh executors.',
       size: '1.6 KB',
       command: 'amClient.register("driver-1", 41000, conf, "http://driver-1:4040")',
-      fields: [{ name: 'attempt', value: '2 (fresh SparkContext)' }],
+      fields: [{ name: 'attempt', value: '2 (fresh SparkContext & YarnAllocator)' }],
       senderState: 'Re-executing orders.py from entry point',
       receiverState: 'RM marks Attempt 2 RUNNING',
     });
     activeAm = am2;
+    activeAlloc = alloc2;
+    activeSchedBackend = schedBackend2;
+    activeBmm = bmm2;
+    activeHbRx = hbRx2;
     activeAttempt = 2;
+    b.resetForAttempt(2);
 
     // Allocate, launch, and register fresh Attempt-2 executors (container_e02_000002..)
-    const a2Execs = Array.from({ length: cfg.numExecutors }, (_, i) => b.execInstance(i + 1, 2));
-    const a2Bms = Array.from({ length: cfg.numExecutors }, (_, i) => b.execBmInstance(i + 1, 2));
+    const a2Allocs = Array.from({ length: cfg.numExecutors }, () => b.allocateExec(2));
+    const a2Execs = a2Allocs.map(a => b.execInstance(a.execNum, 2, a.containerId));
+    const a2Bms = a2Allocs.map(a => b.execBmInstance(a.execNum, 2, a.containerId));
     liveExecs.splice(0, liveExecs.length, ...a2Execs);
     liveBms.splice(0, liveBms.length, ...a2Bms);
-    nextExecNum = cfg.numExecutors + 1;
+    liveExecNums.splice(0, liveExecNums.length, ...a2Allocs.map(a => a.execNum));
+    nextExecNum = b.peekNextExecNum(2);
 
     const a2ContRange =
       cfg.numExecutors === 1
-        ? b.execContainerId(1, 2)
-        : `${b.execContainerId(1, 2)}..${b.execContainerId(cfg.numExecutors, 2)}`;
+        ? a2Allocs[0].containerId
+        : `${a2Allocs[0].containerId}..${a2Allocs[a2Allocs.length - 1].containerId}`;
     const sAm2Alloc = b.addStep({
       id: 'sim-step-am2-alloc',
       title: `AM Attempt 2 allocates & registers ${cfg.numExecutors} fresh executor(s) (${a2ContRange})`,
-      explanation: `YARN retired all Attempt 1 executor containers. AM Attempt 2 YarnAllocator requests ${cfg.numExecutors} fresh Attempt-2 container(s) (${a2ContRange}) from RM :8030, NodeManagers boot ${a2Execs.join(', ')}, and each registers with the Attempt 2 driver and BlockManagerMaster.`,
+      explanation: `YARN retired all Attempt 1 executor containers. AM Attempt 2 YarnAllocator (${activeAlloc}) requests ${cfg.numExecutors} fresh Attempt-2 container(s) (${a2ContRange}) from RM :8030, NodeManagers boot ${a2Execs.join(', ')}, and each registers with Attempt 2 SchedulerBackend and BlockManagerMaster.`,
       category: 'yarn-lifecycle',
       keyState: `${cfg.numExecutors} Attempt-2 executor(s) registered (${a2Execs.join(', ')})`,
       command: `amClient.allocate(${cfg.numExecutors}x A2) -> nmClient.startContainer(${a2ContRange}) -> RegisterExecutor`,
@@ -1609,7 +1762,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     });
     b.addEvent({
       stepId: sAm2Alloc,
-      from: alloc,
+      from: activeAlloc,
       to: rm,
       channel: 'yarn',
       protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
@@ -1626,14 +1779,13 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       receiverState: `RM grants ${cfg.numExecutors} Attempt 2 container(s)`,
     });
     for (let i = 0; i < cfg.numExecutors; i++) {
-      const execNum = i + 1;
+      const { execNum, containerId: cid } = a2Allocs[i];
       const nm = b.nmInstance(b.execHostZone(execNum));
       const host = b.execHostName(execNum);
-      const cid = b.execContainerId(execNum, 2);
       const dataPort = b.execDataPort(execNum);
       b.addEvent({
         stepId: sAm2Alloc,
-        from: alloc,
+        from: activeAlloc,
         to: nm,
         channel: 'yarn',
         protocol: 'Hadoop RPC (ContainerManagementProtocol)',
@@ -1652,12 +1804,12 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       b.addEvent({
         stepId: sAm2Alloc,
         from: a2Execs[i],
-        to: schedBackend,
+        to: activeSchedBackend,
         channel: 'rpc',
         protocol: 'Spark Netty RPC',
         port: b.driverRpc,
         label: `RegisterExec(a2-${execNum})`,
-        info: `Fresh Attempt 2 executor ${a2Execs[i]} (${cid}) on ${host} registers ${cfg.executorCores} core(s) with driver.`,
+        info: `Fresh Attempt 2 executor ${a2Execs[i]} (${cid}) on ${host} registers ${cfg.executorCores} core(s) with Attempt 2 driver.`,
         size: '1.8 KB',
         command: `ref.ask[Boolean](RegisterExecutor("${execNum}", self, "${host}", ${cfg.executorCores})) // ${cid}`,
         fields: [
@@ -1670,12 +1822,12 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       b.addEvent({
         stepId: sAm2Alloc,
         from: a2Bms[i],
-        to: bmm,
+        to: activeBmm,
         channel: 'rpc',
         protocol: 'Spark Netty RPC',
         port: b.driverRpc,
         label: `RegisterBM(a2-${execNum})`,
-        info: `Attempt 2 BlockManager ${a2Bms[i]} (${cid}) binds ${host}:${dataPort} and registers with BlockManagerMaster.`,
+        info: `Attempt 2 BlockManager ${a2Bms[i]} (${cid}) binds ${host}:${dataPort} and registers with Attempt 2 BlockManagerMaster.`,
         size: '1.2 KB',
         command: `master.registerBlockManager(BlockManagerId("${execNum}", "${host}", ${dataPort}), ...) // ${cid}`,
         fields: [
@@ -1697,13 +1849,13 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       id: 'sim-step-client-disc',
       title: 'External driver on edge-01 dies; AM detects onDisconnected',
       explanation:
-        'The submit-host driver disappears without sending Shutdown(code). Client-mode AMEndpoint.onDisconnected() fires: with default spark.yarn.am.clientModeTreatDisconnectAsFailed=false it reports SUCCEEDED; with =true it reports FAILED (EXIT_DISCONNECTED). YARN cannot recreate the external Python driver.',
+        'The submit-host driver disappears without sending Shutdown(code). Client-mode AMEndpoint.onDisconnected() fires on the client-outbound RPC channel: with default spark.yarn.am.clientModeTreatDisconnectAsFailed=false it reports SUCCEEDED (EXIT_SUCCESS=0); with =true it reports FAILED (EXIT_DISCONNECTED=17). YARN cannot recreate the external Python driver.',
       category: 'yarn-lifecycle',
-      keyState: 'Client driver lost | YARN cannot restart external Python process',
-      command: 'AMEndpoint.onDisconnected(edge-01:41000) -> finish(FAILED, EXIT_DISCONNECTED)',
+      keyState: 'Client driver lost | EXIT_DISCONNECTED=17 (if strict) or SUCCEEDED/0 (default)',
+      command: 'AMEndpoint.onDisconnected(edge-01:41000) -> finish(FAILED, EXIT_DISCONNECTED=17)',
       detailsPassed: [
-        { name: 'defaultConfig', value: 'clientModeTreatDisconnectAsFailed=false -> reports SUCCEEDED' },
-        { name: 'strictConfig', value: 'clientModeTreatDisconnectAsFailed=true -> reports FAILED (EXIT_DISCONNECTED)' },
+        { name: 'defaultConfig', value: 'clientModeTreatDisconnectAsFailed=false -> reports SUCCEEDED (EXIT_SUCCESS=0)' },
+        { name: 'strictConfig', value: 'clientModeTreatDisconnectAsFailed=true -> reports FAILED (EXIT_DISCONNECTED=17)' },
         { name: 'yarnRecovery', value: 'None -- YARN cannot relaunch edge-01 driver' },
       ],
       deepDiveComponentId: 'application-master',
@@ -1713,10 +1865,10 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       from: yarnBackend,
       to: activeAm,
       channel: 'error',
-      protocol: 'Netty TCP Disconnect',
-      port: 'edge-01:41000',
+      protocol: 'Netty TCP Disconnect (AM outbound)',
+      port: 'edge-01:41000 (AM outbound RPC)',
       label: 'Driver TCP disconnect',
-      info: 'Submit host edge-01 dies abruptly without sending Shutdown(0) RPC to AMEndpoint.',
+      info: 'Submit host edge-01 dies abruptly without sending Shutdown(0) RPC to AMEndpoint over the AM-outbound RPC channel.',
       size: 'TCP RST/EOF',
       command: 'AMEndpoint.onDisconnected(RpcAddress("edge-01", 41000))',
       fields: [
@@ -1735,12 +1887,12 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
       port: 'rm01:8030',
       label: 'unregisterAM(DISCONN)',
-      info: 'AM unregisters with RM (FAILED when clientModeTreatDisconnectAsFailed=true; SUCCEEDED under default false!) and YARN tears down executors.',
+      info: 'Registered client AM unregisters with RM (FAILED with EXIT_DISCONNECTED=17 when clientModeTreatDisconnectAsFailed=true; SUCCEEDED/0 under default false!) and YARN tears down executors.',
       size: '980 B',
-      command: 'finish(FinalApplicationStatus.FAILED, EXIT_DISCONNECTED)',
+      command: 'finish(FinalApplicationStatus.FAILED, EXIT_DISCONNECTED=17); amClient.unregister(...)',
       fields: [
-        { name: 'ifTreatDisconnectAsFailed', value: 'FAILED (EXIT_DISCONNECTED)' },
-        { name: 'ifDefaultFalse', value: 'SUCCEEDED (verify sink commit logs!)' },
+        { name: 'ifTreatDisconnectAsFailed', value: 'FAILED (EXIT_DISCONNECTED=17)' },
+        { name: 'ifDefaultFalse', value: 'SUCCEEDED (EXIT_SUCCESS=0; verify sink commit logs!)' },
       ],
       senderState: 'AM shutting down',
       receiverState: 'RM cleans up remaining executor containers',
@@ -1750,28 +1902,63 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
   }
 
   // =========================================================================
-  // WORKLOAD EXECUTION STEPS (ALL 7 JOB TYPES)
+  // RUNTIME STATE + PHASE 4 (Executor Startup) & PHASE 5 (Pre-Workload Faults)
   // =========================================================================
-  const producerExec = liveExecs[0];
-  const producerBm = liveBms[0];
   const targetPart = Math.min(cfg.numPartitions - 1, Math.floor(cfg.numPartitions / 2));
   const initialMapId = 100 + targetPart;
   const recomputedMapId = 200 + targetPart;
+  const state: SimRuntimeState = {
+    cfg,
+    totalSlots,
+    idealWavesPerStage,
+    targetPart,
+    initialMapId,
+    recomputedMapId,
+    activeAm,
+    activeAttempt,
+    amRegistered: b.isAmRegistered(activeAm),
+    amNm: amNmInstanceId,
+    liveExecs,
+    liveBms,
+    liveExecNums,
+    nextExecNum,
+    abortedByFault: false,
+    submit,
+    rm,
+    alloc: activeAlloc,
+    schedBackend: activeSchedBackend,
+    bmm: activeBmm,
+    hbRx: activeHbRx,
+  };
+
+  injectExecutorStartupFault(b, state);
+  tryInjectPreWorkloadFault(b, state);
+
+  // =========================================================================
+  // WORKLOAD EXECUTION STEPS (ALL 7 JOB TYPES)
+  // =========================================================================
+  const producerExec = state.liveExecs[0];
+  const producerBm = state.liveBms[0];
+  const producerExecNum = b.instanceExecutorNumber(producerExec);
+  const { hostZone: producerZone, hostName: producerHost } = b.instanceWorkerHost(producerExec);
+  const producerBmPort = b.instanceHostLabel(producerBm);
+  const isSpillOom = cfg.fault === 'task-spill-oom';
+  const isTaskResultLost = cfg.fault === 'task-result-lost';
+  let taskResultLostHandled = false;
   const targetScale =
     cfg.dynamicAllocation && cfg.numPartitions > totalSlots
       ? Math.min(6, Math.ceil(cfg.numPartitions / cfg.executorCores))
       : cfg.numExecutors;
   const willScaleUp = cfg.dynamicAllocation && targetScale > cfg.numExecutors;
   let dynAllocEmitted = false;
-  let abortedByFault = false;
 
   const getConsumerPair = () => {
-    const workerBIdx = liveExecs.findIndex(
+    const workerBIdx = state.liveExecs.findIndex(
       id => b.instanceWorkerHost(id).hostZone === 'worker-node-b',
     );
     const idx = workerBIdx !== -1 ? workerBIdx : 0;
-    const consumerExec = liveExecs[idx];
-    const consumerBm = liveBms[idx];
+    const consumerExec = state.liveExecs[idx];
+    const consumerBm = state.liveBms[idx];
     const { hostZone, hostName } = b.instanceWorkerHost(consumerExec);
     return { consumerExec, consumerBm, hostZone, hostName };
   };
@@ -1836,14 +2023,15 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         senderState: `Exponential numExecutorsToAdd=${r.nominalDelta} -> next ${r.nominalDelta * 2}`,
         receiverState: 'Proxying RequestExecutors to active AM',
       });
+      const amLink = b.driverToAmLink();
       b.addEvent({
         stepId: sDyn,
         from: yb,
-        to: activeAm,
-        kind: cfg.deployMode === 'cluster' ? 'local' : 'wire',
+        to: state.activeAm,
+        kind: amLink.kind,
         channel: 'rpc',
-        protocol: cfg.deployMode === 'cluster' ? 'In-JVM AMEndpoint' : 'Spark Netty RPC',
-        port: cfg.deployMode === 'cluster' ? 'driver-1 in-JVM' : 'driver-1:dynamic',
+        protocol: amLink.protocol,
+        port: amLink.port,
         label: `RequestExecutors(${r.nextTarget})`,
         info: `YarnSchedulerBackend sends RequestExecutors(${r.nextTarget}) (+${r.requestedDelta}) to active AM on ${r.trigger}.`,
         size: '620 B',
@@ -1858,7 +2046,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       });
       b.addEvent({
         stepId: sDyn,
-        from: alloc,
+        from: state.alloc,
         to: rm,
         channel: 'yarn',
         protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
@@ -1874,20 +2062,20 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         senderState: 'Waiting for RM grants',
         receiverState: `RM grants +${r.requestedDelta} container(s)`,
       });
-      for (let n = r.prevTarget + 1; n <= r.nextTarget; n++) {
-        const newExec = b.execInstance(n, activeAttempt);
-        const newBm = b.execBmInstance(n, activeAttempt);
+      for (let k = 0; k < r.requestedDelta; k++) {
+        const { execNum: n, containerId: cid } = b.allocateExec(state.activeAttempt);
+        const newExec = b.execInstance(n, state.activeAttempt, cid);
+        const newBm = b.execBmInstance(n, state.activeAttempt, cid);
         const nm = b.nmInstance(b.execHostZone(n));
         const host = b.execHostName(n);
-        const cid = b.execContainerId(n, activeAttempt);
         b.addEvent({
           stepId: sDyn,
-          from: alloc,
+          from: state.alloc,
           to: nm,
           channel: 'yarn',
           protocol: 'Hadoop RPC (ContainerManagementProtocol)',
           port: `${host}:dynamic`,
-          label: activeAttempt > 1 ? `startContainer(A${activeAttempt} E${n})` : `startContainer(Exec-${n})`,
+          label: state.activeAttempt > 1 ? `startContainer(A${state.activeAttempt} E${n})` : `startContainer(Exec-${n})`,
           info: `ExecutorRunnable launches ramped ${cid} (${newExec}) on ${host}.`,
           size: '9.4 KB',
           command: `nmClient.startContainer(${cid}, ctx[exec=${n}])`,
@@ -1901,11 +2089,11 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         b.addEvent({
           stepId: sDyn,
           from: newExec,
-          to: schedBackend,
+          to: state.schedBackend,
           channel: 'rpc',
           protocol: 'Spark Netty RPC',
           port: b.driverRpc,
-          label: activeAttempt > 1 ? `RegisterExec(a${activeAttempt}-${n})` : `RegisterExecutor(id=${n})`,
+          label: state.activeAttempt > 1 ? `RegisterExec(a${state.activeAttempt}-${n})` : `RegisterExecutor(id=${n})`,
           info: `Ramped ${newExec} (${cid}) on ${host} registers ${cfg.executorCores} core(s) with driver and joins live executor pool.`,
           size: '1.8 KB',
           command: `ref.ask[Boolean](RegisterExecutor("${n}", self, "${host}", ${cfg.executorCores}))`,
@@ -1915,17 +2103,18 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
             { name: 'cores', value: String(cfg.executorCores) },
           ],
           senderState: `${newExec} ready for pending backlog tasks`,
-          receiverState: `Live executors now ${liveExecs.length + 1}`,
+          receiverState: `Live executors now ${state.liveExecs.length + 1}`,
         });
-        liveExecs.push(newExec);
-        liveBms.push(newBm);
-        nextExecNum = Math.max(nextExecNum, n + 1);
+        state.liveExecs.push(newExec);
+        state.liveBms.push(newBm);
+        state.liveExecNums.push(n);
+        state.nextExecNum = b.peekNextExecNum(state.activeAttempt);
       }
     }
   };
 
   const emitTaskExceptionStep = (stageLabel: string, failingExec: string) => {
-    abortedByFault = true;
+    state.abortedByFault = true;
     const tsm = b.std('task-set-manager');
     const dag = b.std('dag-scheduler');
     const sTaskFail = b.addStep({
@@ -1978,58 +2167,14 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       receiverState: 'ActiveJob failed',
       isError: true,
     });
+    emitTerminalAppOutcome(b, state, {
+      origin: 'user-python-app',
+      diagnostic: `Job aborted due to stage failure: Task ${targetPart} failed 4 times (spark.task.maxFailures=4)`,
+      stopLiveExecutors: true,
+    });
   };
 
-  const removeExec1AndLaunchReplacement = (stepId: string) => {
-    const deadIdx = liveExecs.indexOf(producerExec);
-    if (deadIdx !== -1) {
-      liveExecs.splice(deadIdx, 1);
-      liveBms.splice(deadIdx, 1);
-    }
-    const replNum = nextExecNum++;
-    const replZone: 'worker-node-a' | 'worker-node-b' = 'worker-node-a';
-    const replNm = b.nmInstance(replZone);
-    const replExec = b.execReplInstance(replNum, replZone, activeAttempt);
-    const replBm = b.execReplBmInstance(replNum, replZone, activeAttempt);
-    const replCid = b.execContainerId(replNum, activeAttempt);
-    b.addEvent({
-      stepId,
-      from: alloc,
-      to: replNm,
-      channel: 'yarn',
-      protocol: 'Hadoop RPC (ContainerManagementProtocol)',
-      port: 'worker-a:dynamic',
-      label: 'startContainer(Exec-repl)',
-      info: `YarnAllocator launches replacement ${replCid} (Exec-${replNum}) on worker-a after ${producerExec} loss.`,
-      size: '9.4 KB',
-      command: `nmClient.startContainer(${replCid}, ctx[exec=${replNum}])`,
-      fields: [{ name: 'replacementExecutor', value: `${replExec} (id=${replNum})` }],
-      senderState: 'Dispatched replacement executor container',
-      receiverState: 'Booting replacement executor JVM on worker-a',
-    });
-    b.addEvent({
-      stepId,
-      from: replExec,
-      to: schedBackend,
-      channel: 'rpc',
-      protocol: 'Spark Netty RPC',
-      port: b.driverRpc,
-      label: 'RegisterExecutor(repl)',
-      info: `Replacement executor (${replExec}, id=${replNum}) on worker-a registers ${cfg.executorCores} core(s) to finish retried tasks.`,
-      size: '1.8 KB',
-      command: `ref.ask[Boolean](RegisterExecutor("${replNum}", self, "worker-a", ${cfg.executorCores}))`,
-      fields: [
-        { name: 'executorId', value: `"${replNum}"` },
-        { name: 'cores', value: String(cfg.executorCores) },
-      ],
-      senderState: `${replExec} ready for rescheduled tasks`,
-      receiverState: `Registered replacement ${replExec} (${liveExecs.length + 1} live)`,
-    });
-    liveExecs.push(replExec);
-    liveBms.push(replBm);
-  };
-
-  if (cfg.jobType === 'narrow-filter') {
+  if (!state.abortedByFault && cfg.jobType === 'narrow-filter') {
     const sqlPlanner = b.std('sql-planner');
     const dag = b.std('dag-scheduler');
     const isTaskFail = cfg.fault === 'task-exception';
@@ -2070,13 +2215,13 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     });
     b.addEvent({
       stepId: sNarrow,
-      from: schedBackend,
+      from: state.schedBackend,
       to: producerExec,
       channel: 'rpc',
       protocol: 'Spark Netty RPC',
       port: b.driverRpc,
       label: `LaunchTask (${cfg.numPartitions} parts)`,
-      info: `Driver dispatches narrow filter+write tasks across Exec-1..Exec-${cfg.numExecutors} (${Math.min(cfg.numPartitions, totalSlots)} running, ${Math.max(0, cfg.numPartitions - totalSlots)} pending).`,
+      info: `Driver dispatches narrow filter+write tasks across ${state.liveExecs.join(', ')} (${Math.min(cfg.numPartitions, totalSlots)} running, ${Math.max(0, cfg.numPartitions - totalSlots)} pending).`,
       size: '2.2 KB',
       command: 'executorEndpoint.send(LaunchTask(serializedTask))',
       fields: [
@@ -2089,26 +2234,35 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     if (willScaleUp) {
       emitDynamicAllocationScaleUp();
     }
+    if (isSpillOom) {
+      injectTaskSpillOomStep(b, state);
+    }
     if (isTaskFail) {
       emitTaskExceptionStep('ResultStage 0', producerExec);
-    } else if (willScaleUp) {
+    } else if (willScaleUp || isSpillOom) {
       const dn = b.std('hdfs-datanode');
       const sNarrowRun = b.addStep({
         id: 'sim-step-narrow-run',
-        title: `All ${liveExecs.length} live executors scan & write staged Parquet parts`,
-        explanation: `With ${liveExecs.length} live executors after dynamic scale-up, remaining pending narrow tasks finish scanning Parquet blocks from HDFS DataNode and write staged output parts.`,
+        title: isTaskResultLost
+          ? `Live executors (${state.liveExecs.length}) stage Parquet parts & emit IndirectTaskResult`
+          : `All ${state.liveExecs.length} live executors finish scanning & writing staged Parquet parts`,
+        explanation: isTaskResultLost
+          ? `With ${state.liveExecs.length} live executor(s), narrow tasks scan Parquet blocks from HDFS DataNode, write staged output parts, and send IndirectTaskResult to driver while ResultStage 0 remains pending final result fetch.`
+          : `With ${state.liveExecs.length} live executor(s), remaining narrow tasks finish scanning Parquet blocks from HDFS DataNode and write staged output parts.`,
         category: 'sql-planning-aqe',
-        keyState: `ResultStage 0 completed across ${liveExecs.length} live executors`,
+        keyState: isTaskResultLost
+          ? `ResultStage 0 pending IndirectTaskResult fetch (${state.liveExecs.length} live executors)`
+          : `ResultStage 0 completed across ${state.liveExecs.length} live executors`,
         command: 'FileSourceScanExec -> FilterExec -> SingleDirectoryDataWriter.write()',
         detailsPassed: [
-          { name: 'liveExecutors', value: String(liveExecs.length) },
+          { name: 'liveExecutors', value: String(state.liveExecs.length) },
           { name: 'shuffleBytes', value: '0 B (no shuffle!)' },
         ],
         deepDiveComponentId: 'hdfs-datanode',
       });
       b.addEvent({
         stepId: sNarrowRun,
-        from: liveExecs[liveExecs.length - 1],
+        from: state.liveExecs[state.liveExecs.length - 1],
         to: dn,
         channel: 'data',
         protocol: 'HDFS DataTransferProtocol',
@@ -2121,9 +2275,18 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           { name: 'shuffleBytes', value: '0 B (no shuffle!)' },
           { name: 'pythonWorkers', value: '0 (built-in SQL runs in JVM)' },
         ],
-        senderState: 'All narrow tasks finished',
+        senderState: isTaskResultLost
+          ? 'Task staged Parquet part; sending IndirectTaskResult to driver'
+          : 'All narrow tasks finished',
         receiverState: 'Staged Parquet parts flushed to DataNodes',
       });
+      if (isTaskResultLost) {
+        taskResultLostHandled = true;
+        injectTaskResultLostStep(b, state, {
+          inCollectStep: false,
+          stageLabel: 'ResultStage 0 (narrow filter)',
+        });
+      }
     } else {
       const dn = b.std('hdfs-datanode');
       b.addEvent({
@@ -2141,11 +2304,20 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           { name: 'shuffleBytes', value: '0 B (no shuffle!)' },
           { name: 'pythonWorkers', value: '0 (built-in SQL runs in JVM)' },
         ],
-        senderState: 'All narrow tasks finished',
+        senderState: isTaskResultLost
+          ? 'Task staged Parquet part; sending IndirectTaskResult to driver'
+          : 'All narrow tasks finished',
         receiverState: 'Staged Parquet parts flushed to DataNodes',
       });
+      if (isTaskResultLost) {
+        taskResultLostHandled = true;
+        injectTaskResultLostStep(b, state, {
+          inCollectStep: false,
+          stageLabel: 'ResultStage 0 (narrow filter)',
+        });
+      }
     }
-  } else if (cfg.jobType === 'wide-shuffle' || cfg.jobType === 'sort-merge-skew') {
+  } else if (!state.abortedByFault && (cfg.jobType === 'wide-shuffle' || cfg.jobType === 'sort-merge-skew')) {
     const isSkewJoin = cfg.jobType === 'sort-merge-skew';
     const isSkewedProfile = cfg.dataProfile === 'skewed';
     const aqeSplits = isSkewJoin && cfg.aqeEnabled && isSkewedProfile;
@@ -2153,7 +2325,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     const sqlPlanner = b.std('sql-planner');
     const dag = b.std('dag-scheduler');
 
-    if (willScaleUp || isTaskFail) {
+    if (willScaleUp || isTaskFail || isSpillOom) {
       const sMapSubmit = b.addStep({
         id: 'sim-step-map-submit',
         title: isSkewJoin
@@ -2189,7 +2361,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       });
       b.addEvent({
         stepId: sMapSubmit,
-        from: schedBackend,
+        from: state.schedBackend,
         to: producerExec,
         channel: 'rpc',
         protocol: 'Spark Netty RPC',
@@ -2208,24 +2380,27 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       if (willScaleUp) {
         emitDynamicAllocationScaleUp();
       }
+      if (isSpillOom) {
+        injectTaskSpillOomStep(b, state);
+      }
     }
 
     if (isTaskFail) {
       emitTaskExceptionStep('ShuffleMapStage 0', producerExec);
     } else {
       const motm = b.std('map-output-tracker-master');
-      const shuffleWriter = b.workerStd('shuffle-writer', 'worker-node-a');
-      const resolver = b.workerStd('shuffle-block-resolver', 'worker-node-a');
-      const shuffleServerPort = cfg.externalShuffleService ? 'worker-a:7337' : 'worker-a:42001';
+      const shuffleWriter = b.workerStd('shuffle-writer', producerZone);
+      const resolver = b.workerStd('shuffle-block-resolver', producerZone);
+      const shuffleServerPort = cfg.externalShuffleService ? `${producerHost}:7337` : producerBmPort;
 
       const sPlanMap = b.addStep({
         id: 'sim-step-map',
         title: isSkewJoin
           ? `Map Stages write shuffle outputs (${isSkewedProfile ? '640 MiB hot partition 0' : 'uniform 48 MiB'})`
           : `ShuffleMapStage 0: ${cfg.numPartitions} map tasks write .data/.index & report MapStatus`,
-        explanation: `DAGScheduler runs ShuffleMapStage 0 across ${liveExecs.length} live executor(s). Map tasks commit consolidated .data/.index files via IndexShuffleBlockResolver (logical mapIndex=${targetPart}, physical mapId=${initialMapId}) and return MapStatus to DAGScheduler -> MapOutputTrackerMaster.`,
+        explanation: `DAGScheduler runs ShuffleMapStage 0 across ${state.liveExecs.length} live executor(s). Map tasks commit consolidated .data/.index files via IndexShuffleBlockResolver (logical mapIndex=${targetPart}, physical mapId=${initialMapId}) and return MapStatus to DAGScheduler -> MapOutputTrackerMaster.`,
         category: 'sql-planning-aqe',
-        keyState: `Map stage complete | serving via ${cfg.externalShuffleService ? 'ESS worker-a:7337' : 'Exec-1 BM worker-a:42001'}`,
+        keyState: `Map stage complete | serving via ${cfg.externalShuffleService ? `ESS ${producerHost}:7337` : `${producerExec} BM ${producerBmPort}`}`,
         command: 'DAGScheduler.submitStage(ShuffleMapStage 0) -> BypassMergeSortShuffleWriter.write()',
         detailsPassed: [
           { name: 'shuffleWriter', value: 'BypassMergeSortShuffleWriter (default <= 200 parts)' },
@@ -2236,7 +2411,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         deepDiveComponentId: 'shuffle-writer',
         isMacro: true,
       });
-      if (!willScaleUp) {
+      if (!willScaleUp && !isSpillOom) {
         b.addEvent({
           stepId: sPlanMap,
           from: sqlPlanner,
@@ -2387,9 +2562,9 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         });
       }
 
-      // Reduce Fetch Step (or FetchFailed fault!)
+      // Reduce Fetch Step (or Shuffle/DAG-Shuffle fault!)
       const reduceConsumer = getConsumerPair();
-      const isLocalShuffle = liveExecs.length === 1;
+      const isLocalShuffle = state.liveExecs.length === 1;
       const shuffleReader = b.workerStd('shuffle-reader', reduceConsumer.hostZone);
       const motw = b.workerStd('map-output-tracker-worker', reduceConsumer.hostZone);
       const aqeOffNote =
@@ -2399,216 +2574,30 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
             : ' AQE is OFF, so uniform 48 MiB partitions run without runtime re-optimization.'
           : '';
 
-      if (cfg.fault === 'shuffle-fetch-failed') {
-        const essNode = cfg.externalShuffleService ? b.essInstance('worker-node-a') : null;
-        const shuffleServer = essNode ?? producerBm;
-        const retiredExecs: string[] = [];
-        if (cfg.externalShuffleService) {
-          // Host/disk loss on worker-a retires EVERY executor hosted on worker-node-a.
-          const survivingExecs: string[] = [];
-          const survivingBms: string[] = [];
-          for (let i = 0; i < liveExecs.length; i++) {
-            if (b.instanceWorkerHost(liveExecs[i]).hostZone === 'worker-node-a') {
-              retiredExecs.push(liveExecs[i]);
-            } else {
-              survivingExecs.push(liveExecs[i]);
-              survivingBms.push(liveBms[i]);
-            }
-          }
-          liveExecs.splice(0, liveExecs.length, ...survivingExecs);
-          liveBms.splice(0, liveBms.length, ...survivingBms);
-        } else {
-          const deadIdx = liveExecs.indexOf(producerExec);
-          if (deadIdx !== -1) {
-            retiredExecs.push(liveExecs[deadIdx]);
-            liveExecs.splice(deadIdx, 1);
-            liveBms.splice(deadIdx, 1);
-          }
-        }
+      const handledReduceFault = tryInjectShuffleReduceFault(b, state, {
+        aqeOffNote,
+        isLocalShuffle,
+        shuffleServerPort,
+        producerExec,
+        producerExecNum,
+        producerBm,
+        producerZone,
+        producerHost,
+        reduceConsumer,
+      });
 
-        let pendingWorkerBRepl: { num: number; exec: string; bm: string } | null = null;
-        if (liveExecs.length === 0) {
-          const replNum = nextExecNum++;
-          const replExec = b.execReplInstance(replNum, 'worker-node-b', activeAttempt);
-          const replBm = b.execReplBmInstance(replNum, 'worker-node-b', activeAttempt);
-          liveExecs.push(replExec);
-          liveBms.push(replBm);
-          pendingWorkerBRepl = { num: replNum, exec: replExec, bm: replBm };
-        }
-        const recomputeExec = liveExecs[0];
-        const recomputeHost = b.instanceWorkerHost(recomputeExec).hostName;
-
-        const sFf = b.addStep({
-          id: 'sim-step-fetchfailed',
-          title: cfg.externalShuffleService
-            ? `ESS (:7337) survives producer exit; worker-a loss retires ${retiredExecs.length} exec(s) & reruns mapId=${recomputedMapId}`
-            : `Producer Exec-1 lost -> FetchFailed -> invalidate mapIndex=${targetPart} -> mapId=${recomputedMapId} rerun`,
-          explanation: (cfg.externalShuffleService
-            ? `With External Shuffle Service ON (:7337), Exec-1 exiting alone STILL lets reducers fetch intact shuffle files from worker-a:7337. A subsequent worker-a node/disk failure causes FetchFailed, retires ALL executors on worker-node-a (${retiredExecs.join(', ')}), invalidates worker-a map outputs, recomputes missing logical mapIndex=${targetPart} on surviving ${recomputeExec} (${recomputeHost}) under new physical mapId=${recomputedMapId}, and retries ResultStage 1.1.`
-            : `With ESS OFF, losing Exec-1 breaks worker-a:42001 fetches -> ShuffleBlockFetcherIterator reports FetchFailed -> DAGScheduler invalidates MapOutputTrackerMaster (bumping epoch), resubmits ONLY lost logical mapIndex=${targetPart} under new physical attempt mapId=${recomputedMapId} on surviving ${recomputeExec} (${recomputeHost}), and retries ResultStage 1.1 (counted against stage-attempt limits, NOT spark.task.maxFailures).`) + aqeOffNote,
-          category: 'shuffle-internals',
-          keyState: `FetchFailed recovered on ${recomputeExec} (${recomputeHost}) via mapId=${recomputedMapId} & ResultStage 1.1`,
-          command: cfg.externalShuffleService
-            ? 'DAGScheduler.handleTaskCompletion(FetchFailed) -> removeExecutor(worker-a) -> unregisterAllMapOutput("worker-a")'
-            : 'DAGScheduler.handleTaskCompletion(FetchFailed) -> unregisterMapOutput -> scheduleResubmit()',
-          detailsPassed: [
-            { name: 'externalShuffleService', value: cfg.externalShuffleService ? 'ON (:7337)' : 'OFF (:42001)' },
-            { name: 'retiredExecutors', value: retiredExecs.join(', ') },
-            { name: 'survivingExecutors', value: liveExecs.join(', ') },
-            { name: 'oldPhysicalBlock', value: `shuffle_0_${initialMapId}_${targetPart} (lost; mapIndex=${targetPart})` },
-            { name: 'newPhysicalBlock', value: `shuffle_0_${recomputedMapId}_${targetPart} (recomputed on ${recomputeExec})` },
-            { name: 'retryBudget', value: 'Stage attempt limit (4), NOT spark.task.maxFailures' },
-          ],
-          deepDiveComponentId: 'dag-scheduler',
-        });
-        if (essNode) {
-          b.addEvent({
-            stepId: sFf,
-            from: shuffleReader,
-            to: essNode,
-            channel: 'data',
-            protocol: 'BlockTransfer -> ESS :7337',
-            port: 'worker-a:7337',
-            label: 'ESS serves after Exec exit',
-            info: 'Even after Exec-1 exits, worker-a NM External Shuffle Service (:7337) serves intact local shuffle files cleanly.',
-            size: '4.6 MiB OK',
-            command: `ExternalBlockStoreClient.fetchBlocks("worker-a", 7337, "1", ["shuffle_0_${initialMapId}_${targetPart}"])`,
-            fields: [{ name: 'essBenefit', value: 'Decouples shuffle serving from executor JVM lifetime' }],
-            senderState: 'Fetch succeeded via ESS',
-            receiverState: 'Served file segment from local disk',
-          });
-        }
-        b.addEvent({
-          stepId: sFf,
-          from: shuffleReader,
-          to: shuffleServer,
-          channel: 'error',
-          protocol: 'BlockTransfer (IOException)',
-          port: shuffleServerPort,
-          label: cfg.externalShuffleService ? 'Node loss -> FetchFailed' : 'FetchFailed (Exec-1 lost)',
-          info: cfg.externalShuffleService
-            ? 'worker-a node/disk becomes unreachable -> retries exhausted -> FetchFailedException.'
-            : 'Exec-1 died -> worker-a:42001 unreachable -> retries exhausted -> FetchFailedException.',
-          size: 'IOException',
-          command: `throw new FetchFailedException(bmAddress, shuffleId=0, mapId=${initialMapId}, mapIndex=${targetPart}, reduceId=${targetPart})`,
-          fields: [
-            { name: 'failedAddress', value: shuffleServerPort },
-            { name: 'mapIndex_vs_mapId', value: `logical mapIndex=${targetPart}, physical mapId=${initialMapId}` },
-          ],
-          senderState: 'Task reports FetchFailed to driver',
-          receiverState: 'Producer unreachable',
-          isError: true,
-        });
-        if (cfg.externalShuffleService && retiredExecs.length > 0) {
-          b.addEvent({
-            stepId: sFf,
-            from: alloc,
-            to: schedBackend,
-            channel: 'error',
-            protocol: 'Spark Netty RPC (RemoveExecutor)',
-            port: b.driverRpc,
-            label: `Retire worker-a (${retiredExecs.length} exec${retiredExecs.length > 1 ? 's' : ''})`,
-            info: `Lost host worker-a retires ALL executors hosted on worker-node-a (${retiredExecs.join(', ')}) from active executorDataMap.`,
-            size: `${retiredExecs.length} removed`,
-            command: `driverRef.send(RemoveExecutors([${retiredExecs.join(', ')}], SlaveLost("Host worker-a lost")))`,
-            fields: [
-              { name: 'lostHost', value: 'worker-a (worker-node-a)' },
-              { name: 'retiredExecutors', value: retiredExecs.join(', ') },
-              { name: 'survivingExecutors', value: liveExecs.join(', ') },
-            ],
-            senderState: `Retired ${retiredExecs.length} worker-a executor(s)`,
-            receiverState: `Removed ${retiredExecs.join(', ')} from live pool`,
-            isError: true,
-          });
-        }
-        b.addEvent({
-          stepId: sFf,
-          from: dag,
-          to: motm,
-          kind: 'local',
-          channel: 'internal',
-          protocol: 'In-JVM Invalidate + Epoch',
-          port: `${b.driverHost} in-JVM`,
-          label: `unregisterMapOutput(${targetPart})`,
-          info: cfg.externalShuffleService
-            ? `DAGScheduler invalidates all map outputs on lost host worker-a (including mapIndex=${targetPart}), bumps epoch, and schedules Stage 0.1 -> Stage 1.1.`
-            : `DAGScheduler invalidates lost logical mapIndex=${targetPart}, bumps epoch, and schedules Stage 0.1 -> Stage 1.1.`,
-          size: 'in-memory',
-          command: cfg.externalShuffleService
-            ? 'mapOutputTracker.unregisterAllMapOutput("worker-a"); scheduleResubmit()'
-            : `mapOutputTracker.unregisterMapOutput(0, ${targetPart}, bmAddress); scheduleResubmit()`,
-          fields: [
-            { name: 'newEpoch', value: '2' },
-            { name: 'resubmit', value: `ShuffleMapStage 0.1 (missing mapIndex=${targetPart}) -> ResultStage 1.1` },
-          ],
-          senderState: `Recomputing missing partition on surviving ${recomputeExec} (${recomputeHost})`,
-          receiverState: 'Stale location evicted',
-        });
-        if (pendingWorkerBRepl) {
-          const nmB = b.nmInstance('worker-node-b');
-          const replCid = b.execContainerId(pendingWorkerBRepl.num, activeAttempt);
-          b.addEvent({
-            stepId: sFf,
-            from: alloc,
-            to: nmB,
-            channel: 'yarn',
-            protocol: 'Hadoop RPC (ContainerManagementProtocol)',
-            port: 'worker-b:dynamic',
-            label: 'startContainer(Exec-repl)',
-            info: `All previous executors were on lost worker-a; YarnAllocator launches replacement ${replCid} on worker-b.`,
-            size: '9.4 KB',
-            command: `nmClient.startContainer(${replCid}, ctx[exec=${pendingWorkerBRepl.num}])`,
-            fields: [{ name: 'replacementExecutor', value: pendingWorkerBRepl.exec }],
-            senderState: 'Dispatched worker-b replacement container',
-            receiverState: 'Booting replacement executor JVM on worker-b',
-          });
-          b.addEvent({
-            stepId: sFf,
-            from: pendingWorkerBRepl.exec,
-            to: schedBackend,
-            channel: 'rpc',
-            protocol: 'Spark Netty RPC',
-            port: b.driverRpc,
-            label: 'RegisterExecutor(repl)',
-            info: `Replacement executor ${pendingWorkerBRepl.exec} on worker-b registers ${cfg.executorCores} core(s) to recompute missing shuffle partitions.`,
-            size: '1.8 KB',
-            command: `ref.ask[Boolean](RegisterExecutor("${pendingWorkerBRepl.num}", self, "worker-b", ${cfg.executorCores}))`,
-            fields: [
-              { name: 'executorId', value: `"${pendingWorkerBRepl.num}"` },
-              { name: 'host', value: 'worker-b' },
-            ],
-            senderState: `${pendingWorkerBRepl.exec} ready on worker-b`,
-            receiverState: `Registered worker-b replacement (${liveExecs.length} live)`,
-          });
-        }
-        b.addEvent({
-          stepId: sFf,
-          from: recomputeExec,
-          to: motm,
-          channel: 'rpc',
-          protocol: 'Spark Netty RPC (MapStatus)',
-          port: b.driverRpc,
-          label: `Recompute mapId=${recomputedMapId} OK`,
-          info: `Surviving ${recomputeExec} (${recomputeHost}) recomputes logical mapIndex=${targetPart} under new physical attempt mapId=${recomputedMapId} (shuffle_0_${recomputedMapId}_${targetPart}); Stage 1.1 succeeds.`,
-          size: '640 B',
-          command: `registerMapOutput(shuffleId=0, mapIndex=${targetPart}, MapStatus(${recomputeHost}, mapId=${recomputedMapId}))`,
-          fields: [
-            { name: 'recomputeExecutor', value: `${recomputeExec} (${recomputeHost})` },
-            { name: 'newBlock', value: `shuffle_0_${recomputedMapId}_${targetPart}` },
-          ],
-          senderState: 'Recomputed map output served cleanly',
-          receiverState: 'ResultStage 1.1 completes',
-        });
+      if (handledReduceFault) {
+        // Handled by shuffle/DAG fault injector
       } else if (isLocalShuffle) {
         const sFetch = b.addStep({
           id: 'sim-step-reduce-fetch',
           title: 'Reduce stage reads local shuffle blocks directly from worker-a disk',
-          explanation: `With 1 executor (Exec-1 on worker-a), all map outputs are local to worker-a. MapOutputTrackerWorker fetches compressed MapOutputStatuses from driver on cache miss, then ShuffleBlockFetcherIterator reads local .data/.index slices directly via IndexShuffleBlockResolver on worker-a (zero remote shuffle network hops).${aqeOffNote}`,
+          explanation: `With 1 live executor (${producerExec}, id=${producerExecNum} on ${producerHost}), all map outputs are local to ${producerHost}. MapOutputTrackerWorker fetches compressed MapOutputStatuses from driver on cache miss, then ShuffleBlockFetcherIterator reads local .data/.index slices directly via IndexShuffleBlockResolver on ${producerHost} (zero remote shuffle network hops).${aqeOffNote}`,
           category: 'shuffle-internals',
-          keyState: `Local shuffle read on worker-a (.data/.index); 0 remote bytes${isSkewJoin && !cfg.aqeEnabled ? (isSkewedProfile ? ' | AQE OFF (640 MiB straggler)' : ' | AQE OFF (48 MiB uniform)') : ''}`,
+          keyState: `Local shuffle read on ${producerHost} (.data/.index); 0 remote bytes${isSkewJoin && !cfg.aqeEnabled ? (isSkewedProfile ? ' | AQE OFF (640 MiB straggler)' : ' | AQE OFF (48 MiB uniform)') : ''}`,
           command: `ShuffleBlockFetcherIterator.fetchLocalBlocks(shuffle_0_${initialMapId}_${targetPart})`,
           detailsPassed: [
-            { name: 'readMode', value: 'Local disk read on worker-a (single executor)' },
+            { name: 'readMode', value: `Local disk read on ${producerHost} (single live executor id=${producerExecNum})` },
             { name: 'blockId', value: `shuffle_0_${initialMapId}_${targetPart}` },
             { name: 'partitionSize', value: isSkewedProfile ? '640 MiB hot partition 0' : '48 MiB uniform' },
           ],
@@ -2626,7 +2615,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           size: '1.9 KB',
           command: 'askTracker[Array[Byte]](GetMapOutputStatuses(0))',
           fields: [{ name: 'shuffleId', value: '0' }],
-          senderState: 'Cached shuffle 0 statuses locally (all on worker-a)',
+          senderState: `Cached shuffle 0 statuses locally (all on ${producerHost})`,
           receiverState: 'Returned serialized MapStatus array',
         });
         b.addEvent({
@@ -2636,30 +2625,41 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           kind: 'local',
           channel: 'data',
           protocol: 'Local Disk Shuffle Read',
-          port: 'worker-a local-dir',
+          port: `${producerHost} local-dir`,
           label: 'Read local .data/.index',
-          info: `ShuffleBlockFetcherIterator reads shuffle_0_${initialMapId}_${targetPart} directly from local .data/.index files on worker-a (no remote network socket).`,
+          info: `ShuffleBlockFetcherIterator reads shuffle_0_${initialMapId}_${targetPart} directly from local .data/.index files on ${producerHost} (no remote network socket).`,
           size: isSkewedProfile ? '640 MiB local' : '4.6 MiB local',
           command: `IndexShuffleBlockResolver.getBlockData(ShuffleBlockId(0, ${initialMapId}, ${targetPart}))`,
           fields: [
-            { name: 'transferType', value: 'local (worker-a disk; 0 remote bytes)' },
+            { name: 'transferType', value: `local (${producerHost} disk; 0 remote bytes)` },
             { name: 'blockId', value: `shuffle_0_${initialMapId}_${targetPart}` },
           ],
           senderState: 'Read local shuffle bytes via FileSegmentManagedBuffer',
-          receiverState: 'Final HashAggregate / SortMergeJoin complete on worker-a',
+          receiverState: isTaskResultLost
+            ? `Reducer computed partition on ${producerHost}; sending IndirectTaskResult to driver`
+            : `Final HashAggregate / SortMergeJoin complete on ${producerHost}`,
         });
+        if (isTaskResultLost) {
+          taskResultLostHandled = true;
+          injectTaskResultLostStep(b, state, {
+            inCollectStep: false,
+            stageLabel: 'ResultStage 1 (reduce)',
+          });
+        }
       } else {
-        const essNode = cfg.externalShuffleService ? b.essInstance('worker-node-a') : null;
+        const essNode = cfg.externalShuffleService ? b.essInstance(producerZone) : null;
         const shuffleServer = essNode ?? producerBm;
+        const liveMapPort = b.execDataPort(producerExecNum);
         const sFetch = b.addStep({
           id: 'sim-step-reduce-fetch',
-          title: `Reduce stage fetches shuffle blocks from ${cfg.externalShuffleService ? 'ESS (:7337)' : 'Exec-1 BM (:42001)'}`,
-          explanation: `MapOutputTrackerWorker fetches compressed MapOutputStatuses from driver on cache miss, then ShuffleReader (OneForOneBlockFetcher) streams remote shuffle bytes directly from ${shuffleServerPort} to ${reduceConsumer.hostName} (never relayed through the driver).${aqeOffNote}`,
+          title: `Reduce stage fetches shuffle blocks from ${cfg.externalShuffleService ? 'ESS (:7337)' : `Exec-${producerExecNum} BM (:${liveMapPort})`}`,
+          explanation: `MapOutputTrackerWorker fetches compressed MapOutputStatuses from driver on cache miss, then ShuffleReader (OneForOneBlockFetcher) streams remote shuffle bytes directly from ${shuffleServerPort} (live producer executor "${producerExecNum}") to ${reduceConsumer.hostName} (never relayed through the driver).${aqeOffNote}`,
           category: 'shuffle-internals',
           keyState: `Remote shuffle bytes streamed directly from ${shuffleServerPort} -> ${reduceConsumer.hostName}`,
-          command: `OneForOneBlockFetcher.start(FetchShuffleBlocks("${shuffleServerPort}", shuffleId=0))`,
+          command: `OneForOneBlockFetcher.start(FetchShuffleBlocks("${shuffleServerPort}", execId="${producerExecNum}", shuffleId=0))`,
           detailsPassed: [
             { name: 'servingEndpoint', value: shuffleServerPort },
+            { name: 'mapProducerExecId', value: `"${producerExecNum}" (${producerExec})` },
             { name: 'protocol', value: 'FetchShuffleBlocks -> StreamHandle -> ChunkFetchRequest' },
             { name: 'maxSizeInFlight', value: '48 MiB (spark.reducer.maxSizeInFlight)' },
           ],
@@ -2685,13 +2685,16 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           from: shuffleReader,
           to: shuffleServer,
           channel: 'data',
-          protocol: cfg.externalShuffleService ? 'BlockTransfer (ESS :7337)' : 'BlockTransfer (Netty :42001)',
+          protocol: cfg.externalShuffleService ? 'BlockTransfer (ESS :7337)' : `BlockTransfer (Netty :${liveMapPort})`,
           port: shuffleServerPort,
           label: 'FetchShuffleBlocks(0)',
-          info: `OneForOneBlockFetcher requests shuffle_0_${initialMapId}_${targetPart} directly from ${shuffleServerPort}.`,
+          info: `OneForOneBlockFetcher requests shuffle_0_${initialMapId}_${targetPart} directly from ${shuffleServerPort} (live executor "${producerExecNum}").`,
           size: '420 B req',
-          command: `new FetchShuffleBlocks(appId, "1", 0, [${initialMapId}], [[${targetPart}]], false)`,
-          fields: [{ name: 'target', value: shuffleServerPort }],
+          command: `new FetchShuffleBlocks(appId, "${producerExecNum}", 0, [${initialMapId}], [[${targetPart}]], false)`,
+          fields: [
+            { name: 'target', value: shuffleServerPort },
+            { name: 'producerExecId', value: `"${producerExecNum}"` },
+          ],
           senderState: 'Awaiting StreamHandle & chunks',
           receiverState: 'Reading slice via IndexShuffleBlockResolver',
         });
@@ -2708,296 +2711,331 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           command: 'ChunkFetchSuccess(streamId, chunkIndex=0, FileSegmentManagedBuffer)',
           fields: [{ name: 'driverRelay', value: 'none (direct peer transfer)' }],
           senderState: 'Closed chunk stream',
-          receiverState: 'Final HashAggregate / SortMergeJoin complete',
+          receiverState: isTaskResultLost
+            ? 'Reducer computed partition; sending IndirectTaskResult to driver'
+            : 'Final HashAggregate / SortMergeJoin complete',
+        });
+        if (isTaskResultLost) {
+          taskResultLostHandled = true;
+          injectTaskResultLostStep(b, state, {
+            inCollectStep: false,
+            stageLabel: 'ResultStage 1 (reduce)',
+          });
+        }
+      }
+    }
+  } else if (!state.abortedByFault && cfg.jobType === 'broadcast-join') {
+    if (tryInjectBroadcastFault(b, state) !== 'handled-abort') {
+      const bcastEx = b.std('broadcast-exchange');
+      const bcastMgr = b.std('broadcast-manager');
+      const driverBm = b.driverBmInstance();
+      const isTaskFail = cfg.fault === 'task-exception';
+      const isTorrentCorrupt = cfg.fault === 'torrent-piece-corrupt';
+
+      const sBcast = b.addStep({
+        id: 'sim-step-bcast',
+        title: `BroadcastExchange + TorrentBroadcast across ${cfg.numExecutors} executor(s)`,
+        explanation: `Driver collects small dimension table (10.8 MiB) into a HashedRelation. TorrentBroadcast stores ALL 3 serialized pieces (4 + 4 + 2.8 MiB; 4 MiB blockSize) on Driver BM; executors fetch in randomized order and advertise immediately (${cfg.numExecutors >= 2 ? 'enabling peer-to-peer E1 -> E2 fetches' : 'direct from Driver BM with 1 executor, no E-to-E hop'}). Expand for TorrentBroadcast internals.`,
+        category: 'broadcast-torrent',
+        keyState: `Broadcast HashedRelation ready on all ${cfg.numExecutors} executor(s); 0 large-table shuffle`,
+        command: 'BroadcastExchangeExec -> TorrentBroadcast.writeBlocks() -> BroadcastHashJoinExec',
+        detailsPassed: [
+          { name: 'pieceSizes', value: '4 + 4 + 2.8 MiB (10.8 MiB total; 4 MiB blockSize)' },
+          { name: 'driverStores', value: 'ALL 3 serialized pieces (broadcast_0_piece0..2)' },
+          { name: 'p2pHops', value: cfg.numExecutors >= 2 ? 'Enabled (illustrative E1 -> E2)' : 'None (1 executor)' },
+        ],
+        deepDiveComponentId: 'broadcast-manager',
+        isMacro: true,
+      });
+      b.addEvent({
+        stepId: sBcast,
+        from: bcastEx,
+        to: driverBm,
+        kind: 'local',
+        channel: 'data',
+        protocol: 'In-JVM TorrentBroadcast',
+        port: `${b.driverHost} in-JVM`,
+        label: 'Publish 3 pieces (10.8M)',
+        info: 'Driver builds HashedRelation and stores ALL 3 serialized pieces (4 + 4 + 2.8 MiB) in Driver BM.',
+        size: '10.8 MiB (4+4+2.8)',
+        command: 'TorrentBroadcast.writeBlocks(hashedRelation)',
+        fields: [
+          { name: 'pieces', value: 'broadcast_0_piece0..2 (4 + 4 + 2.8 MiB)' },
+          { name: 'driverNote', value: 'Driver retains serialized pieces & broadcast handle' },
+        ],
+        senderState: 'Broadcast handle ready for tasks',
+        receiverState: 'Driver BM serving pieces 0..2',
+      });
+      b.addEvent({
+        stepId: sBcast,
+        from: driverBm,
+        to: producerBm,
+        channel: 'data',
+        protocol: 'BlockTransfer - TorrentBroadcast',
+        port: `${b.driverBmPort} -> ${producerHost}`,
+        label: 'Fetch pieces (Driver->E1)',
+        info: `${producerBm} visits piece IDs in randomized order, fetches 4 + 4 + 2.8 MiB from Driver BM, and immediately advertises ${producerBmPort}.`,
+        size: '10.8 MiB',
+        command: 'TorrentBroadcast.readBlocks() -> exec1BM.getRemoteBytes()',
+        fields: [{ name: 'fetchOrder', value: 'Randomized per executor' }],
+        senderState: `Seeded pieces to ${producerExec}`,
+        receiverState: `${producerExec} cached pieces & registered as peer seed`,
+        peerTag: 'Driver -> E1',
+      });
+      if (state.liveBms.length >= 2) {
+        const peerBm = state.liveBms[1];
+        const peerExec = state.liveExecs[1];
+        b.addEvent({
+          stepId: sBcast,
+          from: producerBm,
+          to: peerBm,
+          channel: 'data',
+          protocol: 'BlockTransfer - TorrentBroadcast P2P',
+          port: `${producerBmPort} -> worker-b`,
+          label: 'P2P piece0 (E1->E2)',
+          info: `Illustrative seeded peer fetch: ${peerExec} fetches broadcast_0_piece0 (4.0 MiB) from locality-ordered peer ${producerBm}, offloading the driver.`,
+          size: '4.0 MiB',
+          command: `exec2BM.getRemoteBytes(broadcast_0_piece0) // peer ${producerBmPort}`,
+          fields: [
+            { name: 'peer', value: producerBmPort },
+            { name: 'note', value: 'Illustrative P2P hop; remaining 4 + 2.8 MiB pieces fetched from peers or driver' },
+          ],
+          senderState: `Served cached piece0 to ${peerExec}`,
+          receiverState: `${peerExec} reassembled HashedRelation`,
+          peerTag: 'E1 -> E2',
         });
       }
-    }
-  } else if (cfg.jobType === 'broadcast-join') {
-    const bcastEx = b.std('broadcast-exchange');
-    const bcastMgr = b.std('broadcast-manager');
-    const driverBm = b.driverBmInstance();
-    const isTaskFail = cfg.fault === 'task-exception';
 
-    const sBcast = b.addStep({
-      id: 'sim-step-bcast',
-      title: `BroadcastExchange + TorrentBroadcast across ${cfg.numExecutors} executor(s)`,
-      explanation: `Driver collects small dimension table (10.8 MiB) into a HashedRelation. TorrentBroadcast stores ALL 3 serialized pieces (4 + 4 + 2.8 MiB; 4 MiB blockSize) on Driver BM; executors fetch in randomized order and advertise immediately (${cfg.numExecutors >= 2 ? 'enabling peer-to-peer E1 -> E2 fetches' : 'direct from Driver BM with 1 executor, no E-to-E hop'}). Expand for TorrentBroadcast internals.`,
-      category: 'broadcast-torrent',
-      keyState: `Broadcast HashedRelation ready on all ${cfg.numExecutors} executor(s); 0 large-table shuffle`,
-      command: 'BroadcastExchangeExec -> TorrentBroadcast.writeBlocks() -> BroadcastHashJoinExec',
-      detailsPassed: [
-        { name: 'pieceSizes', value: '4 + 4 + 2.8 MiB (10.8 MiB total; 4 MiB blockSize)' },
-        { name: 'driverStores', value: 'ALL 3 serialized pieces (broadcast_0_piece0..2)' },
-        { name: 'p2pHops', value: cfg.numExecutors >= 2 ? 'Enabled (illustrative E1 -> E2)' : 'None (1 executor)' },
-      ],
-      deepDiveComponentId: 'broadcast-manager',
-      isMacro: true,
-    });
-    b.addEvent({
-      stepId: sBcast,
-      from: bcastEx,
-      to: driverBm,
-      kind: 'local',
-      channel: 'data',
-      protocol: 'In-JVM TorrentBroadcast',
-      port: `${b.driverHost} in-JVM`,
-      label: 'Publish 3 pieces (10.8M)',
-      info: 'Driver builds HashedRelation and stores ALL 3 serialized pieces (4 + 4 + 2.8 MiB) in Driver BM.',
-      size: '10.8 MiB (4+4+2.8)',
-      command: 'TorrentBroadcast.writeBlocks(hashedRelation)',
-      fields: [
-        { name: 'pieces', value: 'broadcast_0_piece0..2 (4 + 4 + 2.8 MiB)' },
-        { name: 'driverNote', value: 'Driver retains serialized pieces & broadcast handle' },
-      ],
-      senderState: 'Broadcast handle ready for tasks',
-      receiverState: 'Driver BM serving pieces 0..2',
-    });
-    b.addEvent({
-      stepId: sBcast,
-      from: driverBm,
-      to: producerBm,
-      channel: 'data',
-      protocol: 'BlockTransfer - TorrentBroadcast',
-      port: `${b.driverBmPort} -> worker-a`,
-      label: 'Fetch pieces (Driver->E1)',
-      info: `${producerBm} visits piece IDs in randomized order, fetches 4 + 4 + 2.8 MiB from Driver BM, and immediately advertises worker-a:42001.`,
-      size: '10.8 MiB',
-      command: 'TorrentBroadcast.readBlocks() -> exec1BM.getRemoteBytes()',
-      fields: [{ name: 'fetchOrder', value: 'Randomized per executor' }],
-      senderState: `Seeded pieces to ${producerExec}`,
-      receiverState: `${producerExec} cached pieces & registered as peer seed`,
-      peerTag: 'Driver -> E1',
-    });
-    if (liveBms.length >= 2) {
-      const peerBm = liveBms[1];
-      const peerExec = liveExecs[1];
-      b.addEvent({
-        stepId: sBcast,
-        from: producerBm,
-        to: peerBm,
-        channel: 'data',
-        protocol: 'BlockTransfer - TorrentBroadcast P2P',
-        port: 'worker-a:42001 -> worker-b',
-        label: 'P2P piece0 (E1->E2)',
-        info: `Illustrative seeded peer fetch: ${peerExec} fetches broadcast_0_piece0 (4.0 MiB) from locality-ordered peer ${producerBm}, offloading the driver.`,
-        size: '4.0 MiB',
-        command: 'exec2BM.getRemoteBytes(broadcast_0_piece0) // peer worker-a:42001',
-        fields: [
-          { name: 'peer', value: 'worker-a:42001' },
-          { name: 'note', value: 'Illustrative P2P hop; remaining 4 + 2.8 MiB pieces fetched from peers or driver' },
-        ],
-        senderState: `Served cached piece0 to ${peerExec}`,
-        receiverState: `${peerExec} reassembled HashedRelation`,
-        peerTag: 'E1 -> E2',
-      });
-    }
-
-    if (!willScaleUp && !isTaskFail) {
-      const probeConsumer = getConsumerPair();
-      const bhj = b.workerStd('broadcast-hash-join', probeConsumer.hostZone);
-      b.addEvent({
-        stepId: sBcast,
-        from: probeConsumer.consumerBm,
-        to: bhj,
-        kind: 'local',
-        categoryOverride: 'sql-planning-aqe',
-        channel: 'internal',
-        protocol: 'In-JVM HashedRelation Probe',
-        port: `${probeConsumer.hostName} in-JVM`,
-        label: 'Probe streamed fact rows',
-        info: `BroadcastHashJoinExec on ${probeConsumer.hostName} probes read-only HashedRelation per streamed row with zero large-table shuffle.`,
-        size: 'in-memory',
-        command: 'BroadcastHashJoinExec.doExecute() -> hashedRelation.asReadOnlyCopy()',
-        fields: [
-          { name: 'probeHost', value: probeConsumer.hostName },
-          { name: 'largeSideShuffle', value: '0 B (avoided!)' },
-        ],
-        senderState: 'Deserialized HashedRelation shared across executor threads',
-        receiverState: 'Joined rows streaming to Parquet writer',
-      });
-    }
-
-    // Expandable TorrentBroadcast detail sub-steps
-    const sTb1 = b.addStep({
-      id: 'sim-step-bcast-1',
-      parentId: sBcast,
-      title: 'TorrentBroadcast chunks 10.8 MiB (4 + 4 + 2.8 MiB) & updates BlockManagerMaster',
-      explanation: 'Driver TorrentBroadcast splits 10.8 MiB using 4 MiB blockSize into 3 serialized pieces (4 + 4 + 2.8 MiB), writes them into Driver BM, and registers their locations in BlockManagerMaster.',
-      category: 'broadcast-torrent',
-      keyState: 'All 3 pieces (4 + 4 + 2.8 MiB) advertised on driver BM',
-      command: 'TorrentBroadcast.writeBlocks() -> master.updateBlockInfo(driverBmId, pieces)',
-      detailsPassed: [{ name: 'pieces', value: '4 + 4 + 2.8 MiB (4 MiB blockSize)' }],
-      deepDiveComponentId: 'broadcast-manager',
-    });
-    b.addEvent({
-      stepId: sTb1,
-      from: bcastMgr,
-      to: driverBm,
-      kind: 'local',
-      channel: 'data',
-      protocol: 'In-JVM writeBlocks',
-      port: `${b.driverHost} in-JVM`,
-      label: 'Write piece0..2 (10.8M)',
-      info: 'Stores all 3 serialized pieces (4 + 4 + 2.8 MiB) locally in Driver BM.',
-      size: '10.8 MiB',
-      command: 'blockManager.putBytes(BroadcastBlockId(0, "piece" + i), bytes, MEMORY_AND_DISK_SER)',
-      fields: [{ name: 'pieces', value: '4 + 4 + 2.8 MiB (3 pieces)' }],
-      senderState: 'Pieces written',
-      receiverState: 'Serving pieces on Driver BM',
-    });
-    b.addEvent({
-      stepId: sTb1,
-      from: driverBm,
-      to: bmm,
-      kind: 'local',
-      channel: 'rpc',
-      protocol: 'In-JVM BlockManagerMaster',
-      port: `${b.driverHost} in-JVM`,
-      label: 'UpdateBlockInfo(0..2)',
-      info: 'Driver BM registers all 3 piece locations in BlockManagerMaster.',
-      size: '540 B',
-      command: 'master.updateBlockInfo(driverBmId, broadcast_0_piece0..2)',
-      fields: [{ name: 'seed', value: b.driverBmPort }],
-      senderState: 'Directory updated',
-      receiverState: 'Executors can discover seed locations',
-    });
-    const sTb2 = b.addStep({
-      id: 'sim-step-bcast-2',
-      parentId: sBcast,
-      title: cfg.numExecutors >= 2
-        ? 'Randomized executor fetch & immediate peer seeding (Driver -> E1 -> E2)'
-        : 'Single executor fetches all 3 pieces directly from Driver BM (0 E-to-E hops)',
-      explanation: cfg.numExecutors >= 2
-        ? 'Exec-1 fetches in randomized order and immediately advertises cached pieces; Exec-2 fetches piece0 P2P from Exec-1 BM (illustrative seeded peer fetch).'
-        : 'With 1 executor, there are no peer executors; Exec-1 fetches all 3 pieces (4 + 4 + 2.8 MiB) directly from Driver BM.',
-      category: 'broadcast-torrent',
-      keyState: 'All executors hold deserialized HashedRelation',
-      command: 'TorrentBroadcast.readBlocks() // randomized order + immediate UpdateBlockInfo',
-      detailsPassed: [{ name: 'executors', value: String(cfg.numExecutors) }],
-      deepDiveComponentId: 'block-manager',
-    });
-    b.addEvent({
-      stepId: sTb2,
-      from: driverBm,
-      to: producerBm,
-      channel: 'data',
-      protocol: 'BlockTransfer - TorrentBroadcast',
-      port: `${b.driverBmPort} -> worker-a`,
-      label: 'Fetch piece0 (Driver->E1)',
-      info: `${producerExec} fetches piece0 (4.0 MiB) from Driver BM and advertises worker-a:42001 immediately.`,
-      size: '4.0 MiB',
-      command: 'exec1BM.getRemoteBytes(broadcast_0_piece0)',
-      fields: [{ name: 'blockId', value: 'broadcast_0_piece0' }],
-      senderState: 'Served piece0',
-      receiverState: `${producerExec} now acts as peer seed`,
-      peerTag: 'Driver -> E1',
-    });
-    if (liveBms.length >= 2) {
-      const peerBm = liveBms[1];
-      const peerExec = liveExecs[1];
-      b.addEvent({
-        stepId: sTb2,
-        from: producerBm,
-        to: peerBm,
-        channel: 'data',
-        protocol: 'BlockTransfer - TorrentBroadcast P2P',
-        port: 'worker-a:42001 -> worker-b',
-        label: 'P2P piece0 (E1->E2)',
-        info: `${peerExec} fetches piece0 directly from peer ${producerBm}.`,
-        size: '4.0 MiB',
-        command: 'exec2BM.getRemoteBytes(broadcast_0_piece0)',
-        fields: [{ name: 'peer', value: 'worker-a:42001' }],
-        senderState: 'Served peer piece0',
-        receiverState: 'Reassembling HashedRelation',
-        peerTag: 'E1 -> E2',
-      });
-    }
-
-    if (willScaleUp || isTaskFail) {
-      const sqlPlanner = b.std('sql-planner');
-      const dag = b.std('dag-scheduler');
-      const sBhjSubmit = b.addStep({
-        id: 'sim-step-bhj-submit',
-        title: `Submit streamed fact-table BroadcastHashJoin stage (${cfg.numPartitions} tasks)`,
-        explanation: `DAGScheduler submits ResultStage with ${cfg.numPartitions} streamed fact-table probe tasks (${Math.max(0, cfg.numPartitions - totalSlots)} pending in backlog).`,
-        category: 'sql-planning-aqe',
-        keyState: `BroadcastHashJoin stage submitted (${cfg.numPartitions} tasks)`,
-        command: `DAGScheduler.submitJob(BroadcastHashJoinExec, partitions=0..${cfg.numPartitions - 1})`,
-        detailsPassed: [{ name: 'partitions', value: String(cfg.numPartitions) }],
-        deepDiveComponentId: 'dag-scheduler',
-      });
-      b.addEvent({
-        stepId: sBhjSubmit,
-        from: sqlPlanner,
-        to: dag,
-        kind: 'local',
-        channel: 'internal',
-        protocol: 'In-JVM Catalyst -> DAG',
-        port: `${b.driverHost} in-JVM`,
-        label: `Plan BHJ (${cfg.numPartitions} parts)`,
-        info: 'BroadcastHashJoinExec submits streamed fact-table probe tasks referencing broadcast handle.',
-        size: 'in-memory',
-        command: 'BroadcastHashJoinExec.doExecute()',
-        fields: [{ name: 'partitions', value: String(cfg.numPartitions) }],
-        senderState: 'Streamed stage planned',
-        receiverState: 'Submitting TaskSet for streamed fact partitions',
-      });
-      b.addEvent({
-        stepId: sBhjSubmit,
-        from: schedBackend,
-        to: producerExec,
-        channel: 'rpc',
-        protocol: 'Spark Netty RPC',
-        port: b.driverRpc,
-        label: `LaunchTask (${cfg.numPartitions} parts)`,
-        info: `Driver launches streamed BHJ probe tasks (${Math.max(0, cfg.numPartitions - totalSlots)} pending).`,
-        size: '2.2 KB',
-        command: 'executorEndpoint.send(LaunchTask(serializedTask))',
-        fields: [{ name: 'slots', value: String(totalSlots) }],
-        senderState: 'Initial probe wave running',
-        receiverState: 'Probing broadcast HashedRelation',
-      });
-      if (willScaleUp) {
-        emitDynamicAllocationScaleUp();
-      }
-      if (isTaskFail) {
-        emitTaskExceptionStep('BroadcastHashJoin ResultStage', producerExec);
-      } else {
+      if (!willScaleUp && !isTaskFail && !isTorrentCorrupt && !isSpillOom) {
         const probeConsumer = getConsumerPair();
         const bhj = b.workerStd('broadcast-hash-join', probeConsumer.hostZone);
-        const sBhjProbe = b.addStep({
-          id: 'sim-step-bhj-probe',
-          title: `BroadcastHashJoin probes streamed fact rows on ${probeConsumer.hostName}`,
-          explanation: `All ${liveExecs.length} live executors probe read-only HashedRelation per streamed row with zero large-table shuffle.`,
-          category: 'sql-planning-aqe',
-          keyState: `BroadcastHashJoin completed across ${liveExecs.length} live executors`,
-          command: 'BroadcastHashJoinExec.doExecute() -> hashedRelation.asReadOnlyCopy()',
-          detailsPassed: [{ name: 'probeHost', value: probeConsumer.hostName }],
-          deepDiveComponentId: 'broadcast-hash-join',
-        });
         b.addEvent({
-          stepId: sBhjProbe,
+          stepId: sBcast,
           from: probeConsumer.consumerBm,
           to: bhj,
           kind: 'local',
+          categoryOverride: 'sql-planning-aqe',
           channel: 'internal',
           protocol: 'In-JVM HashedRelation Probe',
           port: `${probeConsumer.hostName} in-JVM`,
           label: 'Probe streamed fact rows',
-          info: `BroadcastHashJoinExec on ${probeConsumer.hostName} probes read-only HashedRelation with zero large-table shuffle.`,
+          info: `BroadcastHashJoinExec on ${probeConsumer.hostName} probes read-only HashedRelation per streamed row with zero large-table shuffle.`,
           size: 'in-memory',
           command: 'BroadcastHashJoinExec.doExecute() -> hashedRelation.asReadOnlyCopy()',
-          fields: [{ name: 'largeSideShuffle', value: '0 B (avoided!)' }],
+          fields: [
+            { name: 'probeHost', value: probeConsumer.hostName },
+            { name: 'largeSideShuffle', value: '0 B (avoided!)' },
+          ],
           senderState: 'Deserialized HashedRelation shared across executor threads',
           receiverState: 'Joined rows streaming to Parquet writer',
         });
       }
+
+      // Expandable TorrentBroadcast detail sub-steps
+      const sTb1 = b.addStep({
+        id: 'sim-step-bcast-1',
+        parentId: sBcast,
+        title: 'TorrentBroadcast chunks 10.8 MiB (4 + 4 + 2.8 MiB) & updates BlockManagerMaster',
+        explanation: 'Driver TorrentBroadcast splits 10.8 MiB using 4 MiB blockSize into 3 serialized pieces (4 + 4 + 2.8 MiB), writes them into Driver BM, and registers their locations in BlockManagerMaster.',
+        category: 'broadcast-torrent',
+        keyState: 'All 3 pieces (4 + 4 + 2.8 MiB) advertised on driver BM',
+        command: 'TorrentBroadcast.writeBlocks() -> master.updateBlockInfo(driverBmId, pieces)',
+        detailsPassed: [{ name: 'pieces', value: '4 + 4 + 2.8 MiB (4 MiB blockSize)' }],
+        deepDiveComponentId: 'broadcast-manager',
+      });
+      b.addEvent({
+        stepId: sTb1,
+        from: bcastMgr,
+        to: driverBm,
+        kind: 'local',
+        channel: 'data',
+        protocol: 'In-JVM writeBlocks',
+        port: `${b.driverHost} in-JVM`,
+        label: 'Write piece0..2 (10.8M)',
+        info: 'Stores all 3 serialized pieces (4 + 4 + 2.8 MiB) locally in Driver BM.',
+        size: '10.8 MiB',
+        command: 'blockManager.putBytes(BroadcastBlockId(0, "piece" + i), bytes, MEMORY_AND_DISK_SER)',
+        fields: [{ name: 'pieces', value: '4 + 4 + 2.8 MiB (3 pieces)' }],
+        senderState: 'Pieces written',
+        receiverState: 'Serving pieces on Driver BM',
+      });
+      b.addEvent({
+        stepId: sTb1,
+        from: driverBm,
+        to: state.bmm,
+        kind: 'local',
+        channel: 'rpc',
+        protocol: 'In-JVM BlockManagerMaster',
+        port: `${b.driverHost} in-JVM`,
+        label: 'UpdateBlockInfo(0..2)',
+        info: 'Driver BM registers all 3 piece locations in BlockManagerMaster.',
+        size: '540 B',
+        command: 'master.updateBlockInfo(driverBmId, broadcast_0_piece0..2)',
+        fields: [{ name: 'seed', value: b.driverBmPort }],
+        senderState: 'Directory updated',
+        receiverState: 'Executors can discover seed locations',
+      });
+      const sTb2 = b.addStep({
+        id: 'sim-step-bcast-2',
+        parentId: sBcast,
+        title: cfg.numExecutors >= 2
+          ? 'Randomized executor fetch & immediate peer seeding (Driver -> E1 -> E2)'
+          : 'Single executor fetches all 3 pieces directly from Driver BM (0 E-to-E hops)',
+        explanation: cfg.numExecutors >= 2
+          ? `${producerExec} fetches in randomized order and immediately advertises cached pieces; peer fetches piece0 P2P from ${producerBm} (illustrative seeded peer fetch).`
+          : `With 1 executor, there are no peer executors; ${producerExec} fetches all 3 pieces (4 + 4 + 2.8 MiB) directly from Driver BM.`,
+        category: 'broadcast-torrent',
+        keyState: 'All executors hold deserialized HashedRelation',
+        command: 'TorrentBroadcast.readBlocks() // randomized order + immediate UpdateBlockInfo',
+        detailsPassed: [{ name: 'executors', value: String(cfg.numExecutors) }],
+        deepDiveComponentId: 'block-manager',
+      });
+      b.addEvent({
+        stepId: sTb2,
+        from: driverBm,
+        to: producerBm,
+        channel: 'data',
+        protocol: 'BlockTransfer - TorrentBroadcast',
+        port: `${b.driverBmPort} -> ${producerHost}`,
+        label: 'Fetch piece0 (Driver->E1)',
+        info: `${producerExec} fetches piece0 (4.0 MiB) from Driver BM and advertises ${producerBmPort} immediately.`,
+        size: '4.0 MiB',
+        command: 'exec1BM.getRemoteBytes(broadcast_0_piece0)',
+        fields: [{ name: 'blockId', value: 'broadcast_0_piece0' }],
+        senderState: 'Served piece0',
+        receiverState: `${producerExec} now acts as peer seed`,
+        peerTag: 'Driver -> E1',
+      });
+      if (state.liveBms.length >= 2) {
+        const peerBm = state.liveBms[1];
+        const peerExec = state.liveExecs[1];
+        b.addEvent({
+          stepId: sTb2,
+          from: producerBm,
+          to: peerBm,
+          channel: 'data',
+          protocol: 'BlockTransfer - TorrentBroadcast P2P',
+          port: `${producerBmPort} -> worker-b`,
+          label: 'P2P piece0 (E1->E2)',
+          info: `${peerExec} fetches piece0 directly from peer ${producerBm}.`,
+          size: '4.0 MiB',
+          command: 'exec2BM.getRemoteBytes(broadcast_0_piece0)',
+          fields: [{ name: 'peer', value: producerBmPort }],
+          senderState: 'Served peer piece0',
+          receiverState: 'Reassembling HashedRelation',
+          peerTag: 'E1 -> E2',
+        });
+      }
+
+      if (isTorrentCorrupt && state.liveBms.length >= 2) {
+        injectTorrentPieceCorruptStep(
+          b,
+          state,
+          driverBm,
+          producerBm,
+          state.liveBms[1],
+          state.liveExecs[1],
+        );
+      }
+
+      if (willScaleUp || isTaskFail || isTorrentCorrupt || isSpillOom) {
+        const sqlPlanner = b.std('sql-planner');
+        const dag = b.std('dag-scheduler');
+        if (willScaleUp || isTaskFail || isSpillOom) {
+          const sBhjSubmit = b.addStep({
+            id: 'sim-step-bhj-submit',
+            title: `Submit streamed fact-table BroadcastHashJoin stage (${cfg.numPartitions} tasks)`,
+            explanation: `DAGScheduler submits ResultStage with ${cfg.numPartitions} streamed fact-table probe tasks (${Math.max(0, cfg.numPartitions - totalSlots)} pending in backlog).`,
+            category: 'sql-planning-aqe',
+            keyState: `BroadcastHashJoin stage submitted (${cfg.numPartitions} tasks)`,
+            command: `DAGScheduler.submitJob(BroadcastHashJoinExec, partitions=0..${cfg.numPartitions - 1})`,
+            detailsPassed: [{ name: 'partitions', value: String(cfg.numPartitions) }],
+            deepDiveComponentId: 'dag-scheduler',
+          });
+          b.addEvent({
+            stepId: sBhjSubmit,
+            from: sqlPlanner,
+            to: dag,
+            kind: 'local',
+            channel: 'internal',
+            protocol: 'In-JVM Catalyst -> DAG',
+            port: `${b.driverHost} in-JVM`,
+            label: `Plan BHJ (${cfg.numPartitions} parts)`,
+            info: 'BroadcastHashJoinExec submits streamed fact-table probe tasks referencing broadcast handle.',
+            size: 'in-memory',
+            command: 'BroadcastHashJoinExec.doExecute()',
+            fields: [{ name: 'partitions', value: String(cfg.numPartitions) }],
+            senderState: 'Streamed stage planned',
+            receiverState: 'Submitting TaskSet for streamed fact partitions',
+          });
+          b.addEvent({
+            stepId: sBhjSubmit,
+            from: state.schedBackend,
+            to: producerExec,
+            channel: 'rpc',
+            protocol: 'Spark Netty RPC',
+            port: b.driverRpc,
+            label: `LaunchTask (${cfg.numPartitions} parts)`,
+            info: `Driver launches streamed BHJ probe tasks (${Math.max(0, cfg.numPartitions - totalSlots)} pending).`,
+            size: '2.2 KB',
+            command: 'executorEndpoint.send(LaunchTask(serializedTask))',
+            fields: [{ name: 'slots', value: String(totalSlots) }],
+            senderState: 'Initial probe wave running',
+            receiverState: 'Probing broadcast HashedRelation',
+          });
+          if (willScaleUp) {
+            emitDynamicAllocationScaleUp();
+          }
+          if (isSpillOom) {
+            injectTaskSpillOomStep(b, state);
+          }
+        }
+        if (isTaskFail) {
+          emitTaskExceptionStep('BroadcastHashJoin ResultStage', producerExec);
+        } else {
+          const probeConsumer = getConsumerPair();
+          const bhj = b.workerStd('broadcast-hash-join', probeConsumer.hostZone);
+          const sBhjProbe = b.addStep({
+            id: 'sim-step-bhj-probe',
+            title: `BroadcastHashJoin probes streamed fact rows on ${probeConsumer.hostName}`,
+            explanation: `All ${state.liveExecs.length} live executors probe read-only HashedRelation per streamed row with zero large-table shuffle.`,
+            category: 'sql-planning-aqe',
+            keyState: `BroadcastHashJoin completed across ${state.liveExecs.length} live executors`,
+            command: 'BroadcastHashJoinExec.doExecute() -> hashedRelation.asReadOnlyCopy()',
+            detailsPassed: [{ name: 'probeHost', value: probeConsumer.hostName }],
+            deepDiveComponentId: 'broadcast-hash-join',
+          });
+          b.addEvent({
+            stepId: sBhjProbe,
+            from: probeConsumer.consumerBm,
+            to: bhj,
+            kind: 'local',
+            channel: 'internal',
+            protocol: 'In-JVM HashedRelation Probe',
+            port: `${probeConsumer.hostName} in-JVM`,
+            label: 'Probe streamed fact rows',
+            info: `BroadcastHashJoinExec on ${probeConsumer.hostName} probes read-only HashedRelation with zero large-table shuffle.`,
+            size: 'in-memory',
+            command: 'BroadcastHashJoinExec.doExecute() -> hashedRelation.asReadOnlyCopy()',
+            fields: [{ name: 'largeSideShuffle', value: '0 B (avoided!)' }],
+            senderState: 'Deserialized HashedRelation shared across executor threads',
+            receiverState: 'Joined rows streaming to Parquet writer',
+          });
+        }
+      }
+      if (!state.abortedByFault && isTaskResultLost) {
+        taskResultLostHandled = true;
+        injectTaskResultLostStep(b, state, {
+          inCollectStep: false,
+          stageLabel: 'BroadcastHashJoin ResultStage',
+        });
+      }
     }
-  } else if (cfg.jobType === 'python-udf') {
+  } else if (!state.abortedByFault && cfg.jobType === 'python-udf') {
     const isArrow = cfg.pythonUdfMode === 'arrow';
     const isTaskFail = cfg.fault === 'task-exception';
 
-    if (willScaleUp || isTaskFail) {
+    if (willScaleUp || isTaskFail || isSpillOom) {
       const sqlPlanner = b.std('sql-planner');
       const dag = b.std('dag-scheduler');
       const sUdfSubmit = b.addStep({
@@ -3028,7 +3066,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       });
       b.addEvent({
         stepId: sUdfSubmit,
-        from: schedBackend,
+        from: state.schedBackend,
         to: producerExec,
         channel: 'rpc',
         protocol: 'Spark Netty RPC',
@@ -3044,88 +3082,110 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       if (willScaleUp) {
         emitDynamicAllocationScaleUp();
       }
+      if (isSpillOom) {
+        injectTaskSpillOomStep(b, state);
+      }
     }
 
     const udfConsumer = getConsumerPair();
     const udfOp = b.workerStd('python-udf-operator', udfConsumer.hostZone);
     const pyFactory = b.workerStd('python-worker-factory', udfConsumer.hostZone);
     const pyRunner = b.workerStd('python-runner', udfConsumer.hostZone);
-    const pyWorker = b.workerStd('python-worker', udfConsumer.hostZone);
+    const pyWorker =
+      cfg.fault === 'python-daemon-stdout-corrupt'
+        ? undefined
+        : b.workerStd('python-worker', udfConsumer.hostZone);
+    const pyCtx = { isArrow, udfConsumer, udfOp, pyFactory, pyRunner, pyWorker };
 
-    const sUdf = b.addStep({
-      id: 'sim-step-udf',
-      title: `Executor (${udfConsumer.hostName}) ${isArrow ? 'ArrowEvalPythonExec' : 'BatchEvalPythonExec'} <-> Python worker`,
-      explanation: `Catalyst ExtractPythonUDFs isolates score_udf into ${isArrow ? 'ArrowEvalPythonExec (Arrow columnar IPC batches)' : 'BatchEvalPythonExec (pickled row batches)'}. ${udfConsumer.consumerExec} on ${udfConsumer.hostName} acquires a local worker via PythonWorkerFactory (pyspark.daemon fork/reuse) and BasePythonRunner interleaves reads/writes via ReaderInputStream (non-blocking NIO selector in Spark dada2a6).`,
-      category: 'python-worker-ipc',
-      keyState: isTaskFail
-        ? `Python worker on ${udfConsumer.hostName} hits corrupt row in partition ${targetPart}`
-        : `Python UDF evaluated in local worker on ${udfConsumer.hostName} (${isArrow ? 'Arrow IPC' : 'CPickle'})`,
-      command: isArrow ? 'ArrowEvalPythonExec -> ReaderInputStream <-> worker.py' : 'BatchEvalPythonExec -> ReaderInputStream <-> worker.py',
-      detailsPassed: [
-        { name: 'operator', value: isArrow ? 'ArrowEvalPythonExec' : 'BatchEvalPythonExec' },
-        { name: 'workerHost', value: udfConsumer.hostName },
-        { name: 'ioEngine', value: 'BasePythonRunner ReaderInputStream (NIO Selector)' },
-        { name: 'reusePolicy', value: 'spark.python.use.daemon=true, worker.reuse=true' },
-      ],
-      deepDiveComponentId: 'python-runner',
-    });
-    b.addEvent({
-      stepId: sUdf,
-      from: udfOp,
-      to: pyFactory,
-      kind: 'local',
-      channel: 'internal',
-      protocol: 'In-JVM Pool Checkout',
-      port: `${udfConsumer.hostName} in-JVM`,
-      label: 'createThroughDaemon()',
-      info: `Operator on ${udfConsumer.hostName} checks idle worker pool or connects to pyspark.daemon to fork a local Python worker.`,
-      size: 'in-memory',
-      command: 'PythonWorkerFactory.createThroughDaemon()',
-      fields: [
-        { name: 'host', value: udfConsumer.hostName },
-        { name: 'reuse', value: 'FIFO idle pool' },
-      ],
-      senderState: 'Acquired local worker SocketChannel',
-      receiverState: 'Checked out worker PID 18422',
-    });
-    b.addEvent({
-      stepId: sUdf,
-      from: pyRunner,
-      to: pyWorker,
-      channel: 'python',
-      protocol: isArrow ? 'Local Socket (Arrow IPC)' : 'Local Socket (CPickle)',
-      port: '127.0.0.1:ephemeral',
-      label: isArrow ? 'Stream Arrow batch' : 'Stream pickled batch',
-      info: `BasePythonRunner ReaderInputStream on ${udfConsumer.hostName} sends UDF & ${isArrow ? 'Arrow RecordBatches' : 'pickled batches'} over the local socket.`,
-      size: isArrow ? '256 KiB Arrow' : '128 KiB pickle',
-      command: 'ReaderInputStream (non-blocking Selector) -> worker.main()',
-      fields: [{ name: 'format', value: isArrow ? 'Arrow IPC' : 'BatchedSerializer(CPickle)' }],
-      senderState: 'Interleaving writes & reads on task thread',
-      receiverState: 'Running score_udf in Python process',
-    });
-    if (isTaskFail) {
-      emitTaskExceptionStep('EvalPythonExec ResultStage', udfConsumer.consumerExec);
+    const isPreBatchPyFault =
+      cfg.fault === 'python-daemon-stdout-corrupt' || cfg.fault === 'python-version-mismatch';
+
+    if (isPreBatchPyFault) {
+      tryInjectPythonUdfFault(b, state, pyCtx);
     } else {
+      const activePyWorker = pyWorker!;
+      const sUdf = b.addStep({
+        id: 'sim-step-udf',
+        title: `Executor (${udfConsumer.hostName}) ${isArrow ? 'ArrowEvalPythonExec' : 'BatchEvalPythonExec'} <-> Python worker`,
+        explanation: `Catalyst ExtractPythonUDFs isolates score_udf into ${isArrow ? 'ArrowEvalPythonExec (Arrow columnar IPC batches)' : 'BatchEvalPythonExec (pickled row batches)'}. ${udfConsumer.consumerExec} on ${udfConsumer.hostName} acquires a local worker via PythonWorkerFactory (pyspark.daemon fork/reuse) and BasePythonRunner interleaves reads/writes via ReaderInputStream (non-blocking NIO selector in Spark dada2a6).`,
+        category: 'python-worker-ipc',
+        keyState: isTaskFail
+          ? `Python worker on ${udfConsumer.hostName} hits corrupt row in partition ${targetPart}`
+          : `Python UDF evaluated in local worker on ${udfConsumer.hostName} (${isArrow ? 'Arrow IPC' : 'CPickle'})`,
+        command: isArrow ? 'ArrowEvalPythonExec -> ReaderInputStream <-> worker.py' : 'BatchEvalPythonExec -> ReaderInputStream <-> worker.py',
+        detailsPassed: [
+          { name: 'operator', value: isArrow ? 'ArrowEvalPythonExec' : 'BatchEvalPythonExec' },
+          { name: 'workerHost', value: udfConsumer.hostName },
+          { name: 'ioEngine', value: 'BasePythonRunner ReaderInputStream (NIO Selector)' },
+          { name: 'reusePolicy', value: 'spark.python.use.daemon=true, worker.reuse=true' },
+        ],
+        deepDiveComponentId: 'python-runner',
+      });
       b.addEvent({
         stepId: sUdf,
-        from: pyWorker,
-        to: pyRunner,
+        from: udfOp,
+        to: pyFactory,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM Pool Checkout',
+        port: `${udfConsumer.hostName} in-JVM`,
+        label: 'createThroughDaemon()',
+        info: `Operator on ${udfConsumer.hostName} checks idle worker pool or connects to pyspark.daemon to fork a local Python worker.`,
+        size: 'in-memory',
+        command: 'PythonWorkerFactory.createThroughDaemon()',
+        fields: [
+          { name: 'host', value: udfConsumer.hostName },
+          { name: 'reuse', value: 'FIFO idle pool' },
+        ],
+        senderState: 'Acquired local worker SocketChannel',
+        receiverState: 'Checked out worker PID 18422',
+      });
+      b.addEvent({
+        stepId: sUdf,
+        from: pyRunner,
+        to: activePyWorker,
         channel: 'python',
         protocol: isArrow ? 'Local Socket (Arrow IPC)' : 'Local Socket (CPickle)',
         port: '127.0.0.1:ephemeral',
-        label: 'Return UDF results',
-        info: 'worker.py returns evaluated scores in input order; operator rejoins pass-through columns and releases worker to idle pool.',
-        size: '96 KiB',
-        command: 'outfile.flush() -> PythonWorkerFactory.releaseWorker()',
-        fields: [{ name: 'workerReturned', value: 'true (idle pool)' }],
-        senderState: 'Waiting for next task batch',
-        receiverState: 'UnsafeRow output ready for write',
+        label: isArrow ? 'Stream Arrow batch' : 'Stream pickled batch',
+        info: `BasePythonRunner ReaderInputStream on ${udfConsumer.hostName} sends UDF & ${isArrow ? 'Arrow RecordBatches' : 'pickled batches'} over the local socket.`,
+        size: isArrow ? '256 KiB Arrow' : '128 KiB pickle',
+        command: 'ReaderInputStream (non-blocking Selector) -> worker.main()',
+        fields: [{ name: 'format', value: isArrow ? 'Arrow IPC' : 'BatchedSerializer(CPickle)' }],
+        senderState: 'Interleaving writes & reads on task thread',
+        receiverState: 'Running score_udf in Python process',
       });
+      if (isTaskFail) {
+        emitTaskExceptionStep('EvalPythonExec ResultStage', udfConsumer.consumerExec);
+      } else if (tryInjectPythonUdfFault(b, state, pyCtx) === 'none') {
+        b.addEvent({
+          stepId: sUdf,
+          from: activePyWorker,
+          to: pyRunner,
+          channel: 'python',
+          protocol: isArrow ? 'Local Socket (Arrow IPC)' : 'Local Socket (CPickle)',
+          port: '127.0.0.1:ephemeral',
+          label: 'Return UDF results',
+          info: 'worker.py returns evaluated scores in input order; operator rejoins pass-through columns and releases worker to idle pool.',
+          size: '96 KiB',
+          command: 'outfile.flush() -> PythonWorkerFactory.releaseWorker()',
+          fields: [{ name: 'workerReturned', value: 'true (idle pool)' }],
+          senderState: 'Waiting for next task batch',
+          receiverState: 'UnsafeRow output ready for write',
+        });
+        if (isTaskResultLost) {
+          taskResultLostHandled = true;
+          injectTaskResultLostStep(b, state, {
+            inCollectStep: false,
+            stageLabel: 'EvalPythonExec ResultStage',
+          });
+        }
+      }
     }
-  } else if (cfg.jobType === 'cached-rdd') {
+  } else if (!state.abortedByFault && cfg.jobType === 'cached-rdd') {
     const isTaskFail = cfg.fault === 'task-exception';
 
-    if (willScaleUp || isTaskFail) {
+    if (willScaleUp || isTaskFail || isSpillOom) {
       const dag = b.std('dag-scheduler');
       const sCacheSubmit = b.addStep({
         id: 'sim-step-cache-submit',
@@ -3140,7 +3200,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       b.addEvent({
         stepId: sCacheSubmit,
         from: dag,
-        to: schedBackend,
+        to: state.schedBackend,
         kind: 'local',
         channel: 'internal',
         protocol: 'In-JVM TaskSet Submit',
@@ -3155,7 +3215,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       });
       b.addEvent({
         stepId: sCacheSubmit,
-        from: schedBackend,
+        from: state.schedBackend,
         to: producerExec,
         channel: 'rpc',
         protocol: 'Spark Netty RPC',
@@ -3171,12 +3231,15 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       if (willScaleUp) {
         emitDynamicAllocationScaleUp();
       }
+      if (isSpillOom) {
+        injectTaskSpillOomStep(b, state);
+      }
     }
 
     if (isTaskFail) {
       emitTaskExceptionStep('Action 1 (rdd.count())', producerExec);
     } else {
-      const rddCache = b.workerStd('rdd-cache', 'worker-node-a');
+      const rddCache = b.workerStd('rdd-cache', producerZone);
       const dn = b.std('hdfs-datanode');
       const sCache = b.addStep({
         id: 'sim-step-cache',
@@ -3199,7 +3262,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         kind: 'local',
         channel: 'data',
         protocol: 'In-JVM BlockManager',
-        port: 'worker-a in-JVM',
+        port: `${producerHost} in-JVM`,
         label: 'Action 1: compute & store',
         info: `Action 1 misses cache, computes partitions from HDFS lineage, and stores rdd_17_0 and rdd_17_${targetPart} in MemoryStore (MEMORY_ONLY).`,
         size: '48 MiB cached',
@@ -3214,7 +3277,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       b.addEvent({
         stepId: sCache,
         from: producerBm,
-        to: bmm,
+        to: state.bmm,
         channel: 'rpc',
         protocol: 'Spark Netty RPC',
         port: b.driverRpc,
@@ -3227,7 +3290,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           { name: 'dataProxiedByDriver', value: 'false (metadata only)' },
         ],
         senderState: 'Block visible to DAGScheduler locality',
-        receiverState: 'Recorded cache locations on worker-a',
+        receiverState: `Recorded cache locations on ${producerHost}`,
       });
       b.addEvent({
         stepId: sCache,
@@ -3236,7 +3299,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         kind: 'local',
         channel: 'data',
         protocol: 'In-JVM Cache Hit',
-        port: 'worker-a in-JVM',
+        port: `${producerHost} in-JVM`,
         label: 'Action 2: hit rdd_17_0',
         info: 'Action 2 finds partition 0 (rdd_17_0) locally in MemoryStore without rescanning HDFS.',
         size: '48 MiB hit',
@@ -3255,7 +3318,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         kind: 'local',
         channel: 'data',
         protocol: 'In-JVM Cache Miss (Evicted)',
-        port: 'worker-a in-JVM',
+        port: `${producerHost} in-JVM`,
         label: `Miss evicted rdd_17_${targetPart}`,
         info: `Under MEMORY_ONLY, partition ${targetPart} (rdd_17_${targetPart}) was evicted under memory pressure without spilling to disk; getLocalValues returns None and falls back to RDD.getOrCompute.`,
         size: 'Cache miss',
@@ -3282,14 +3345,27 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           { name: 'partition', value: String(targetPart) },
           { name: 'recomputeCause', value: 'MEMORY_ONLY RAM eviction' },
         ],
-        senderState: 'Action 2 completed (hit p=0 + recomputed evicted p=' + targetPart + ')',
+        senderState: isTaskResultLost
+          ? `Recomputed p=${targetPart}; sending IndirectTaskResult for Action 2`
+          : 'Action 2 completed (hit p=0 + recomputed evicted p=' + targetPart + ')',
         receiverState: 'Served lineage blocks for recomputation',
       });
+      if (isTaskResultLost) {
+        taskResultLostHandled = true;
+        injectTaskResultLostStep(b, state, {
+          inCollectStep: false,
+          stageLabel: 'Action 2 (rdd.count())',
+          actionCompleteLabel: 'Action 2 completed',
+          actionCompleteInfo: `Driver TaskResultGetter delivers retry attempt 1 result for Action 2 (rdd.count()); Action 2 completes cleanly after TaskResultLost recovery (hit p=0 + recomputed evicted p=${targetPart}).`,
+          actionCompleteSenderState:
+            'Action 2 completed (hit p=0 + recomputed evicted p=' + targetPart + ' + retry OK)',
+        });
+      }
     }
-  } else if (cfg.jobType === 'collect-action') {
+  } else if (!state.abortedByFault && cfg.jobType === 'collect-action') {
     const isTaskFail = cfg.fault === 'task-exception';
 
-    if (willScaleUp || isTaskFail) {
+    if (willScaleUp || isTaskFail || isSpillOom) {
       const dag = b.std('dag-scheduler');
       const sCollectSubmit = b.addStep({
         id: 'sim-step-collect-submit',
@@ -3304,7 +3380,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       b.addEvent({
         stepId: sCollectSubmit,
         from: dag,
-        to: schedBackend,
+        to: state.schedBackend,
         kind: 'local',
         channel: 'internal',
         protocol: 'In-JVM TaskSet Submit',
@@ -3319,7 +3395,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       });
       b.addEvent({
         stepId: sCollectSubmit,
-        from: schedBackend,
+        from: state.schedBackend,
         to: producerExec,
         channel: 'rpc',
         protocol: 'Spark Netty RPC',
@@ -3335,13 +3411,17 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       if (willScaleUp) {
         emitDynamicAllocationScaleUp();
       }
+      if (isSpillOom) {
+        injectTaskSpillOomStep(b, state);
+      }
     }
 
     if (isTaskFail) {
       emitTaskExceptionStep('collect() ResultStage', producerExec);
     } else {
       const trg = b.std('task-result-getter');
-      const isLarge = cfg.dataProfile === 'large-result' || cfg.fault === 'max-result-size';
+      const isLarge =
+        cfg.dataProfile === 'large-result' || cfg.fault === 'max-result-size' || isTaskResultLost;
       const perPartMiB = Math.ceil(600 / cfg.numPartitions);
       const totalMiB = perPartMiB * cfg.numPartitions;
       const perPartBytes = perPartMiB * 1024 * 1024;
@@ -3356,19 +3436,28 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           : 'collect() returns serialized partition arrays directly in StatusUpdate',
         explanation: isLarge
           ? cfg.fault === 'max-result-size'
-            ? `Each of ${cfg.numPartitions} partitions serializes to ${perPartMiB} MiB (${totalMiB} MiB total) and is stored as a TaskResultBlock via IndirectTaskResult. With spark.driver.maxResultSize=512 MiB, TaskSetManager.canFetchMoreResults crosses the limit on partition #${crossingCount} (${crossingTotalMiB} MiB > 512 MiB) and aborts BEFORE fetching that TaskResultBlock.`
-            : `Each of ${cfg.numPartitions} partitions serializes to ${perPartMiB} MiB (${totalMiB} MiB total) and is stored as a TaskResultBlock via IndirectTaskResult. With spark.driver.maxResultSize=1 GiB (1024 MiB), totalMiB (${totalMiB} MiB <= 1024 MiB) passes TaskSetManager.canFetchMoreResults and Driver TaskResultGetter fetches TaskResultBlocks over :42001.`
+            ? `Each of ${cfg.numPartitions} partitions serializes to ${perPartMiB} MiB (${totalMiB} MiB total) and is stored as a TaskResultBlock (StorageLevel.MEMORY_AND_DISK_SER) via IndirectTaskResult. With spark.driver.maxResultSize=512 MiB, TaskSetManager.canFetchMoreResults crosses the limit on partition #${crossingCount} (${crossingTotalMiB} MiB > 512 MiB) and aborts BEFORE fetching that TaskResultBlock.`
+            : isTaskResultLost
+              ? `Each of ${cfg.numPartitions} partitions serializes to ${perPartMiB} MiB (${totalMiB} MiB total) and is stored as a TaskResultBlock with StorageLevel.MEMORY_AND_DISK_SER before sending IndirectTaskResult to Driver TaskResultGetter. Before result delivery, TaskResultGetter fails to fetch the lost TaskResultBlock, reports TaskResultLost, and retries the task before delivering results to Python collect().`
+              : `Each of ${cfg.numPartitions} partitions serializes to ${perPartMiB} MiB (${totalMiB} MiB total) and is stored as a TaskResultBlock (StorageLevel.MEMORY_AND_DISK_SER) via IndirectTaskResult. With spark.driver.maxResultSize=1 GiB (1024 MiB), totalMiB (${totalMiB} MiB <= 1024 MiB) passes TaskSetManager.canFetchMoreResults and Driver TaskResultGetter fetches TaskResultBlocks over ${producerBmPort}.`
           : 'Small serialized partition results fit inside StatusUpdate RPC messages directly to the driver and are concatenated in Python.',
         category: 'yarn-lifecycle',
         keyState:
           cfg.fault === 'max-result-size'
             ? `ABORTED on part #${crossingCount}: ${crossingTotalMiB} MiB > 512 MiB (total ${cfg.numPartitions}x${perPartMiB}=${totalMiB} MiB)`
-            : isLarge
-              ? `collect() succeeded: ${totalMiB} MiB (${cfg.numPartitions}x${perPartMiB} MiB) <= 1 GiB maxResultSize`
-              : 'Driver assembled collect() result list in Python',
+            : isTaskResultLost
+              ? `IndirectTaskResult (${perPartMiB} MiB, MEMORY_AND_DISK_SER) queued for TaskResultGetter fetch`
+              : isLarge
+                ? `collect() succeeded: ${totalMiB} MiB (${cfg.numPartitions}x${perPartMiB} MiB) <= 1 GiB maxResultSize`
+                : 'Driver assembled collect() result list in Python',
         command: 'RDD.collect() -> TaskResultGetter.enqueueSuccessfulTask()',
         detailsPassed: [
-          { name: 'transport', value: isLarge ? 'IndirectTaskResult -> BlockManager fetch' : 'DirectTaskResult in StatusUpdate' },
+          {
+            name: 'transport',
+            value: isLarge
+              ? 'IndirectTaskResult (StorageLevel.MEMORY_AND_DISK_SER) -> BlockManager fetch'
+              : 'DirectTaskResult in StatusUpdate',
+          },
           ...(isLarge
             ? [{ name: 'resultSizing', value: `${cfg.numPartitions} parts x ${perPartMiB} MiB = ${totalMiB} MiB` }]
             : []),
@@ -3385,14 +3474,15 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         port: b.driverRpc,
         label: isLarge ? `IndirectTaskResult(${perPartMiB}M)` : 'DirectTaskResult(120 KB)',
         info: isLarge
-          ? `Executor stores TaskResultBlock locally and sends IndirectTaskResult(blockId, ${perPartMiB} MiB) reference in StatusUpdate (${cfg.numPartitions} parts = ${totalMiB} MiB total).`
+          ? `Executor stores TaskResultBlock locally with StorageLevel.MEMORY_AND_DISK_SER and sends IndirectTaskResult(blockId, ${perPartMiB} MiB) reference in StatusUpdate (${cfg.numPartitions} parts = ${totalMiB} MiB total).`
           : 'Executor embeds small serialized partition array directly inside StatusUpdate.',
         size: isLarge ? '280 B ref' : '120 KB',
         command: isLarge
-          ? `new IndirectTaskResult(TaskResultBlockId(tid), ${perPartBytes})`
+          ? `new IndirectTaskResult(TaskResultBlockId(tid), ${perPartBytes}) // StorageLevel.MEMORY_AND_DISK_SER`
           : 'new DirectTaskResult(bytes)',
         fields: isLarge
           ? [
+              { name: 'storageLevel', value: 'StorageLevel.MEMORY_AND_DISK_SER' },
               { name: 'perPartitionSize', value: `${perPartMiB} MiB` },
               { name: 'totalProjected', value: `${totalMiB} MiB (${cfg.numPartitions} x ${perPartMiB} MiB)` },
             ]
@@ -3402,7 +3492,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       });
       if (cfg.fault === 'max-result-size') {
         const tsm = b.std('task-set-manager');
-        abortedByFault = true;
+        state.abortedByFault = true;
         b.addEvent({
           stepId: sCollect,
           from: trg,
@@ -3424,6 +3514,18 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           receiverState: 'Job failed; Python receives SparkException (no partial list)',
           isError: true,
         });
+        emitTerminalAppOutcome(b, state, {
+          origin: 'user-python-app',
+          diagnostic: `Total serialized results (${crossingTotalMiB} MiB) exceeded spark.driver.maxResultSize (512 MiB)`,
+          stopLiveExecutors: true,
+        });
+      } else if (isTaskResultLost) {
+        taskResultLostHandled = true;
+        injectTaskResultLostStep(b, state, {
+          inCollectStep: true,
+          perPartMiB,
+          totalMiB,
+        });
       } else if (isLarge) {
         b.addEvent({
           stepId: sCollect,
@@ -3431,9 +3533,9 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           to: producerBm,
           channel: 'data',
           protocol: 'BlockTransfer (TaskResultBlock)',
-          port: 'worker-a:42001',
+          port: producerBmPort,
           label: 'getRemoteBytes(taskres)',
-          info: `Driver TaskResultGetter fetches TaskResultBlock (${perPartMiB} MiB; ${cfg.numPartitions} parts = ${totalMiB} MiB <= 1 GiB limit) from worker-a:42001 after quota check passes.`,
+          info: `Driver TaskResultGetter fetches TaskResultBlock (${perPartMiB} MiB; ${cfg.numPartitions} parts = ${totalMiB} MiB <= 1 GiB limit) from ${producerBmPort} after quota check passes.`,
           size: `${perPartMiB} MiB`,
           command: 'sparkEnv.blockManager.getRemoteBytes(TaskResultBlockId(tid))',
           fields: [{ name: 'quotaCheck', value: `Passed (${totalMiB} MiB <= 1 GiB)` }],
@@ -3445,181 +3547,16 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
   }
 
   // =========================================================================
-  // MID-RUN INJECTED RECOVERABLE FAULTS (PMEM / Preemption / Heartbeat / Speculation)
+  // PHASE 9: Mid-Run Injected Recoverable & Degraded Faults
   // =========================================================================
-  if (cfg.fault === 'oom-pmem' || cfg.fault === 'yarn-preemption') {
-    const isPmem = cfg.fault === 'oom-pmem';
-    const nmA = b.nmInstance('worker-node-a');
-    const yarnCode = isPmem ? -104 : -102;
-    const sLoss = b.addStep({
-      id: `sim-step-${cfg.fault}`,
-      title: isPmem
-        ? 'YARN NM kills Exec-1 (KILLED_EXCEEDED_PMEM=-104) -- charged to task failures'
-        : 'YARN preempts Exec-1 (PREEMPTED=-102) -- NOT charged to task failures',
-      explanation: isPmem
-        ? 'Exec-1 container exceeds physical memory limit (JVM heap + Python worker + native RSS). NodeManager terminates container via OS SIGKILL (137) and reports Hadoop ContainerExitStatus.KILLED_EXCEEDED_PMEM (-104); YarnAllocator marks exitCausedByApp=true, so TaskSetManager increments task failure count and retries on surviving/replacement executor.'
-        : 'YARN CapacityScheduler preempts Exec-1 for queue sharing (ContainerExitStatus.PREEMPTED=-102). YarnAllocator marks exitCausedByApp=false, so TaskSetManager reschedules interrupted tasks WITHOUT charging spark.task.maxFailures.',
-      category: 'yarn-lifecycle',
-      keyState: isPmem
-        ? 'KILLED_EXCEEDED_PMEM (-104) | exitCausedByApp=true -> replacement exec-repl registered'
-        : 'PREEMPTED (-102) | exitCausedByApp=false (free retry) -> replacement exec-repl registered',
-      command: isPmem
-        ? 'YarnAllocator.processCompletedContainers(KILLED_EXCEEDED_PMEM=-104) // exitCausedByApp=true'
-        : 'YarnAllocator.processCompletedContainers(PREEMPTED=-102) // exitCausedByApp=false',
-      detailsPassed: isPmem
-        ? [
-            { name: 'yarnExitStatus', value: 'KILLED_EXCEEDED_PMEM (-104)' },
-            { name: 'osSignalCause', value: 'SIGKILL (137) sent by NM memory monitor' },
-            { name: 'exitCausedByApp', value: 'true' },
-            { name: 'countsTowardsTaskFailures', value: 'true' },
-          ]
-        : [
-            { name: 'yarnExitStatus', value: 'PREEMPTED (-102)' },
-            { name: 'exitCausedByApp', value: 'false' },
-            { name: 'countsTowardsTaskFailures', value: 'false' },
-          ],
-      deepDiveComponentId: 'yarn-allocator',
-    });
-    b.addEvent({
-      stepId: sLoss,
-      from: nmA,
-      to: rm,
-      channel: 'error',
-      protocol: 'Hadoop RPC (ResourceTracker)',
-      port: 'rm01:8031',
-      label: isPmem ? 'Kill Exec-1 (PMEM -104)' : 'Preempt Exec-1 (-102)',
-      info: isPmem
-        ? 'NodeManager terminates container_e01_000002 via OS SIGKILL for exceeding physical memory limits and reports ContainerExitStatus.KILLED_EXCEEDED_PMEM (-104).'
-        : 'YARN preempts container_e01_000002 to rebalance queue capacity and reports ContainerExitStatus.PREEMPTED (-102).',
-      size: 'ContainerStatus',
-      command: `ContainerStatus(${b.execContainerId(1)}, exitStatus=${yarnCode})`,
-      fields: isPmem
-        ? [
-            { name: 'containerId', value: b.execContainerId(1) },
-            { name: 'containerExitStatus', value: '-104 (KILLED_EXCEEDED_PMEM)' },
-            { name: 'osSignalCause', value: 'OS SIGKILL (137)' },
-          ]
-        : [
-            { name: 'containerId', value: b.execContainerId(1) },
-            { name: 'containerExitStatus', value: '-102 (PREEMPTED)' },
-          ],
-      senderState: 'Container killed on worker-a',
-      receiverState: 'RM reports completedContainer to AM',
-      isError: true,
-    });
-    b.addEvent({
-      stepId: sLoss,
-      from: alloc,
-      to: schedBackend,
-      channel: 'rpc',
-      protocol: 'Spark Netty RPC (RemoveExecutor)',
-      port: b.driverRpc,
-      label: isPmem ? 'RemoveExec(appFault=true)' : 'RemoveExec(preempted)',
-      info: `YarnAllocator reports ExecutorExited(${yarnCode}, exitCausedByApp=${isPmem}) to driver; TaskSetManager reschedules affected tasks.`,
-      size: '740 B',
-      command: `driverRef.send(RemoveExecutor("1", ExecutorExited(${yarnCode}, exitCausedByApp=${isPmem})))`,
-      fields: [
-        { name: 'exitCode', value: String(yarnCode) },
-        { name: 'exitCausedByApp', value: String(isPmem) },
-      ],
-      senderState: 'Requesting replacement container from RM',
-      receiverState: 'Tasks re-queued on surviving/replacement executor',
-    });
-    removeExec1AndLaunchReplacement(sLoss);
-  } else if (cfg.fault === 'heartbeat-timeout') {
-    const sHb = b.addStep({
-      id: 'sim-step-hb-timeout',
-      title: 'Exec-1 misses 120s HeartbeatReceiver timeout -> driver kills & replaces it',
-      explanation:
-        'Exec-1 pauses (e.g., long GC or network partition) and stops heartbeating even though worker-a NodeManager is still healthy. HeartbeatReceiver.expireDeadHosts() calls sc.killAndReplaceExecutor("1") and sends RemoveExecutor directly to CoarseGrainedSchedulerBackend, then YarnAllocator launches replacement exec-repl.',
-      category: 'heartbeats-metrics',
-      keyState: 'Exec-1 expired by HeartbeatReceiver -> killAndReplaceExecutor("1") -> exec-repl registered',
-      command: 'HeartbeatReceiver.expireDeadHosts() -> sc.killAndReplaceExecutor("1")',
-      detailsPassed: [
-        { name: 'heartbeatInterval', value: '10s' },
-        { name: 'timeout', value: '120s (spark.network.timeout)' },
-      ],
-      deepDiveComponentId: 'heartbeat-receiver',
-    });
-    b.addEvent({
-      stepId: sHb,
-      from: hbRx,
-      to: schedBackend,
-      kind: 'local',
-      channel: 'error',
-      protocol: 'In-JVM ExpireDeadHosts',
-      port: `${b.driverHost} in-JVM`,
-      label: 'Timeout -> RemoveExec(1)',
-      info: 'now - executorLastSeen("1") > 120000 ms; HeartbeatReceiver requests replacement and removes Exec-1.',
-      size: 'in-memory',
-      command: 'sc.killAndReplaceExecutor("1"); driverEndpoint.send(RemoveExecutor("1", ...))',
-      fields: [{ name: 'reason', value: 'Executor heartbeat timed out after 120000 ms' }],
-      senderState: 'Removed Exec-1 from executorLastSeen',
-      receiverState: 'Failed in-flight tasks on Exec-1 & asked AM for replacement',
-      isError: true,
-    });
-    removeExec1AndLaunchReplacement(sHb);
-  } else if (cfg.fault === 'speculation-race') {
-    const occ = b.std('output-commit-coordinator');
-    const attempt0Exec = liveExecs[0]; // exec-1 on worker-a
-    const attempt1Exec = liveExecs[1]; // exec-2 on worker-b (distinct host guaranteed by validator)
-    const sSpec = b.addStep({
-      id: 'sim-step-speculation',
-      title: `Speculative Attempt 1 (worker-b) wins canCommit for p=${targetPart}; Attempt 0 (worker-a) denied`,
-      explanation: `TaskSetManager marks straggler partition ${targetPart} (Attempt 0 on Exec-1 / worker-a) speculatable and launches Attempt 1 on a distinct host (Exec-2 / worker-b). Attempt 1 asks OutputCommitCoordinator.canCommit(stage, 0, ${targetPart}, 1) first and wins the slot; slower Attempt 0 on Exec-1 is denied (TaskCommitDenied, NOT counted toward task failures) and aborts its attempt output.`,
-      category: 'output-commit',
-      keyState: `Attempt 1 (worker-b) authorized for p=${targetPart} | Attempt 0 (worker-a) received TaskCommitDenied (free)`,
-      command: `OutputCommitCoordinator.canCommit(stage, 0, part=${targetPart}, attempt=1) -> true`,
-      detailsPassed: [
-        { name: 'partition', value: `${targetPart} (valid in 0..${cfg.numPartitions - 1})` },
-        { name: 'winner', value: 'Attempt 1 on Exec-2 (worker-b, first eligible asker)' },
-        { name: 'loser', value: 'Attempt 0 on Exec-1 (worker-a) -> TaskCommitDenied (countTowardsTaskFailures=false)' },
-      ],
-      deepDiveComponentId: 'output-commit-coordinator',
-    });
-    b.addEvent({
-      stepId: sSpec,
-      from: attempt1Exec,
-      to: occ,
-      channel: 'rpc',
-      protocol: 'Spark Netty RPC (canCommit)',
-      port: b.driverRpc,
-      label: `canCommit(p=${targetPart},a=1) OK`,
-      info: `Speculative Attempt 1 on Exec-2 (worker-b) reaches commit first and wins exclusive permission for partition ${targetPart}.`,
-      size: '440 B',
-      command: `AskPermissionToCommitOutput(stage, 0, partition=${targetPart}, attempt=1) -> true`,
-      fields: [
-        { name: 'host', value: 'worker-b (Exec-2)' },
-        { name: 'authorizedOwner', value: `(stageAttempt=0, part=${targetPart}, taskAttempt=1)` },
-      ],
-      senderState: `Committing partition ${targetPart} output from worker-b`,
-      receiverState: `Slot (stage, ${targetPart}) locked to Attempt 1`,
-    });
-    b.addEvent({
-      stepId: sSpec,
-      from: attempt0Exec,
-      to: occ,
-      channel: 'error',
-      protocol: 'Spark Netty RPC (canCommit)',
-      port: b.driverRpc,
-      label: `canCommit(p=${targetPart},a=0) NO`,
-      info: `Original Attempt 0 on Exec-1 (worker-a) arrives second; coordinator returns false -> Attempt 0 aborts task with TaskCommitDenied.`,
-      size: '440 B',
-      command: `AskPermissionToCommitOutput(stage, 0, partition=${targetPart}, attempt=0) -> false`,
-      fields: [
-        { name: 'host', value: 'worker-a (Exec-1)' },
-        { name: 'reason', value: 'TaskCommitDenied (not counted against maxFailures)' },
-      ],
-      senderState: 'Attempt 0 aborts its temp output cleanly on worker-a',
-      receiverState: 'Slot remains owned by Attempt 1',
-      isError: true,
-    });
+  if (!state.abortedByFault) {
+    injectPostWorkloadMidRunFault(b, state, { taskResultLostHandled });
   }
 
   // =========================================================================
   // V1 OUTPUT COMMIT STEP (For file-write jobs not already aborted)
   // =========================================================================
-  if (job.hasFileCommit && !abortedByFault) {
+  if (job.hasFileCommit && !state.abortedByFault) {
     const commitConsumer = getConsumerPair();
     const ffw = b.workerStd('file-format-writer', commitConsumer.hostZone);
     const workerCommit = b.workerStd('file-commit-protocol', commitConsumer.hostZone);
@@ -3627,7 +3564,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     const commitNn = b.std('hdfs-namenode');
 
     if (cfg.fault === 'commit-job-failure') {
-      abortedByFault = true;
+      state.abortedByFault = true;
       const sCommitFail = b.addStep({
         id: 'sim-step-commit-fail',
         title: 'All write tasks commit to _temporary/0/task_*, then driver commitJob() fails -> abortJob()',
@@ -3695,6 +3632,11 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         receiverState: 'Removed staging directory (verify target path before retry)',
         isError: true,
       });
+      emitTerminalAppOutcome(b, state, {
+        origin: 'user-python-app',
+        diagnostic: 'Driver V1 commitJob() failed with HDFS IOException after best-effort abortJob()',
+        stopLiveExecutors: true,
+      });
     } else {
       const sCommit = b.addStep({
         id: 'sim-step-commit',
@@ -3754,26 +3696,26 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
   // =========================================================================
   // ORDERLY SHUTDOWN (if not aborted by terminal fault)
   // =========================================================================
-  if (!abortedByFault) {
+  if (!state.abortedByFault) {
     const sStop = b.addStep({
       id: 'sim-step-shutdown',
-      title: `spark.stop() halts ${liveExecs.length} live executor(s) & active AM unregisters SUCCEEDED`,
-      explanation: `orders.py calls spark.stop(). CoarseGrainedSchedulerBackend sends StopExecutor ONLY to the ${liveExecs.length} live executor(s) (${liveExecs.join(', ')}), orders.py exits 0, and active AM (${activeAm}) unregisters FinalApplicationStatus.SUCCEEDED on RM :8030.`,
+      title: `spark.stop() halts ${state.liveExecs.length} live executor(s) & active AM unregisters SUCCEEDED`,
+      explanation: `orders.py calls spark.stop(). CoarseGrainedSchedulerBackend sends StopExecutor ONLY to the ${state.liveExecs.length} live executor(s) (${state.liveExecs.join(', ')}), orders.py exits 0, and active AM (${state.activeAm}) unregisters FinalApplicationStatus.SUCCEEDED on RM :8030.`,
       category: 'yarn-lifecycle',
-      keyState: `Stopped ${liveExecs.length} live executor(s) | YARN state=FINISHED, finalStatus=SUCCEEDED`,
+      keyState: `Stopped ${state.liveExecs.length} live executor(s) | YARN state=FINISHED, finalStatus=SUCCEEDED`,
       command: 'spark.stop() -> StopExecutors -> amClient.unregister(SUCCEEDED)',
       detailsPassed: [
-        { name: 'liveExecutorsStopped', value: `${liveExecs.length} (${liveExecs.join(', ')})` },
-        { name: 'activeAm', value: activeAm },
+        { name: 'liveExecutorsStopped', value: `${state.liveExecs.length} (${state.liveExecs.join(', ')})` },
+        { name: 'activeAm', value: state.activeAm },
         { name: 'yarnState', value: 'FINISHED' },
         { name: 'finalStatus', value: 'SUCCEEDED' },
       ],
       deepDiveComponentId: 'application-master',
     });
-    for (const liveExecId of liveExecs) {
+    for (const liveExecId of state.liveExecs) {
       b.addEvent({
         stepId: sStop,
-        from: schedBackend,
+        from: state.schedBackend,
         to: liveExecId,
         channel: 'rpc',
         protocol: 'Spark Netty RPC',
@@ -3784,7 +3726,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         command: `driverEndpoint.askSync[Boolean](StopExecutors) // target=${liveExecId}`,
         fields: [
           { name: 'executorId', value: liveExecId },
-          { name: 'stoppedLiveExecutors', value: String(liveExecs.length) },
+          { name: 'stoppedLiveExecutors', value: String(state.liveExecs.length) },
         ],
         senderState: 'SparkContext stopping live executors',
         receiverState: `${liveExecId} releasing resources and exiting`,
@@ -3792,17 +3734,17 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     }
     b.addEvent({
       stepId: sStop,
-      from: activeAm,
+      from: state.activeAm,
       to: rm,
       channel: 'yarn',
       protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
       port: 'rm01:8030',
       label: 'unregisterAM(SUCCEEDED)',
-      info: `Active AM (${activeAm}) calls finishApplicationMaster(SUCCEEDED), cleans .sparkStaging/, and exits 0.`,
+      info: `Active AM (${state.activeAm}) calls finishApplicationMaster(SUCCEEDED), cleans .sparkStaging/, and exits 0.`,
       size: '920 B',
       command: 'amClient.unregister(FinalApplicationStatus.SUCCEEDED, "")',
       fields: [
-        { name: 'amInstance', value: activeAm },
+        { name: 'amInstance', value: state.activeAm },
         { name: 'finalStatus', value: 'SUCCEEDED' },
       ],
       senderState: 'AM JVM exiting',

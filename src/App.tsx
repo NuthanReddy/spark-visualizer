@@ -80,6 +80,7 @@ import {
   FAULT_MAP,
   JOB_TYPE_MAP,
   SIMULATED_DATA_PROFILES,
+  SIMULATED_FAULTS,
   validateSimulationConfig,
 } from './engine/simulatorTypes';
 import type {
@@ -266,6 +267,9 @@ function collectDescendantStepIds(run: ExecutionRun, stepId: string): string[] {
 const VALID_DATA_PROFILES = new Set<SimulatedDataProfile>(
   SIMULATED_DATA_PROFILES.map((p) => p.id),
 );
+const VALID_SIM_FAULTS = new Set<SimulatedFault>(
+  SIMULATED_FAULTS.map((f) => f.id),
+);
 const VALID_DEPLOY_MODES = new Set<SimulationConfig['deployMode']>([
   'cluster',
   'client',
@@ -279,7 +283,7 @@ function isValidJobType(value: string): value is SimulatedJobType {
 }
 
 function isValidFault(value: string): value is SimulatedFault {
-  return Object.prototype.hasOwnProperty.call(FAULT_MAP, value);
+  return VALID_SIM_FAULTS.has(value as SimulatedFault);
 }
 
 function parseStrictInt(raw: string | null): number | null {
@@ -1827,6 +1831,8 @@ export default function App() {
       : Boolean(
           simTelemetry?.faultLabel && !/^none\b/i.test(simTelemetry.faultLabel),
         );
+  const simFaultSeverity =
+    simFaultId !== null ? FAULT_MAP[simFaultId].severity : null;
   const simFaultBadgeText =
     simFaultId !== null
       ? simFaultId === 'none'
@@ -2042,7 +2048,7 @@ export default function App() {
                   }}
                 >
                   <MapIcon size={13} aria-hidden="true" />
-                  <span>All 54 Map</span>
+                  <span>All {COMPONENT_LIST.length} Map</span>
                 </button>
                 <button
                   type="button"
@@ -2222,9 +2228,18 @@ export default function App() {
                   </>
                 )}
                 <span
-                  className={`sim-strip-fault-badge ${
-                    simHasFault ? 'is-fault' : 'is-ok'
-                  }`}
+                  className={[
+                    'sim-strip-fault-badge',
+                    simHasFault ? 'is-fault' : 'is-ok',
+                    simFaultSeverity ? `sev-${simFaultSeverity}` : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ')}
+                  title={
+                    simFaultId !== null && simFaultId !== 'none'
+                      ? FAULT_MAP[simFaultId].label
+                      : undefined
+                  }
                 >
                   {simHasFault && <AlertTriangle size={10} aria-hidden="true" />}
                   <span>{simFaultBadgeText}</span>
@@ -2787,7 +2802,7 @@ export default function App() {
               ['Step forward one visible event', 'S'],
               ['Reset trace to Step 1', 'R'],
               ['Slower / faster playback speed', '[ / ]'],
-              ['Cycle canvas view (Topology / All 54 Map / Sequence)', 'V'],
+              [`Cycle canvas view (Topology / All ${COMPONENT_LIST.length} Map / Sequence)`, 'V'],
               ['Toggle job, data & fault simulator', 'G'],
               ['Toggle step category filters', 'C'],
               ['Toggle left catalog sidebar', 'L'],

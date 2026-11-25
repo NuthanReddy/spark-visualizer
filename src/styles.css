@@ -1704,6 +1704,158 @@ kbd {
   margin-top: 4px;
 }
 
+.peer-interactions-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.peer-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  background: var(--page);
+  border-radius: 3px;
+  min-width: 0;
+}
+
+.peer-group-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.peer-group-count {
+  margin-left: auto;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 9.5px;
+  font-weight: 600;
+}
+
+.peer-cards-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.peer-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 7px 8px;
+  text-align: left;
+  border: 1px solid var(--border-subtle);
+  background: var(--panel);
+  border-radius: 3px;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+
+.peer-card:hover,
+.peer-card:focus-visible {
+  border-color: var(--accent);
+  background: var(--selection);
+}
+
+.peer-card-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.peer-channel-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.peer-card-name {
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.peer-card-zone {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: var(--raised);
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.03em;
+}
+
+.peer-jump-icon {
+  flex-shrink: 0;
+  color: var(--faint);
+  transition: color 140ms ease, transform 140ms ease;
+}
+
+.peer-card:hover .peer-jump-icon,
+.peer-card:focus-visible .peer-jump-icon {
+  color: var(--accent);
+  transform: translate(1px, -1px);
+}
+
+.peer-card-proto {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.peer-card-labels {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--text);
+}
+
+.peer-more-pill {
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: var(--raised);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.peer-empty {
+  margin: 0;
+  padding: 6px 2px;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: var(--muted);
+}
+
 .ownership-dl {
   display: flex;
   flex-direction: column;
@@ -3811,6 +3963,18 @@ kbd {
   color: var(--ch-error);
 }
 
+.sim-strip-fault-badge.is-fault.sev-degraded {
+  border-color: color-mix(in srgb, var(--ch-internal) 65%, var(--border));
+  background: color-mix(in srgb, var(--ch-internal) 12%, var(--panel));
+  color: var(--ch-internal);
+}
+
+.sim-strip-fault-badge.is-fault.sev-recoverable {
+  border-color: color-mix(in srgb, var(--ch-data) 65%, var(--border));
+  background: color-mix(in srgb, var(--ch-data) 12%, var(--panel));
+  color: var(--ch-data);
+}
+
 .sim-status-actions {
   display: inline-flex;
   align-items: center;
@@ -3859,8 +4023,9 @@ kbd {
   border-bottom: 1px solid var(--border);
   background: var(--panel);
   flex-shrink: 0;
-  max-height: min(440px, 60vh);
+  max-height: min(580px, 68vh);
   overflow-y: auto;
+  overflow-x: hidden;
   z-index: 2;
 }
 
@@ -3935,12 +4100,12 @@ kbd {
   background: var(--raised);
 }
 
-/* Quick Scenario Presets Strip */
+/* Quick Scenario Presets Strip (12 presets) */
 .sim-presets-row {
   display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
   padding: 6px 8px;
   border: 1px solid var(--border-subtle);
   background: var(--raised);
@@ -3955,14 +4120,12 @@ kbd {
   text-transform: uppercase;
   color: var(--muted);
   white-space: nowrap;
-  margin-right: 2px;
 }
 
 .sim-presets-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 5px;
-  flex: 1;
+  gap: 4px 5px;
   min-width: 0;
 }
 
@@ -3970,21 +4133,34 @@ kbd {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 3px 7px;
+  padding: 2.5px 6.5px;
   border: 1px solid var(--border);
   background: var(--page);
   color: var(--text);
   border-radius: 2px;
   font-family: var(--font-sans);
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 500;
   white-space: nowrap;
+  max-width: 100%;
+}
+
+.sim-preset-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sim-preset-btn:hover {
   border-color: var(--accent);
   background: var(--selection);
   color: var(--accent);
+}
+
+.sim-preset-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
 }
 
 .sim-preset-btn.is-matched {
@@ -4003,6 +4179,7 @@ kbd {
   font-size: 8px;
   font-weight: 600;
   letter-spacing: 0.4px;
+  flex-shrink: 0;
 }
 
 .sim-preset-btn.is-fault-preset .sim-preset-badge {
@@ -4015,11 +4192,15 @@ kbd {
   color: var(--accent);
 }
 
-/* 3-Column Control Grid */
+/* 2-Column Top Row + Full-Width Fault Injection & Diagnostics Card */
 .sim-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+}
+
+.sim-col-fault {
+  grid-column: 1 / -1;
 }
 
 .sim-col {
@@ -4075,6 +4256,7 @@ kbd {
 
 .sim-select {
   width: 100%;
+  max-width: 100%;
   padding: 5px 7px;
   border: 1px solid var(--border);
   background: var(--page);
@@ -4085,6 +4267,8 @@ kbd {
   font-weight: 500;
   line-height: 1.3;
   cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sim-select:hover {
@@ -4093,6 +4277,14 @@ kbd {
 
 .sim-select.is-fault-selected {
   border-color: color-mix(in srgb, var(--ch-error) 65%, var(--border));
+}
+
+.sim-select.is-fault-selected.sev-degraded {
+  border-color: color-mix(in srgb, var(--ch-internal) 60%, var(--border));
+}
+
+.sim-select.is-fault-selected.sev-recoverable {
+  border-color: color-mix(in srgb, var(--ch-data) 60%, var(--border));
 }
 
 .sim-action-preview {
@@ -4225,13 +4417,20 @@ kbd {
   font-family: var(--font-mono);
   font-size: 8px;
   font-weight: 600;
-  letter-spacing: 0.4px;
+  letter-spacing: 0.45px;
+  white-space: nowrap;
 }
 
 .sim-severity-pill.sev-ok {
   background: var(--page);
   color: var(--ch-rpc);
   border-color: color-mix(in srgb, var(--ch-rpc) 45%, var(--border));
+}
+
+.sim-severity-pill.sev-degraded {
+  background: color-mix(in srgb, var(--ch-internal) 12%, var(--page));
+  color: var(--ch-internal);
+  border-color: color-mix(in srgb, var(--ch-internal) 55%, var(--border));
 }
 
 .sim-severity-pill.sev-recoverable {
@@ -4244,6 +4443,252 @@ kbd {
   background: color-mix(in srgb, var(--ch-error) 12%, var(--page));
   color: var(--ch-error);
   border-color: color-mix(in srgb, var(--ch-error) 65%, var(--border));
+}
+
+/* Fault Category Filter Pills */
+.sim-cat-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+
+.sim-cat-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  background: var(--page);
+  color: var(--muted);
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.sim-cat-pill:hover {
+  border-color: var(--accent);
+  color: var(--text);
+  background: var(--panel);
+}
+
+.sim-cat-pill:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+
+.sim-cat-pill.is-active {
+  border-color: var(--accent);
+  background: var(--selection);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.sim-cat-pill.is-none-cat.is-active {
+  border-color: color-mix(in srgb, var(--ch-rpc) 65%, var(--border));
+  background: color-mix(in srgb, var(--ch-rpc) 10%, var(--page));
+  color: var(--ch-rpc);
+}
+
+.sim-cat-pill.is-sigkill-cat.is-active {
+  border-color: color-mix(in srgb, var(--ch-error) 70%, var(--border));
+  background: color-mix(in srgb, var(--ch-error) 12%, var(--page));
+  color: var(--ch-error);
+}
+
+.sim-cat-pill.is-current-in-all {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  color: var(--text);
+}
+
+.sim-cat-count {
+  padding: 0 4px;
+  border: 1px solid var(--border-subtle);
+  background: var(--panel);
+  color: var(--faint);
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.sim-cat-pill.is-active .sim-cat-count {
+  border-color: color-mix(in srgb, currentColor 45%, var(--border));
+  color: currentColor;
+}
+
+.sim-cat-desc {
+  font-family: var(--font-sans);
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--muted);
+}
+
+.sim-fault-scope-readout {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Live Diagnostic Reference Card */
+.sim-diag-card {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 8px 10px;
+  margin-top: 2px;
+  border: 1px solid var(--border);
+  background: var(--page);
+  border-radius: 3px;
+  min-width: 0;
+}
+
+.sim-diag-card.sev-ok {
+  border-color: color-mix(in srgb, var(--ch-rpc) 38%, var(--border));
+}
+
+.sim-diag-card.sev-degraded {
+  border-color: color-mix(in srgb, var(--ch-internal) 50%, var(--border));
+}
+
+.sim-diag-card.sev-recoverable {
+  border-color: color-mix(in srgb, var(--ch-data) 50%, var(--border));
+}
+
+.sim-diag-card.sev-terminal {
+  border-color: color-mix(in srgb, var(--ch-error) 55%, var(--border));
+}
+
+.sim-diag-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 5px 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.sim-diag-card.sev-ok .sim-diag-header {
+  padding-bottom: 4px;
+}
+
+.sim-diag-title {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.3;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.sim-diag-badges {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.sim-diag-cat-tag {
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  background: var(--raised);
+  color: var(--muted);
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+
+.sim-diag-baseline {
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--muted);
+}
+
+.sim-diag-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 12px;
+  margin: 0;
+}
+
+.sim-diag-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.sim-diag-item.full-width {
+  grid-column: 1 / -1;
+  flex-direction: row;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  padding-top: 5px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.sim-diag-key {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.45px;
+  text-transform: uppercase;
+  color: var(--faint);
+  flex-shrink: 0;
+}
+
+.sim-diag-val {
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  line-height: 1.38;
+  color: var(--text);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sim-diag-val.is-mono {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--accent);
+}
+
+.sim-diag-item.full-width .sim-diag-val.is-mono {
+  color: var(--muted);
+}
+
+.sim-sigkill-callout {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 5px 8px;
+  border: 1px solid color-mix(in srgb, var(--ch-data) 55%, var(--border));
+  background: color-mix(in srgb, var(--ch-data) 8%, var(--panel));
+  border-radius: 2px;
+  font-family: var(--font-sans);
+  font-size: 10px;
+  line-height: 1.38;
+  color: var(--text);
+}
+
+.sim-sigkill-callout svg {
+  color: var(--ch-data);
+  flex-shrink: 0;
+  margin-top: 2px;
 }
 
 /* Live Computed Telemetry Chips */
@@ -4718,6 +5163,20 @@ kbd {
 
   .sim-inline-pair {
     grid-template-columns: 1fr;
+  }
+
+  .sim-diag-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .sim-diag-item.full-width {
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .sim-cat-pill {
+    font-size: 9px;
+    padding: 2.5px 6px;
   }
 
   .sim-footer-actions {
