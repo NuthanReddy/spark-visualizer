@@ -455,3 +455,93 @@ export function resolveEventAfterToggleExpand(
   }
   return resolveEventAfterProjectionChange(previousEventId, run, nextProjection);
 }
+
+export interface SameTraceLanguageTransitionInput {
+  nextRun: ExecutionRun;
+  nextLanguage: 'pyspark' | 'scala' | 'java';
+  currentExpandedStepIds: ReadonlySet<string>;
+  enabledCategories: ReadonlySet<StepCategory>;
+  currentEventId: string | null;
+  currentFrame: ProjectedFrame | null;
+  selectedComponentId: import('../data/types.ts').ComponentId | null;
+  componentLanguages?: readonly ('pyspark' | 'scala' | 'java')[];
+}
+
+export interface SameTraceLanguageTransitionResult {
+  nextExpandedStepIds: Set<string>;
+  nextProjection: ProjectedTimeline;
+  nextEventId: string | null;
+  nextSelectedComponentId: import('../data/types.ts').ComponentId | null;
+}
+
+/**
+ * Reconciles expanded steps, active playback event, and inspector component selection
+ * when toggling language (or navigating browser Back/Forward) on the same trace ID.
+ */
+export function reconcileSameTraceLanguageTransition(
+  input: SameTraceLanguageTransitionInput,
+): SameTraceLanguageTransitionResult {
+  const nextExpandableIds = new Set(getExpandableStepIds(input.nextRun));
+  const nextExpandedStepIds = new Set(
+    [...input.currentExpandedStepIds].filter(stepId => nextExpandableIds.has(stepId)),
+  );
+  const nextProjection = projectRun(
+    input.nextRun,
+    nextExpandedStepIds,
+    input.enabledCategories,
+  );
+
+  // 1. Prefer the exact current event ID when it survives in the destination projection.
+  let nextEventId: string | null = null;
+  if (
+    input.currentEventId &&
+    nextProjection.frameIndexByEventId.has(input.currentEventId)
+  ) {
+    nextEventId = input.currentEventId;
+  } else {
+    const currentStepId = input.currentFrame?.step.id ?? null;
+    const currentRootStepId = input.currentFrame?.ancestors[0]?.id ?? currentStepId;
+    const clampedStepIdx =
+      input.currentFrame &&
+      input.currentFrame.visibleStepIndex >= 0 &&
+      nextProjection.visibleSteps.length > 0
+        ? Math.min(
+            input.currentFrame.visibleStepIndex,
+            nextProjection.visibleSteps.length - 1,
+          )
+        : 0;
+    const targetStep =
+      (currentStepId
+        ? nextProjection.visibleSteps.find(ps => ps.step.id === currentStepId)
+        : undefined) ??
+      (currentRootStepId
+        ? nextProjection.visibleSteps.find(ps => ps.step.id === currentRootStepId)
+        : undefined) ??
+      nextProjection.visibleSteps[clampedStepIdx] ??
+      nextProjection.visibleSteps[0] ??
+      null;
+    nextEventId = targetStep
+      ? (nextProjection.visibleFrames[targetStep.firstFrameIndex]?.event.id ?? null)
+      : (nextProjection.visibleFrames[0]?.event.id ?? null);
+  }
+
+  // 2. Retain selectedComponentId only if it still participates in nextRun and supports nextLanguage.
+  let nextSelectedComponentId = input.selectedComponentId;
+  if (nextSelectedComponentId) {
+    const stillInRun = Object.values(input.nextRun.instances).some(
+      inst => inst.componentId === nextSelectedComponentId,
+    );
+    const supportsLang =
+      !input.componentLanguages || input.componentLanguages.includes(input.nextLanguage);
+    if (!stillInRun || !supportsLang) {
+      nextSelectedComponentId = null;
+    }
+  }
+
+  return {
+    nextExpandedStepIds,
+    nextProjection,
+    nextEventId,
+    nextSelectedComponentId,
+  };
+}

@@ -101,11 +101,24 @@ test('catalog defines all 71 components with non-overlapping Master Canvas coord
   }
 });
 
-test('traces cover 12 lifecycle flows, 26 scenarios, and all 71 components', () => {
-  assert.equal(LIFECYCLE_TRACES.length, 12);
+test('traces cover 9 dynamic lifecycle flows, 26 scenarios, and all 71 components', () => {
+  assert.equal(LIFECYCLE_TRACES.length, 9);
   assert.equal(SCENARIO_TRACES.length, 26);
   assert.equal(COMPONENT_TRACES.length, 71);
-  assert.equal(ALL_TRACES.length, 109);
+  assert.equal(ALL_TRACES.length, 106);
+
+  for (const flow of LIFECYCLE_TRACES) {
+    assert.deepEqual(
+      [...(flow.languages ?? [])],
+      ['pyspark', 'scala', 'java'],
+      `${flow.id}: expected unified lifecycle flow to support all 3 languages`,
+    );
+    assert.equal(
+      flow.languageVariantGroup,
+      undefined,
+      `${flow.id}: unified lifecycle flow should not carry obsolete languageVariantGroup`,
+    );
+  }
 
   const scenarioNums = SCENARIO_TRACES.map(t => t.scenarioNumber).sort((a, b) => (a ?? 0) - (b ?? 0));
   assert.deepEqual(
@@ -222,4 +235,37 @@ test('observability components, traces, categories, and peer interactions are wi
   const msPeers = computePeerInteractions('metrics-system');
   assert.ok(msPeers.receivesFrom.some(p => p.peerId === 'executor-metrics-poller'));
   assert.ok(msPeers.sendsTo.some(p => p.peerId === 'spark-ui'));
+});
+
+test('computePeerInteractions filters and adapts peers by active SparkLanguage', () => {
+  const scalaSubmitPeers = computePeerInteractions('spark-submit', 'scala');
+  const scalaAll = [...scalaSubmitPeers.receivesFrom, ...scalaSubmitPeers.sendsTo];
+  assert.ok(
+    scalaAll.some(p => p.peerId === 'jvm-user-app'),
+    'Expected spark-submit in Scala mode to include jvm-user-app peer',
+  );
+  assert.equal(
+    scalaAll.some(p => p.peerId === 'python-driver'),
+    false,
+    'Expected spark-submit in Scala mode to exclude python-driver peer',
+  );
+
+  const javaSubmitPeers = computePeerInteractions('spark-submit', 'java');
+  const javaAll = [...javaSubmitPeers.receivesFrom, ...javaSubmitPeers.sendsTo];
+  assert.ok(
+    javaAll.some(p => p.peerId === 'jvm-user-app'),
+    'Expected spark-submit in Java mode to include jvm-user-app peer',
+  );
+  assert.equal(
+    javaAll.some(p => p.peerId === 'python-driver'),
+    false,
+    'Expected spark-submit in Java mode to exclude python-driver peer',
+  );
+
+  const pySubmitPeers = computePeerInteractions('spark-submit', 'pyspark');
+  const pyAll = [...pySubmitPeers.receivesFrom, ...pySubmitPeers.sendsTo];
+  assert.ok(
+    pyAll.some(p => p.peerId === 'python-driver'),
+    'Expected spark-submit in PySpark mode to include python-driver peer',
+  );
 });

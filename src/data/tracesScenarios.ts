@@ -1469,6 +1469,7 @@ export const SCENARIO_TRACES: TraceLesson[] = [
     kind: 'scenario',
     scenarioNumber: 8,
     subsystem: 'sql-execution',
+    languages: ['pyspark'],
     name: '08. Filter Crosses into Scalar Python UDF',
     subtitle: 'BatchEvalPythonExec pickles row batches over a local socket to pyspark/worker.py',
     summary:
@@ -2412,6 +2413,7 @@ export const SCENARIO_TRACES: TraceLesson[] = [
     kind: 'scenario',
     scenarioNumber: 12,
     subsystem: 'scheduling',
+    languages: ['pyspark'],
     name: '12. Same Partition Fails on Every Attempt',
     subtitle: 'TaskSetManager reaches numFailures(12) >= 4 (spark.task.maxFailures) and aborts the TaskSet',
     summary:

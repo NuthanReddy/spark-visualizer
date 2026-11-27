@@ -31,6 +31,23 @@ const ALL_SPARK_LANGUAGES: readonly SparkLanguage[] = [
   'java',
 ];
 
+const LEGACY_FLOW_ALIASES: Readonly<
+  Record<string, { traceId: string; defaultLanguage: SparkLanguage }>
+> = {
+  'flow-scala-cluster-lifecycle': {
+    traceId: 'flow-cluster-lifecycle',
+    defaultLanguage: 'scala',
+  },
+  'flow-java-cluster-lifecycle': {
+    traceId: 'flow-cluster-lifecycle',
+    defaultLanguage: 'java',
+  },
+  'flow-jvm-udf-encoder-boundary': {
+    traceId: 'flow-python-udf-boundary',
+    defaultLanguage: 'scala',
+  },
+};
+
 export type ParsedUrlRoute =
   | {
       kind: 'sim';
@@ -417,6 +434,7 @@ export function parseUrlHash(
   }
 
   let matchedTrace: TraceLesson | null = null;
+  let legacyAliasLanguage: SparkLanguage | null = null;
 
   const compParam = params.get('component');
   if (compParam) {
@@ -458,6 +476,18 @@ export function parseUrlHash(
         traceById[flowParam] ??
         traces.find((t) => t.id.toLowerCase() === flowParam.toLowerCase()) ??
         null;
+      if (!matchedTrace) {
+        const alias = LEGACY_FLOW_ALIASES[flowParam.toLowerCase()];
+        if (alias) {
+          matchedTrace =
+            traceById[alias.traceId] ??
+            traces.find((t) => t.id === alias.traceId) ??
+            null;
+          if (matchedTrace) {
+            legacyAliasLanguage = alias.defaultLanguage;
+          }
+        }
+      }
     }
   }
 
@@ -489,7 +519,7 @@ export function parseUrlHash(
     kind: 'trace',
     traceId: targetTrace.id,
     view,
-    language: inferTracePrimaryLanguage(targetTrace),
+    language: legacyAliasLanguage ?? inferTracePrimaryLanguage(targetTrace),
   };
 }
 

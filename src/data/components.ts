@@ -11,30 +11,30 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     clusterPos: [144, 106],
     languages: ['pyspark', 'scala', 'java'],
     process: 'Submit JVM (org.apache.spark.deploy.SparkSubmit) on submit host',
-    role: 'Parses CLI arguments and properties, resolves deploy mode and primary resources, and invokes YarnClusterApplication (cluster) or deploy.PythonRunner (client) inside the submit JVM.',
+    role: 'Parses CLI arguments and properties, resolves deploy mode and primary resources (.py script or --class JAR), and invokes YarnClusterApplication (cluster), JavaMainApplication (Scala/Java client), or deploy.PythonRunner (PySpark client) inside the submit JVM.',
     keyDistinction:
-      'In cluster mode the submit JVM runs the YARN submission client instead; the ApplicationMaster starts Python later.',
+      'In cluster mode the submit JVM runs the YARN submission client instead; the ApplicationMaster launches the user main class (Scala/Java) or PythonRunner (PySpark) later.',
     startedBy: 'User shell or orchestrator invoking bin/spark-submit -> spark-class',
     monitoredBy: 'Submitting user/orchestrator via process exit code and --verbose output',
-    stoppedBy: 'Exits after YarnClusterApplication finishes monitoring (cluster) or PythonRunner exits (client)',
+    stoppedBy: 'Exits after YarnClusterApplication finishes monitoring (cluster) or the client user app / PythonRunner exits (client)',
     inputs: [
-      'CLI options (--master yarn, --deploy-mode, --num-executors, --py-files, --conf)',
-      'Primary .py script path/URI and post-script application arguments',
+      'CLI options (--master yarn, --deploy-mode, --num-executors, --class / --jars / --py-files, --conf)',
+      'Primary JAR or .py script path/URI and post-resource application arguments',
       'spark-defaults.conf, HADOOP_CONF_DIR / YARN_CONF_DIR, and process environment',
     ],
     outputs: [
       '(childArgs, childClasspath, sparkConf, childMainClass) from prepareSubmitEnvironment',
-      'In-JVM dispatch to YarnClusterApplication (cluster) or deploy.PythonRunner (client)',
-      'Mapped YARN configs (spark.executor.instances, spark.yarn.dist.pyFiles, spark.yarn.isPython=true)',
+      'In-JVM dispatch to YarnClusterApplication (cluster), JavaMainApplication (Scala/Java client), or deploy.PythonRunner (PySpark client)',
+      'Mapped YARN configs (spark.executor.instances, spark.yarn.dist.jars / pyFiles, spark.yarn.isPython)',
     ],
     internalState: [
-      'SparkSubmitArguments (primaryResource, isPython, childArgs, sparkProperties)',
+      'SparkSubmitArguments (primaryResource, mainClass, isPython, childArgs, sparkProperties)',
       'SparkSubmit.prepareSubmitEnvironment resolved SparkConf and classpath',
       'MutableURLClassLoader installed before runMain invokes SparkApplication.start',
     ],
     failureClues: [
       'Missing HADOOP_CONF_DIR/YARN_CONF_DIR or unloadable YARN classes fail in the submit process before any container exists',
-      'Options placed after orders.py are passed as script arguments rather than Spark options; verify with --verbose',
+      'Options placed after the primary JAR or .py script are passed as application arguments rather than Spark options; verify with --verbose',
       'With spark.yarn.submit.waitAppCompletion=false in cluster mode, shell exit 0 does not prove job success',
     ],
     sourceLinks: [
@@ -70,12 +70,12 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     monitoredBy: 'Caller polling monitorApplication reports and LauncherBackend state updates',
     stoppedBy: 'Stops after app completes or waitAppCompletion=false (cluster), or on YarnClientSchedulerBackend.stop (client)',
     inputs: [
-      'ClientArguments (userClass, primaryPyFile, userArgs) and SparkConf / YarnConfiguration',
-      'Local script, --py-files / --files / --archives, and PySpark runtime libraries',
+      'ClientArguments (userClass, userJar / primaryPyFile, userArgs) and SparkConf / YarnConfiguration',
+      'Application JAR (--jars) or local .py script (--py-files) plus --files / --archives (and PySpark zips for Python apps)',
       'RM getNewApplication() response (ApplicationId and max container capability)',
     ],
     outputs: [
-      'Uploaded files and __spark_conf__ archive under .sparkStaging/<applicationId>',
+      'Uploaded JAR/files and __spark_conf__ archive under .sparkStaging/<applicationId> (localized link __app__.jar for JVM apps)',
       'ApplicationSubmissionContext + AM ContainerLaunchContext submitted to RM ClientRMService',
       'Polled YarnApplicationState and FinalApplicationStatus reports',
     ],
@@ -87,7 +87,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     failureClues: [
       'ApplicationId printed followed by "above the max threshold" means verifyClusterResources rejected container memory before submitting',
       'File present on submit host but missing in AM points to copyFileToRemote rules or NM localization diagnostics',
-      'YARN state RUNNING or fire-and-forget return does not prove orders.py finished or committed output',
+      'YARN state RUNNING or fire-and-forget return does not prove the user job finished or committed output',
     ],
     sourceLinks: [
       {
@@ -118,7 +118,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     process: 'YARN AM Container JVM (ApplicationMaster in cluster mode / ExecutorLauncher in client mode)',
     role: 'Represents one YARN application attempt: starts the user Driver thread (cluster) or connects to the external driver (client), registers the attempt with the RM, hosts YarnAllocator and the Reporter loop, and unregisters final attempt status.',
     keyDistinction:
-      'In client mode the ApplicationMaster connects to an existing external driver and never starts the Python script.',
+      'In client mode the ApplicationMaster connects to an existing external driver and never invokes the user main class or Python script.',
     startedBy: 'Selected NodeManager launching ContainerLaunchContext submitted via RM AMLauncher',
     monitoredBy: 'ResourceManager via AM allocate heartbeats and container exit status',
     stoppedBy: 'User thread exit (cluster), driver Shutdown/disconnect (client), reporter failure threshold, or JVM shutdown hook',
@@ -138,8 +138,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
       'AMEndpoint (YarnAM) registered after allocator setup to handle driver capacity/loss RPCs',
     ],
     failureClues: [
-      '"Waiting for spark context initialization" timeout means cluster AM never reached first allocator poll; inspect AM/Python stdout first',
-      'Normal script return before AM registration is recorded as FAILED / EXIT_SC_NOT_INITED (13)',
+      '"Waiting for spark context initialization" timeout means cluster AM never reached first allocator poll; inspect AM/driver stderr first',
+      'Normal return or exception before AM registration is recorded as FAILED / EXIT_SC_NOT_INITED (13); uncaught JVM main() after registration exits 15',
       'Non-last attempt failure skips unregister and staging cleanup so RM can launch a fresh retry attempt',
     ],
     sourceLinks: [
@@ -489,18 +489,18 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     role: 'Process role hosting SparkContext, SparkSession, SparkEnv, SQL planner, DAG/task schedulers, executor registry, storage/shuffle masters, and SparkUI for one application lifetime.',
     keyDistinction:
       'YARN grants the container; the Spark driver JVM decides which tasks each registered executor runs.',
-    startedBy: 'ApplicationMaster Driver thread (cluster mode) or SparkSubmit invoking PythonRunner (client mode)',
+    startedBy: 'ApplicationMaster Driver thread (cluster mode) or SparkSubmit invoking JavaMainApplication / PythonRunner (client mode)',
     monitoredBy: 'ApplicationMaster (cluster) or submitting user / YarnClientSchedulerBackend monitor (client)',
-    stoppedBy: 'spark.stop() -> SparkContext.stop(), Python child exit, or fatal JVM/container crash',
+    stoppedBy: 'spark.stop() -> SparkContext.stop(), user main() / Python child exit, or fatal JVM/container crash',
     inputs: [
-      'Local Py4J calls from the Python driver script (SQL queries, RDD actions, stop)',
+      'Direct in-JVM Scala/Java calls or local Py4J calls from a PySpark driver script (SQL queries, RDD actions, stop)',
       'Executor Spark RPC messages: RegisterExecutor, LaunchedExecutor, StatusUpdate, Heartbeat',
       'AM control handoffs (SparkContext rendezvous in cluster mode or YarnScheduler RPC in client mode)',
     ],
     outputs: [
       'Encoded LaunchTask and KillTask commands over Spark RPC to registered executors',
       'Executor capacity requests to the AM via YarnSchedulerBackend',
-      'Action results returned to Python driver (scalar over Py4J or batches over local data socket)',
+      'Action results returned in-JVM (Scala Array / Java List) or to Python driver via Py4J / local data socket',
     ],
     internalState: [
       'Live SparkContext, driver SparkEnv, and listening NettyRpcEnv (spark.driver.port)',
@@ -508,9 +508,9 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
       'Master metadata directories (BlockManagerMaster, MapOutputTrackerMaster, AppStatusStore)',
     ],
     failureClues: [
-      '"Timed out waiting for SparkContext" in cluster AM means pre-context Python code blocked past spark.yarn.am.waitTime',
-      'Driver JVM crash loses all in-memory scheduler state; YARN retry reruns orders.py from the start (cluster) or cannot resurrect it (client)',
-      'spark.stop() ends the JVM context without automatically terminating remaining Python script code',
+      '"Timed out waiting for SparkContext" in cluster AM means pre-context user code blocked past spark.yarn.am.waitTime',
+      'Driver JVM crash loses all in-memory scheduler state; YARN retry reruns main() / script from the start (cluster) or cannot resurrect it (client)',
+      'spark.stop() ends the JVM context without automatically exiting remaining user code in main() or Python',
     ],
     sourceLinks: [
       {
@@ -694,11 +694,11 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subZone: 'AM BRIDGE & DRIVER CORE',
     clusterPos: [344, 426],
     languages: ['pyspark', 'scala', 'java'],
-    process: 'Driver JVM singleton (org.apache.spark.SparkContext / JavaSparkContext) + Python wrapper',
+    process: 'Driver JVM singleton (org.apache.spark.SparkContext; wrapped by JavaSparkContext in Java and Python wrapper in PySpark)',
     role: 'Owns the Spark application lifecycle, initializes driver SparkEnv, LiveListenerBus, HeartbeatReceiver, schedulers, and optional dynamic allocation/event log, and serves as the runJob boundary into DAGScheduler.',
     keyDistinction:
       'SparkContext exists only on the driver; read properties like sc.defaultParallelism on the driver rather than capturing sc in a task closure.',
-    startedBy: 'SparkSession.builder.getOrCreate() or SparkContext.getOrCreate(conf) via Py4J JavaSparkContext',
+    startedBy: 'SparkSession.builder.getOrCreate() or SparkContext.getOrCreate(conf) (direct in Scala/Java, or via Py4J JavaSparkContext in PySpark)',
     monitoredBy: 'JVM activeContext singleton guard, LiveListenerBus application events, and JVM shutdown hook',
     stoppedBy: 'sc.stop() / spark.stop() (atomic stopped guard) or JVM shutdown hook cleanup',
     inputs: [
@@ -716,7 +716,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
       'Thread-local properties (job group, pool, SQL execution ID) and persistentRdds registry',
     ],
     failureClues: [
-      'CONTEXT_ONLY_VALID_ON_DRIVER during serialization means a Python task closure captured sc instead of a plain value',
+      'NotSerializableException (Scala/Java) or CONTEXT_ONLY_VALID_ON_DRIVER (PySpark) during serialization means a task closure captured sc instead of a plain value',
       'Constructing a second SparkContext in the same driver JVM is rejected by the activeContext guard',
       'Initialization failures trigger partial cleanup in post-init catch blocks before activeContext is published',
     ],

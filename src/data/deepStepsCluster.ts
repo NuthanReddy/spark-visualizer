@@ -2648,12 +2648,14 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
       },
     },
   },
+};
 
+export const DEEP_STEPS_CLUSTER_JVM: Record<string, DeepStepEnrichment> = {
   // ===========================================================================
-  // 3. Scala Cluster-Mode Batch Lifecycle (Steps 0, 1, 2, 3 expandable -- 0 Python/Py4J)
+  // 1. Scala Cluster-Mode Batch Lifecycle (flow-cluster-lifecycle:scala) (Steps 0, 1, 2, 3 expandable -- 0 Python/Py4J)
   // ===========================================================================
-  'flow-scala-cluster-lifecycle': {
-    traceId: 'flow-scala-cluster-lifecycle',
+  'flow-cluster-lifecycle:scala': {
+    traceId: 'flow-cluster-lifecycle',
     extraInstances: [
       {
         id: 'spark-env',
@@ -2690,8 +2692,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
       0: {
         steps: [
           {
-            id: 'flow-scala-cluster-lifecycle:step-0.1',
-            parentId: 'flow-scala-cluster-lifecycle:step-0',
+            id: 'flow-cluster-lifecycle:step-0.1',
+            parentId: 'flow-cluster-lifecycle:step-0',
             title: 'SparkSubmitArguments parses --class OrdersJob & dispatches YarnClusterApplication',
             explanation:
               'SparkSubmitArguments recognizes orders-assembly.jar as a JVM primary resource (spark.yarn.isPython=false), resolves --class com.acme.OrdersJob, and invokes YarnClusterApplication inside the edge-01 JVM with ZERO PythonRunner involvement.',
@@ -2707,8 +2709,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'spark-submit',
           },
           {
-            id: 'flow-scala-cluster-lifecycle:step-0.2',
-            parentId: 'flow-scala-cluster-lifecycle:step-0',
+            id: 'flow-cluster-lifecycle:step-0.2',
+            parentId: 'flow-cluster-lifecycle:step-0',
             title: 'yarn.Client allocates ApplicationId & runs verifyClusterResources()',
             explanation:
               'deploy.yarn.Client calls getNewApplication() on ResourceManager :8032 to reserve application_1740_0108, then checks AM (2432 MiB) and executor (4608 MiB) totals against RM maximum-allocation-mb before staging any files.',
@@ -2723,8 +2725,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'yarn-client',
           },
           {
-            id: 'flow-scala-cluster-lifecycle:step-0.3',
-            parentId: 'flow-scala-cluster-lifecycle:step-0',
+            id: 'flow-cluster-lifecycle:step-0.3',
+            parentId: 'flow-cluster-lifecycle:step-0',
             title: 'prepareLocalResources() uploads orders-assembly.jar (localized as __app__.jar)',
             explanation:
               'Client.prepareLocalResources() registers orders-assembly.jar under the fixed YARN LocalResource link name __app__.jar (local:/ URIs skip HDFS upload), calling NameNode :8020 for namespace metadata and streaming 24.6 MB JAR bytes to DataNode :9866.',
@@ -2740,8 +2742,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'hdfs-namenode',
           },
           {
-            id: 'flow-scala-cluster-lifecycle:step-0.4',
-            parentId: 'flow-scala-cluster-lifecycle:step-0',
+            id: 'flow-cluster-lifecycle:step-0.4',
+            parentId: 'flow-cluster-lifecycle:step-0',
             title: 'yarn.Client submits AM context (--jar orders-assembly.jar --class OrdersJob)',
             explanation:
               'yarn.Client submits ApplicationSubmissionContext to RM :8032 launching ApplicationMaster with --jar orders-assembly.jar (args.userJar, Client.scala:1118-1128; __app__.jar is the localized working-directory symlink, NOT the --jar CLI arg) and --class com.acme.OrdersJob, then enters ApplicationReport polling.',
@@ -2758,7 +2760,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
         events: [
           {
             id: 'fscl-0-1a',
-            stepId: 'flow-scala-cluster-lifecycle:step-0.1',
+            stepId: 'flow-cluster-lifecycle:step-0.1',
             kind: 'local',
             fromInstance: 'spark-submit',
             toInstance: 'yarn-client',
@@ -2781,7 +2783,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-0-2a',
-            stepId: 'flow-scala-cluster-lifecycle:step-0.2',
+            stepId: 'flow-cluster-lifecycle:step-0.2',
             kind: 'wire',
             fromInstance: 'yarn-client',
             toInstance: 'resource-manager',
@@ -2803,7 +2805,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-0-2b',
-            stepId: 'flow-scala-cluster-lifecycle:step-0.2',
+            stepId: 'flow-cluster-lifecycle:step-0.2',
             kind: 'local',
             fromInstance: 'yarn-client',
             toInstance: 'yarn-client',
@@ -2825,7 +2827,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-0-3a',
-            stepId: 'flow-scala-cluster-lifecycle:step-0.3',
+            stepId: 'flow-cluster-lifecycle:step-0.3',
             kind: 'wire',
             fromInstance: 'yarn-client',
             toInstance: 'hdfs-namenode',
@@ -2847,7 +2849,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-0-3b',
-            stepId: 'flow-scala-cluster-lifecycle:step-0.3',
+            stepId: 'flow-cluster-lifecycle:step-0.3',
             kind: 'wire',
             fromInstance: 'yarn-client',
             toInstance: 'hdfs-datanode',
@@ -2869,7 +2871,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-0-4a',
-            stepId: 'flow-scala-cluster-lifecycle:step-0.4',
+            stepId: 'flow-cluster-lifecycle:step-0.4',
             kind: 'wire',
             categoryOverride: 'yarn-lifecycle',
             fromInstance: 'yarn-client',
@@ -2899,8 +2901,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
       1: {
         steps: [
           {
-            id: 'flow-scala-cluster-lifecycle:step-1.1',
-            parentId: 'flow-scala-cluster-lifecycle:step-1',
+            id: 'flow-cluster-lifecycle:step-1.1',
+            parentId: 'flow-cluster-lifecycle:step-1',
             title: 'RM CapacityScheduler grants AM container_e01_000001 on driver-1',
             explanation:
               'RM CapacityScheduler allocates container_e01_000001 (2432 MiB, 1 vcore) on driver-1 for Attempt 1 and mints AMRMToken.',
@@ -2914,8 +2916,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'resource-manager',
           },
           {
-            id: 'flow-scala-cluster-lifecycle:step-1.2',
-            parentId: 'flow-scala-cluster-lifecycle:step-1',
+            id: 'flow-cluster-lifecycle:step-1.2',
+            parentId: 'flow-cluster-lifecycle:step-1',
             title: 'RM AMLauncher sends startContainers(AM) with __app__.jar manifest',
             explanation:
               'RM AMLauncher calls ContainerManagementProtocol.startContainers() on driver-1 NodeManager with LocalResources pointing to __app__.jar and __spark_conf__.zip.',
@@ -2929,8 +2931,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'node-manager',
           },
           {
-            id: 'flow-scala-cluster-lifecycle:step-1.3',
-            parentId: 'flow-scala-cluster-lifecycle:step-1',
+            id: 'flow-cluster-lifecycle:step-1.3',
+            parentId: 'flow-cluster-lifecycle:step-1',
             title: 'NM ContainerLocalizer downloads staged JAR into NM local cache',
             explanation:
               'driver-1 NodeManager ContainerLocalizer resolves block locations via NameNode :8020 and downloads orders-assembly.jar and __spark_conf__.zip bytes from DataNode :9866 into the NM local cache (working-directory symlink __app__.jar is created next by the container launch script, ContainerExecutor.java:452-455).',
@@ -2944,8 +2946,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'hdfs-datanode',
           },
           {
-            id: 'flow-scala-cluster-lifecycle:step-1.4',
-            parentId: 'flow-scala-cluster-lifecycle:step-1',
+            id: 'flow-cluster-lifecycle:step-1.4',
+            parentId: 'flow-cluster-lifecycle:step-1',
             title: 'Container launch script symlinks __app__.jar & boots ApplicationMaster.main()',
             explanation:
               'NodeManager configures the 2432 MiB memory cgroup and execs Hadoop container launch script launch_container.sh (ContainerExecutor.java:452-455), which creates the working-directory symlink __app__.jar -> localized orders-assembly.jar and starts org.apache.spark.deploy.yarn.ApplicationMaster.main() in cluster mode.',
@@ -2962,7 +2964,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
         events: [
           {
             id: 'fscl-1-1a',
-            stepId: 'flow-scala-cluster-lifecycle:step-1.1',
+            stepId: 'flow-cluster-lifecycle:step-1.1',
             kind: 'local',
             fromInstance: 'resource-manager',
             toInstance: 'resource-manager',
@@ -2984,7 +2986,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-1-2a',
-            stepId: 'flow-scala-cluster-lifecycle:step-1.2',
+            stepId: 'flow-cluster-lifecycle:step-1.2',
             kind: 'wire',
             fromInstance: 'resource-manager',
             toInstance: 'am-nm',
@@ -3006,7 +3008,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-1-3a',
-            stepId: 'flow-scala-cluster-lifecycle:step-1.3',
+            stepId: 'flow-cluster-lifecycle:step-1.3',
             kind: 'wire',
             fromInstance: 'am-nm',
             toInstance: 'hdfs-namenode',
@@ -3028,7 +3030,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-1-3b',
-            stepId: 'flow-scala-cluster-lifecycle:step-1.3',
+            stepId: 'flow-cluster-lifecycle:step-1.3',
             kind: 'wire',
             fromInstance: 'am-nm',
             toInstance: 'hdfs-datanode',
@@ -3050,7 +3052,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-1-4a',
-            stepId: 'flow-scala-cluster-lifecycle:step-1.4',
+            stepId: 'flow-cluster-lifecycle:step-1.4',
             kind: 'local',
             fromInstance: 'am-nm',
             toInstance: 'am-container',
@@ -3072,7 +3074,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-1-4b',
-            stepId: 'flow-scala-cluster-lifecycle:step-1.4',
+            stepId: 'flow-cluster-lifecycle:step-1.4',
             kind: 'local',
             fromInstance: 'am-container',
             toInstance: 'application-master',
@@ -3101,8 +3103,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
       2: {
         steps: [
           {
-            id: 'flow-scala-cluster-lifecycle:step-2.1',
-            parentId: 'flow-scala-cluster-lifecycle:step-2',
+            id: 'flow-cluster-lifecycle:step-2.1',
+            parentId: 'flow-cluster-lifecycle:step-2',
             title: 'AM installs shutdown hook (priority - 1) & YARN AmIpFilter',
             explanation:
               'ApplicationMaster caches stagingDirFs, installs its shutdown hook at SPARK_CONTEXT_SHUTDOWN_PRIORITY - 1, and configures YARN AmIpFilter for Spark UI proxy routing.',
@@ -3116,8 +3118,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'application-master',
           },
           {
-            id: 'flow-scala-cluster-lifecycle:step-2.2',
-            parentId: 'flow-scala-cluster-lifecycle:step-2',
+            id: 'flow-cluster-lifecycle:step-2.2',
+            parentId: 'flow-cluster-lifecycle:step-2',
             title: 'AM builds MutableURLClassLoader / ChildFirstURLClassLoader over __app__.jar',
             explanation:
               'ApplicationMaster constructs userClassLoader adding localized __app__.jar (and --jars) without spawning any PythonRunner or Py4JServer. When spark.driver.userClassPathFirst=true (ApplicationMaster.scala:84-95; deprecated spark.yarn.user.classpath.first affects YARN launch classpath ordering), ChildFirstURLClassLoader is chosen to resolve library version conflicts.',
@@ -3131,8 +3133,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'jvm-user-app',
           },
           {
-            id: 'flow-scala-cluster-lifecycle:step-2.3',
-            parentId: 'flow-scala-cluster-lifecycle:step-2',
+            id: 'flow-cluster-lifecycle:step-2.3',
+            parentId: 'flow-cluster-lifecycle:step-2',
             title: 'AM reflects com.acme.OrdersJob.main(Array[String]) before thread launch',
             explanation:
               'ApplicationMaster.startUserApplication() calls userClassLoader.loadClass("com.acme.OrdersJob").getMethod("main", classOf[Array[String]]). Note: if loadClass fails here before registration, AM exits EXIT_SC_NOT_INITED (13) with zero unregisterApplicationMaster.',
@@ -3146,8 +3148,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'jvm-user-app',
           },
           {
-            id: 'flow-scala-cluster-lifecycle:step-2.4',
-            parentId: 'flow-scala-cluster-lifecycle:step-2',
+            id: 'flow-cluster-lifecycle:step-2.4',
+            parentId: 'flow-cluster-lifecycle:step-2',
             title: 'AM starts "Driver" thread invoking OrdersJob.main() & awaits scPromise',
             explanation:
               'AM sets contextClassLoader = userClassLoader on a non-daemon "Driver" thread, invokes OrdersJob.main(args) directly in-JVM, and blocks the AM main thread on sparkContextPromise (up to spark.yarn.am.waitTime=100s).',
@@ -3164,7 +3166,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
         events: [
           {
             id: 'fscl-2-1a',
-            stepId: 'flow-scala-cluster-lifecycle:step-2.1',
+            stepId: 'flow-cluster-lifecycle:step-2.1',
             kind: 'local',
             fromInstance: 'application-master',
             toInstance: 'application-master',
@@ -3186,7 +3188,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-2-2a',
-            stepId: 'flow-scala-cluster-lifecycle:step-2.2',
+            stepId: 'flow-cluster-lifecycle:step-2.2',
             kind: 'local',
             fromInstance: 'application-master',
             toInstance: 'jvm-user-app',
@@ -3208,7 +3210,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-2-3a',
-            stepId: 'flow-scala-cluster-lifecycle:step-2.3',
+            stepId: 'flow-cluster-lifecycle:step-2.3',
             kind: 'local',
             fromInstance: 'application-master',
             toInstance: 'jvm-user-app',
@@ -3230,7 +3232,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-2-4a',
-            stepId: 'flow-scala-cluster-lifecycle:step-2.4',
+            stepId: 'flow-cluster-lifecycle:step-2.4',
             kind: 'local',
             fromInstance: 'application-master',
             toInstance: 'jvm-user-app',
@@ -3259,8 +3261,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
       3: {
         steps: [
           {
-            id: 'flow-scala-cluster-lifecycle:step-3.1',
-            parentId: 'flow-scala-cluster-lifecycle:step-3',
+            id: 'flow-cluster-lifecycle:step-3.1',
+            parentId: 'flow-cluster-lifecycle:step-3',
             title: 'OrdersJob.main() builds SparkSession & SparkContext in-JVM',
             explanation:
               'Direct Scala call SparkSession.builder().getOrCreate() constructs SparkContext inside the AM JVM with zero Py4J overhead.',
@@ -3274,8 +3276,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'spark-session',
           },
           {
-            id: 'flow-scala-cluster-lifecycle:step-3.2',
-            parentId: 'flow-scala-cluster-lifecycle:step-3',
+            id: 'flow-cluster-lifecycle:step-3.2',
+            parentId: 'flow-cluster-lifecycle:step-3',
             title: 'SparkEnv binds NettyRpcEnv (:41000) & SparkUI (:4040)',
             explanation:
               'SparkContext creates Driver SparkEnv, binds NettyRpcEnv on driver-1:41000, and starts ephemeral live SparkUI Jetty on driver-1:4040.',
@@ -3289,8 +3291,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'rpc-env',
           },
           {
-            id: 'flow-scala-cluster-lifecycle:step-3.3',
-            parentId: 'flow-scala-cluster-lifecycle:step-3',
+            id: 'flow-cluster-lifecycle:step-3.3',
+            parentId: 'flow-cluster-lifecycle:step-3',
             title: 'SparkContext resolves AM sparkContextPromise for RM registration',
             explanation:
               'SparkContext calls ApplicationMaster.sparkContextInitialized(sc), waking the AM main thread to register with RM :8030.',
@@ -3307,7 +3309,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
         events: [
           {
             id: 'fscl-3-1a',
-            stepId: 'flow-scala-cluster-lifecycle:step-3.1',
+            stepId: 'flow-cluster-lifecycle:step-3.1',
             kind: 'local',
             fromInstance: 'jvm-user-app',
             toInstance: 'spark-session',
@@ -3329,7 +3331,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-3-2a',
-            stepId: 'flow-scala-cluster-lifecycle:step-3.2',
+            stepId: 'flow-cluster-lifecycle:step-3.2',
             kind: 'local',
             fromInstance: 'spark-context',
             toInstance: 'spark-env',
@@ -3351,7 +3353,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-3-2b',
-            stepId: 'flow-scala-cluster-lifecycle:step-3.2',
+            stepId: 'flow-cluster-lifecycle:step-3.2',
             kind: 'local',
             fromInstance: 'spark-env',
             toInstance: 'rpc-env',
@@ -3373,7 +3375,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-3-2c',
-            stepId: 'flow-scala-cluster-lifecycle:step-3.2',
+            stepId: 'flow-cluster-lifecycle:step-3.2',
             kind: 'local',
             fromInstance: 'spark-context',
             toInstance: 'spark-ui',
@@ -3395,7 +3397,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fscl-3-3a',
-            stepId: 'flow-scala-cluster-lifecycle:step-3.3',
+            stepId: 'flow-cluster-lifecycle:step-3.3',
             kind: 'local',
             fromInstance: 'spark-context',
             toInstance: 'application-master',
@@ -3421,10 +3423,10 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
   },
 
   // ===========================================================================
-  // 4. Java Cluster-Mode Batch Lifecycle (Steps 0, 1, 2, 3 expandable -- 0 Python/Py4J)
+  // 2. Java Cluster-Mode Batch Lifecycle (flow-cluster-lifecycle:java) (Steps 0, 1, 2, 3 expandable -- 0 Python/Py4J)
   // ===========================================================================
-  'flow-java-cluster-lifecycle': {
-    traceId: 'flow-java-cluster-lifecycle',
+  'flow-cluster-lifecycle:java': {
+    traceId: 'flow-cluster-lifecycle',
     extraInstances: [
       {
         id: 'spark-env',
@@ -3461,8 +3463,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
       0: {
         steps: [
           {
-            id: 'flow-java-cluster-lifecycle:step-0.1',
-            parentId: 'flow-java-cluster-lifecycle:step-0',
+            id: 'flow-cluster-lifecycle:step-0.1',
+            parentId: 'flow-cluster-lifecycle:step-0',
             title: 'SparkSubmitArguments parses --class OrdersJavaJob & dispatches YarnClusterApplication',
             explanation:
               'SparkSubmitArguments resolves orders-java.jar and --class com.acme.OrdersJavaJob (spark.yarn.isPython=false) and dispatches YarnClusterApplication inside the edge-01 JVM.',
@@ -3476,8 +3478,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'spark-submit',
           },
           {
-            id: 'flow-java-cluster-lifecycle:step-0.2',
-            parentId: 'flow-java-cluster-lifecycle:step-0',
+            id: 'flow-cluster-lifecycle:step-0.2',
+            parentId: 'flow-cluster-lifecycle:step-0',
             title: 'yarn.Client reserves ApplicationId & verifies container caps',
             explanation:
               'yarn.Client calls createApplication() on RM :8032 to obtain application_1740_0109 and verifies AM and executor memory against RM maximum-allocation-mb.',
@@ -3491,8 +3493,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'yarn-client',
           },
           {
-            id: 'flow-java-cluster-lifecycle:step-0.3',
-            parentId: 'flow-java-cluster-lifecycle:step-0',
+            id: 'flow-cluster-lifecycle:step-0.3',
+            parentId: 'flow-cluster-lifecycle:step-0',
             title: 'prepareLocalResources() stages orders-java.jar (localized as __app__.jar)',
             explanation:
               'yarn.Client creates HDFS .sparkStaging/application_1740_0109/orders-java.jar metadata on NameNode :8020 and streams 19.4 MB orders-java.jar bytes to DataNode :9866, registering YARN localized working-directory link name __app__.jar.',
@@ -3506,8 +3508,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'hdfs-namenode',
           },
           {
-            id: 'flow-java-cluster-lifecycle:step-0.4',
-            parentId: 'flow-java-cluster-lifecycle:step-0',
+            id: 'flow-cluster-lifecycle:step-0.4',
+            parentId: 'flow-cluster-lifecycle:step-0',
             title: 'yarn.Client submits Java AM ApplicationSubmissionContext to RM :8032',
             explanation:
               'Submits AM context (--jar orders-java.jar --class com.acme.OrdersJavaJob; args.userJar per Client.scala:1118-1128, while __app__.jar is the localized working-directory symlink) to RM :8032 and polls ApplicationReport.',
@@ -3524,7 +3526,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
         events: [
           {
             id: 'fjcl-0-1a',
-            stepId: 'flow-java-cluster-lifecycle:step-0.1',
+            stepId: 'flow-cluster-lifecycle:step-0.1',
             kind: 'local',
             fromInstance: 'spark-submit',
             toInstance: 'yarn-client',
@@ -3546,7 +3548,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-0-2a',
-            stepId: 'flow-java-cluster-lifecycle:step-0.2',
+            stepId: 'flow-cluster-lifecycle:step-0.2',
             kind: 'wire',
             fromInstance: 'yarn-client',
             toInstance: 'resource-manager',
@@ -3568,7 +3570,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-0-3a',
-            stepId: 'flow-java-cluster-lifecycle:step-0.3',
+            stepId: 'flow-cluster-lifecycle:step-0.3',
             kind: 'wire',
             fromInstance: 'yarn-client',
             toInstance: 'hdfs-namenode',
@@ -3590,7 +3592,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-0-3b',
-            stepId: 'flow-java-cluster-lifecycle:step-0.3',
+            stepId: 'flow-cluster-lifecycle:step-0.3',
             kind: 'wire',
             fromInstance: 'yarn-client',
             toInstance: 'hdfs-datanode',
@@ -3612,7 +3614,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-0-4a',
-            stepId: 'flow-java-cluster-lifecycle:step-0.4',
+            stepId: 'flow-cluster-lifecycle:step-0.4',
             kind: 'wire',
             categoryOverride: 'yarn-lifecycle',
             fromInstance: 'yarn-client',
@@ -3642,8 +3644,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
       1: {
         steps: [
           {
-            id: 'flow-java-cluster-lifecycle:step-1.1',
-            parentId: 'flow-java-cluster-lifecycle:step-1',
+            id: 'flow-cluster-lifecycle:step-1.1',
+            parentId: 'flow-cluster-lifecycle:step-1',
             title: 'RM AMLauncher dispatches AM container_e01_000001 to driver-1 NM',
             explanation:
               'RM CapacityScheduler grants container_e01_000001 on driver-1 and AMLauncher sends ContainerManagementProtocol.startContainers().',
@@ -3657,8 +3659,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'node-manager',
           },
           {
-            id: 'flow-java-cluster-lifecycle:step-1.2',
-            parentId: 'flow-java-cluster-lifecycle:step-1',
+            id: 'flow-cluster-lifecycle:step-1.2',
+            parentId: 'flow-cluster-lifecycle:step-1',
             title: 'NM ContainerLocalizer downloads staged JAR into NM local cache',
             explanation:
               'driver-1 NM ContainerLocalizer queries NameNode :8020 for block locations and downloads orders-java.jar bytes from DataNode :9866 into the NM local cache (working-directory symlink __app__.jar is created next by the container launch script, ContainerExecutor.java:452-455).',
@@ -3672,8 +3674,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'hdfs-datanode',
           },
           {
-            id: 'flow-java-cluster-lifecycle:step-1.3',
-            parentId: 'flow-java-cluster-lifecycle:step-1',
+            id: 'flow-cluster-lifecycle:step-1.3',
+            parentId: 'flow-cluster-lifecycle:step-1',
             title: 'Container launch script symlinks __app__.jar & enters ApplicationMaster.main()',
             explanation:
               'NodeManager configures memory cgroups and runs Hadoop container launch script launch_container.sh (ContainerExecutor.java:452-455), creating the working-directory __app__.jar symlink before starting ApplicationMaster.main() inside container_e01_000001.',
@@ -3690,7 +3692,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
         events: [
           {
             id: 'fjcl-1-1a',
-            stepId: 'flow-java-cluster-lifecycle:step-1.1',
+            stepId: 'flow-cluster-lifecycle:step-1.1',
             kind: 'wire',
             fromInstance: 'resource-manager',
             toInstance: 'am-nm',
@@ -3712,7 +3714,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-1-2a',
-            stepId: 'flow-java-cluster-lifecycle:step-1.2',
+            stepId: 'flow-cluster-lifecycle:step-1.2',
             kind: 'wire',
             fromInstance: 'am-nm',
             toInstance: 'hdfs-namenode',
@@ -3734,7 +3736,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-1-2b',
-            stepId: 'flow-java-cluster-lifecycle:step-1.2',
+            stepId: 'flow-cluster-lifecycle:step-1.2',
             kind: 'wire',
             fromInstance: 'am-nm',
             toInstance: 'hdfs-datanode',
@@ -3756,7 +3758,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-1-3a',
-            stepId: 'flow-java-cluster-lifecycle:step-1.3',
+            stepId: 'flow-cluster-lifecycle:step-1.3',
             kind: 'local',
             fromInstance: 'am-nm',
             toInstance: 'am-container',
@@ -3778,7 +3780,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-1-3b',
-            stepId: 'flow-java-cluster-lifecycle:step-1.3',
+            stepId: 'flow-cluster-lifecycle:step-1.3',
             kind: 'local',
             fromInstance: 'am-container',
             toInstance: 'application-master',
@@ -3807,8 +3809,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
       2: {
         steps: [
           {
-            id: 'flow-java-cluster-lifecycle:step-2.1',
-            parentId: 'flow-java-cluster-lifecycle:step-2',
+            id: 'flow-cluster-lifecycle:step-2.1',
+            parentId: 'flow-cluster-lifecycle:step-2',
             title: 'AM builds MutableURLClassLoader over __app__.jar (zero Python/Py4J)',
             explanation:
               'ApplicationMaster prepares MutableURLClassLoader (or ChildFirstURLClassLoader when spark.driver.userClassPathFirst=true, ApplicationMaster.scala:84-95; deprecated spark.yarn.user.classpath.first affects YARN launch classpath ordering) pointing at localized symlink __app__.jar. No PythonRunner or Py4JServer is ever constructed.',
@@ -3822,8 +3824,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'jvm-user-app',
           },
           {
-            id: 'flow-java-cluster-lifecycle:step-2.2',
-            parentId: 'flow-java-cluster-lifecycle:step-2',
+            id: 'flow-cluster-lifecycle:step-2.2',
+            parentId: 'flow-cluster-lifecycle:step-2',
             title: 'AM reflects public static void OrdersJavaJob.main(String[])',
             explanation:
               'ApplicationMaster.startUserApplication() reflects com.acme.OrdersJavaJob.main(String[]) before starting the user thread (missing class here exits EXIT_SC_NOT_INITED = 13 without unregister).',
@@ -3837,8 +3839,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'jvm-user-app',
           },
           {
-            id: 'flow-java-cluster-lifecycle:step-2.3',
-            parentId: 'flow-java-cluster-lifecycle:step-2',
+            id: 'flow-cluster-lifecycle:step-2.3',
+            parentId: 'flow-cluster-lifecycle:step-2',
             title: 'Driver thread invokes OrdersJavaJob.main(String[]) directly in-JVM',
             explanation:
               'AM spawns the non-daemon "Driver" thread calling OrdersJavaJob.main(args) directly in-JVM and waits on sparkContextPromise.',
@@ -3855,7 +3857,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
         events: [
           {
             id: 'fjcl-2-1a',
-            stepId: 'flow-java-cluster-lifecycle:step-2.1',
+            stepId: 'flow-cluster-lifecycle:step-2.1',
             kind: 'local',
             fromInstance: 'application-master',
             toInstance: 'jvm-user-app',
@@ -3877,7 +3879,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-2-2a',
-            stepId: 'flow-java-cluster-lifecycle:step-2.2',
+            stepId: 'flow-cluster-lifecycle:step-2.2',
             kind: 'local',
             fromInstance: 'application-master',
             toInstance: 'jvm-user-app',
@@ -3899,7 +3901,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-2-3a',
-            stepId: 'flow-java-cluster-lifecycle:step-2.3',
+            stepId: 'flow-cluster-lifecycle:step-2.3',
             kind: 'local',
             fromInstance: 'application-master',
             toInstance: 'jvm-user-app',
@@ -3928,8 +3930,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
       3: {
         steps: [
           {
-            id: 'flow-java-cluster-lifecycle:step-3.1',
-            parentId: 'flow-java-cluster-lifecycle:step-3',
+            id: 'flow-cluster-lifecycle:step-3.1',
+            parentId: 'flow-cluster-lifecycle:step-3',
             title: 'SparkSession.builder() initializes single SparkContext, SparkEnv & NettyRpcEnv',
             explanation:
               'OrdersJavaJob.main() calls SparkSession.builder().getOrCreate(), constructing ONE SparkContext, Driver SparkEnv, NettyRpcEnv (:41000), and SparkUI (:4040).',
@@ -3943,8 +3945,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'spark-session',
           },
           {
-            id: 'flow-java-cluster-lifecycle:step-3.2',
-            parentId: 'flow-java-cluster-lifecycle:step-3',
+            id: 'flow-cluster-lifecycle:step-3.2',
+            parentId: 'flow-cluster-lifecycle:step-3',
             title: 'YarnClusterScheduler.postStartHook() fulfills sparkContextPromise & pauses user thread',
             explanation:
               'During SparkContext construction, YarnClusterScheduler.postStartHook() calls ApplicationMaster.sparkContextInitialized(sc) (ApplicationMaster.scala:405-418), completing sparkContextPromise AND calling sparkContextPromise.wait() to pause the "Driver" thread before SparkSession.builder().getOrCreate() returns.',
@@ -3958,8 +3960,8 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
             deepDiveComponentId: 'spark-context',
           },
           {
-            id: 'flow-java-cluster-lifecycle:step-3.3',
-            parentId: 'flow-java-cluster-lifecycle:step-3',
+            id: 'flow-cluster-lifecycle:step-3.3',
+            parentId: 'flow-cluster-lifecycle:step-3',
             title: 'AM runDriver() unblocks to register on RM :8030 & create YarnAllocator',
             explanation:
               'ApplicationMaster.runDriver() receives the SparkContext from sparkContextPromise.future and proceeds to registerAM() on RM :8030 and createAllocator() before calling resumeDriver() so OrdersJavaJob.main() can wrap spark.sparkContext() via JavaSparkContext.fromSparkContext().',
@@ -3976,7 +3978,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
         events: [
           {
             id: 'fjcl-3-1a',
-            stepId: 'flow-java-cluster-lifecycle:step-3.1',
+            stepId: 'flow-cluster-lifecycle:step-3.1',
             kind: 'local',
             fromInstance: 'jvm-user-app',
             toInstance: 'spark-session',
@@ -3998,7 +4000,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-3-1b',
-            stepId: 'flow-java-cluster-lifecycle:step-3.1',
+            stepId: 'flow-cluster-lifecycle:step-3.1',
             kind: 'local',
             fromInstance: 'spark-context',
             toInstance: 'rpc-env',
@@ -4020,7 +4022,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-3-2a',
-            stepId: 'flow-java-cluster-lifecycle:step-3.2',
+            stepId: 'flow-cluster-lifecycle:step-3.2',
             kind: 'local',
             fromInstance: 'spark-context',
             toInstance: 'application-master',
@@ -4042,7 +4044,7 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
           {
             id: 'fjcl-3-3a',
-            stepId: 'flow-java-cluster-lifecycle:step-3.3',
+            stepId: 'flow-cluster-lifecycle:step-3.3',
             kind: 'local',
             fromInstance: 'application-master',
             toInstance: 'application-master',
@@ -4064,6 +4066,165 @@ export const DEEP_STEPS_CLUSTER: Record<string, DeepStepEnrichment> = {
           },
         ],
       },
+    },
+  },
+
+  // ===========================================================================
+  // 3. Client-Mode Startup & Discovery -- Pure JVM (flow-client-discovery:jvm)
+  // ===========================================================================
+  'flow-client-discovery:jvm': {
+    traceId: 'flow-client-discovery',
+    extraInstances: DEEP_STEPS_CLUSTER['flow-client-discovery'].extraInstances,
+    expansions: {
+      // -----------------------------------------------------------------------
+      // Step 0: Local JavaMainApplication launch on edge-01 (zero Python/Py4J)
+      // -----------------------------------------------------------------------
+      0: {
+        steps: [
+          {
+            id: 'flow-client-discovery:step-0.1',
+            parentId: 'flow-client-discovery:step-0',
+            title: 'SparkSubmitArguments parses --class & JAR (deployMode=client, isPython=false)',
+            explanation:
+              'bin/spark-submit parses CLI options on edge-01, sees --deploy-mode client with a JVM JAR (spark.yarn.isPython=false), and prepares the local submit classpath without invoking YarnClusterApplication or any Python process.',
+            category: 'yarn-lifecycle',
+            keyState: 'deployMode=client | spark.yarn.isPython=false | edge-01 JVM',
+            command: 'new SparkSubmitArguments(args) -> prepareSubmitEnvironment(args)',
+            detailsPassed: [
+              { name: 'deployMode', value: 'client (local driver JVM on edge-01)' },
+              { name: 'spark.yarn.isPython', value: 'false (pure JVM JAR submission)' },
+              { name: 'yarnAppId', value: 'none yet (created when SparkContext starts)' },
+            ],
+            deepDiveComponentId: 'spark-submit',
+          },
+          {
+            id: 'flow-client-discovery:step-0.2',
+            parentId: 'flow-client-discovery:step-0',
+            title: 'JavaMainApplication.start() reflects user main() directly on edge-01',
+            explanation:
+              'SparkSubmit.runMain instantiates org.apache.spark.deploy.JavaMainApplication inside the edge-01 submit JVM and reflects user main() directly on the submit classpath (zero Python subprocess, zero Py4J loopback server).',
+            category: 'yarn-lifecycle',
+            keyState: 'User main() running in-JVM on edge-01 | 0 Python / 0 Py4J',
+            command: 'JavaMainApplication.start(childArgs, sparkConf) -> mainClass.main(args)',
+            detailsPassed: [
+              { name: 'entryWrapper', value: 'org.apache.spark.deploy.JavaMainApplication' },
+              { name: 'hostZone', value: 'edge-01 submit-host (driver JVM)' },
+              { name: 'zeroPython', value: 'No loopback Py4J gateway or Python process' },
+            ],
+            deepDiveComponentId: 'jvm-user-app',
+          },
+        ],
+        events: [
+          {
+            id: 'fcd-jvm-0-1a',
+            stepId: 'flow-client-discovery:step-0.1',
+            kind: 'local',
+            fromInstance: 'spark-submit',
+            toInstance: 'spark-submit',
+            fromComponent: 'spark-submit',
+            toComponent: 'spark-submit',
+            channel: 'internal',
+            protocol: 'In-JVM SparkSubmitArguments',
+            port: 'edge-01 in-JVM',
+            label: 'Parse --class (client)',
+            info: 'SparkSubmitArguments parses --deploy-mode client and JVM JAR flags on edge-01 with spark.yarn.isPython=false.',
+            size: 'in-memory',
+            command: 'new SparkSubmitArguments(args) // deployMode=client, isPython=false',
+            fields: [
+              { name: 'deployMode', value: 'client' },
+              { name: 'spark.yarn.isPython', value: 'false' },
+              { name: 'childMainClass', value: 'User --class via JavaMainApplication' },
+            ],
+            senderState: 'Parsed client-mode JVM flags on edge-01',
+            receiverState: 'Dispatching JavaMainApplication.start() on submit classpath',
+          },
+          {
+            id: 'fcd-jvm-0-2a',
+            stepId: 'flow-client-discovery:step-0.2',
+            kind: 'local',
+            fromInstance: 'spark-submit',
+            toInstance: 'jvm-user-app',
+            fromComponent: 'spark-submit',
+            toComponent: 'jvm-user-app',
+            channel: 'internal',
+            protocol: 'In-JVM JavaMainApplication.start',
+            port: 'edge-01 in-JVM',
+            label: 'Reflect main() on edge-01',
+            info: 'JavaMainApplication.start() reflects the Scala/Java main() method directly inside the edge-01 client JVM (zero Python subprocess, zero Py4J loopback).',
+            size: 'in-memory',
+            command: 'JavaMainApplication.start(args, sparkConf) -> mainMethod.invoke(null, args)',
+            fields: [
+              { name: 'host', value: 'edge-01 (submit host becomes client driver)' },
+              { name: 'py4jUsed', value: 'false (100% pure JVM)' },
+              { name: 'yarnStatus', value: 'No YARN application requested yet' },
+            ],
+            senderState: 'Submit JVM transformed into client-mode Driver JVM',
+            receiverState: 'User JVM main() executing locally on edge-01',
+          },
+        ],
+      },
+
+      // -----------------------------------------------------------------------
+      // Step 1: Local JVM driver boots SparkSession & binds edge-01:41000
+      // -----------------------------------------------------------------------
+      1: {
+        steps: [
+          {
+            id: 'flow-client-discovery:step-1.1',
+            parentId: 'flow-client-discovery:step-1',
+            title: 'Local JVM user app invokes SparkSession.builder().master("yarn").getOrCreate()',
+            explanation:
+              'On edge-01, the Scala/Java user app constructs SparkSession directly in-JVM (zero Py4J loopback) before YARN has any application, triggering local SparkContext initialization.',
+            category: 'yarn-lifecycle',
+            keyState: 'Direct in-JVM SparkSession init on edge-01 | No YARN app yet',
+            command: 'SparkSession.builder().master("yarn").appName("orders-client").getOrCreate()',
+            detailsPassed: [
+              { name: 'invocation', value: 'Direct in-JVM call on edge-01 (zero Py4J)' },
+              { name: 'deployMode', value: 'client' },
+              { name: 'yarnAppId', value: 'none yet (created in Step 2/3)' },
+            ],
+            deepDiveComponentId: 'spark-session',
+          },
+          ...DEEP_STEPS_CLUSTER['flow-client-discovery'].expansions[1].steps
+            .slice(1)
+            .map((step) => ({
+              ...step,
+              category:
+                step.category === 'driver-python-bridge'
+                  ? ('yarn-lifecycle' as const)
+                  : step.category,
+            })),
+        ],
+        events: [
+          {
+            id: 'fcd-jvm-1-1a',
+            stepId: 'flow-client-discovery:step-1.1',
+            kind: 'local',
+            fromInstance: 'jvm-user-app',
+            toInstance: 'spark-session',
+            fromComponent: 'jvm-user-app',
+            toComponent: 'spark-session',
+            channel: 'internal',
+            protocol: 'In-JVM SparkSession Builder',
+            port: 'edge-01 in-JVM',
+            label: 'SparkSession.builder()',
+            info: 'Local JVM user app invokes SparkSession.builder().master("yarn").getOrCreate() directly inside the edge-01 client JVM before any YARN RPC.',
+            size: 'in-memory',
+            command: 'SparkSession.builder().master("yarn").appName("orders-client").getOrCreate()',
+            fields: [
+              { name: 'host', value: 'edge-01 (client driver JVM)' },
+              { name: 'master', value: 'yarn' },
+              { name: 'py4jUsed', value: 'false' },
+            ],
+            senderState: 'Constructing local SparkSession on edge-01',
+            receiverState: 'Initializing underlying client-mode SparkContext',
+          },
+          ...DEEP_STEPS_CLUSTER['flow-client-discovery'].expansions[1].events.slice(2),
+        ],
+      },
+
+      4: DEEP_STEPS_CLUSTER['flow-client-discovery'].expansions[4],
+      5: DEEP_STEPS_CLUSTER['flow-client-discovery'].expansions[5],
     },
   },
 };

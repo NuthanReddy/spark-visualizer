@@ -32,6 +32,7 @@ import SequenceCanvas from './components/SequenceCanvas';
 import SimulatorPanel from './components/SimulatorPanel';
 import TopologyCanvas from './components/TopologyCanvas';
 import { COMPONENTS, COMPONENT_LIST } from './data/components';
+import { resolveTraceForLanguage } from './data/jvmTraceOverrides';
 import {
   ALL_STEP_CATEGORIES,
   CATEGORY_PRESETS,
@@ -71,6 +72,7 @@ import {
   computeHiddenCategoriesForStep,
   getExpandableStepIds,
   projectRun,
+  reconcileSameTraceLanguageTransition,
   resolveEventAfterProjectionChange,
   resolveEventAfterToggleExpand,
   stepJumpEventId,
@@ -352,7 +354,7 @@ export default function App() {
     const trace = TRACE_BY_ID[initialCatalogTraceId] ?? DEFAULT_TRACE;
     const simConfig = parsed.kind === 'sim' ? parsed.simConfig : null;
     const simRun = simConfig ? buildSimulatedRun(simConfig) : null;
-    const run = simRun ?? adaptTraceToRun(trace);
+    const run = simRun ?? adaptTraceToRun(trace, parsed.language);
     const proj = projectRun(run, new Set(), ALL_STEP_CATEGORIES);
     return {
       parsed,
@@ -439,7 +441,10 @@ export default function App() {
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   const selectedTrace = TRACE_BY_ID[traceId] ?? DEFAULT_TRACE;
-  const catalogRun = useMemo(() => adaptTraceToRun(selectedTrace), [selectedTrace]);
+  const catalogRun = useMemo(
+    () => adaptTraceToRun(selectedTrace, activeLanguage),
+    [selectedTrace, activeLanguage],
+  );
   const activeRun: ExecutionRun = activeSimRun ?? catalogRun;
 
   const projection = useMemo(
@@ -582,28 +587,30 @@ export default function App() {
   const catalogSearchEntries = useMemo<SearchEntry[]>(() => {
     const entries: SearchEntry[] = [];
     for (const trace of LIFECYCLE_TRACES) {
+      const resolved = resolveTraceForLanguage(trace, activeLanguage);
       entries.push({
         key: `trace-${trace.id}`,
-        title: trace.name,
-        subtitle: trace.subtitle,
+        title: resolved.name,
+        subtitle: resolved.subtitle,
         badge: 'LIFECYCLE',
         kind: 'lifecycle',
         traceId: trace.id,
         stepId: null,
-        searchText: `${trace.name} ${trace.subtitle} ${trace.summary} ${trace.layerTag} lifecycle`.toLowerCase(),
+        searchText: `${resolved.name} ${resolved.subtitle} ${resolved.summary} ${resolved.layerTag} ${trace.name} lifecycle`.toLowerCase(),
       });
     }
     for (const trace of SCENARIO_TRACES) {
+      const resolved = resolveTraceForLanguage(trace, activeLanguage);
       const num = trace.scenarioNumber ?? 0;
       entries.push({
         key: `trace-${trace.id}`,
-        title: trace.name,
-        subtitle: trace.subtitle,
+        title: resolved.name,
+        subtitle: resolved.subtitle,
         badge: `SCENARIO #${String(num).padStart(2, '0')}`,
         kind: 'scenario',
         traceId: trace.id,
         stepId: null,
-        searchText: `${trace.name} ${trace.subtitle} ${trace.summary} ${trace.layerTag} scenario ${num}`.toLowerCase(),
+        searchText: `${resolved.name} ${resolved.subtitle} ${resolved.summary} ${resolved.layerTag} ${trace.name} scenario ${num}`.toLowerCase(),
       });
     }
     for (const comp of COMPONENT_LIST) {
@@ -623,23 +630,23 @@ export default function App() {
       });
     }
     for (const trace of ALL_TRACES) {
-      const run = adaptTraceToRun(trace);
+      const run = adaptTraceToRun(trace, activeLanguage);
       run.steps.forEach((step, idx) => {
         entries.push({
           key: `step-${step.id}`,
           title: step.title,
-          subtitle: `${trace.name} · Step ${idx + 1} of ${run.steps.length}`,
+          subtitle: `${run.name} - Step ${idx + 1} of ${run.steps.length}`,
           badge: `STEP ${String(idx + 1).padStart(2, '0')}`,
           kind: 'step',
           traceId: trace.id,
           stepId: step.id,
           componentId: trace.componentId,
-          searchText: `${step.title} ${step.explanation} ${step.keyState ?? ''} ${step.command ?? ''} ${trace.name}`.toLowerCase(),
+          searchText: `${step.title} ${step.explanation} ${step.keyState ?? ''} ${step.command ?? ''} ${run.name}`.toLowerCase(),
         });
       });
     }
     return entries;
-  }, []);
+  }, [activeLanguage]);
 
   const allSearchEntries = useMemo<SearchEntry[]>(() => {
     if (activeRun.sourceKind !== 'simulation') return catalogSearchEntries;
@@ -686,14 +693,17 @@ export default function App() {
       historyMode?: 'replace' | 'push';
     },
   ) {
-    const isCurrentRun = id === activeRun.id;
     const target = TRACE_BY_ID[id] ?? DEFAULT_TRACE;
-    const nextRun = isCurrentRun ? activeRun : adaptTraceToRun(target);
     const nextLanguage: SparkLanguage = opts?.languageOverride
       ? opts.languageOverride
       : TRACE_BY_ID[id]
         ? resolveLanguageAfterTraceSelect(target, activeLanguage)
         : activeLanguage;
+    const isCurrentRun =
+      id === activeRun.id && nextLanguage === activeLanguage;
+    const nextRun = isCurrentRun
+      ? activeRun
+      : adaptTraceToRun(target, nextLanguage);
 
     if (
       opts?.historyMode !== 'replace' &&
@@ -862,6 +872,41 @@ export default function App() {
         animate: false,
         languageOverride: nextLang,
       });
+    } else {
+      const nextRun = adaptTraceToRun(selectedTrace, nextLang);
+      const transition = reconcileSameTraceLanguageTransition({
+        nextRun,
+        nextLanguage: nextLang,
+        currentExpandedStepIds: expandedStepIds,
+        enabledCategories,
+        currentEventId: activeEventId,
+        currentFrame: activeFrame,
+        selectedComponentId,
+        componentLanguages: selectedComponentId
+          ? COMPONENTS[selectedComponentId]?.languages
+          : undefined,
+      });
+      if (
+        transition.nextExpandedStepIds.size !== expandedStepIds.size ||
+        [...transition.nextExpandedStepIds].some((id) => !expandedStepIds.has(id))
+      ) {
+        setExpandedStepIds(transition.nextExpandedStepIds);
+      }
+      if (transition.nextSelectedComponentId !== selectedComponentId) {
+        setSelectedComponentId(transition.nextSelectedComponentId);
+      }
+      playScopeRef.current = null;
+      setPlaying(false);
+      commitPlayback(
+        transition.nextEventId,
+        transition.nextEventId ? 1 : 0,
+      );
+      const landingIdx = transition.nextEventId
+        ? (transition.nextProjection.frameIndexByEventId.get(
+            transition.nextEventId,
+          ) ?? -1)
+        : -1;
+      updateReadyAtStart(landingIdx === 0 && isReadyAtStartRef.current);
     }
   }
 
@@ -1065,7 +1110,7 @@ export default function App() {
     const targetTrace = TRACE_BY_ID[entry.traceId] ?? DEFAULT_TRACE;
     const restoredExpanded = new Set<string>(entry.expandedStepIds);
     const restoredCategories = new Set<StepCategory>(entry.enabledCategories);
-    const restoredRun = entry.run ?? adaptTraceToRun(targetTrace);
+    const restoredRun = entry.run ?? adaptTraceToRun(targetTrace, entry.language);
     const restoredProj = projectRun(
       restoredRun,
       restoredExpanded,
@@ -1497,9 +1542,40 @@ export default function App() {
         selectTrace(nextTrace.id, {
           componentId: nextTrace.componentId ?? null,
           tab: 'step',
+          animate: true,
           languageOverride: parsed.language,
           historyMode: 'replace',
         });
+      } else if (parsed.language !== activeLanguage) {
+        // Same-trace language history traversal: preserve valid expansions, surviving activeEventId, and reconcile inspector component!
+        const nextRun = adaptTraceToRun(nextTrace, parsed.language);
+        const transition = reconcileSameTraceLanguageTransition({
+          nextRun,
+          nextLanguage: parsed.language,
+          currentExpandedStepIds: expandedStepIds,
+          enabledCategories,
+          currentEventId: activeEventId,
+          currentFrame: activeFrame,
+          selectedComponentId,
+          componentLanguages: selectedComponentId
+            ? COMPONENTS[selectedComponentId]?.languages
+            : undefined,
+        });
+        if (
+          transition.nextExpandedStepIds.size !== expandedStepIds.size ||
+          [...transition.nextExpandedStepIds].some((id) => !expandedStepIds.has(id))
+        ) {
+          setExpandedStepIds(transition.nextExpandedStepIds);
+        }
+        if (transition.nextSelectedComponentId !== selectedComponentId) {
+          setSelectedComponentId(transition.nextSelectedComponentId);
+        }
+        playScopeRef.current = null;
+        setPlaying(false);
+        commitPlayback(
+          transition.nextEventId,
+          transition.nextEventId ? 1 : 0,
+        );
       } else if (
         nextTrace.componentId &&
         nextTrace.componentId !== selectedComponentId

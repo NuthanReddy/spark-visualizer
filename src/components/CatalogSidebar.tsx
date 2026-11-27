@@ -13,6 +13,7 @@ import type {
   ProjectedTimeline,
   RunStep,
 } from '../data/runModel';
+import { resolveTraceForLanguage } from '../data/jvmTraceOverrides';
 import { SPARK_LANGUAGES, SUBSYSTEM_META } from '../data/types';
 import type {
   SparkLanguage,
@@ -498,6 +499,10 @@ export default function CatalogSidebar({
 
       <div className="catalog-list">
         {pinnedHiddenActiveTrace && (() => {
+          const displayPinned = resolveTraceForLanguage(
+            pinnedHiddenActiveTrace,
+            activeLanguage,
+          );
           const pinnedLangBadge = getLanguageBadge(
             getEffectiveTraceLanguages(pinnedHiddenActiveTrace),
           );
@@ -542,7 +547,7 @@ export default function CatalogSidebar({
                 </span>
                 <span className="catalog-entry-copy">
                   <span className="catalog-entry-title-row">
-                    <strong>{pinnedHiddenActiveTrace.name}</strong>
+                    <strong>{displayPinned.name}</strong>
                     <span className="catalog-entry-tags">
                       {pinnedLangBadge && (
                         <span className={pinnedLangBadge.className}>
@@ -563,7 +568,7 @@ export default function CatalogSidebar({
                       )}
                     </span>
                   </span>
-                  <small>{pinnedHiddenActiveTrace.subtitle}</small>
+                  <small>{displayPinned.subtitle}</small>
                 </span>
                 <ChevronDown size={14} />
               </button>
@@ -573,6 +578,7 @@ export default function CatalogSidebar({
         })()}
 
         {visibleTraces.map((trace, idx) => {
+          const displayTrace = resolveTraceForLanguage(trace, activeLanguage);
           const isSelected = trace.id === activeRunId;
           const showProjectedSteps = isSelected && projection.runId === trace.id;
           const langBadge = getLanguageBadge(getEffectiveTraceLanguages(trace));
@@ -603,7 +609,7 @@ export default function CatalogSidebar({
                 </span>
                 <span className="catalog-entry-copy">
                   <span className="catalog-entry-title-row">
-                    <strong>{trace.name}</strong>
+                    <strong>{displayTrace.name}</strong>
                     <span className="catalog-entry-tags">
                       {langBadge && (
                         <span className={langBadge.className}>{langBadge.text}</span>
@@ -619,7 +625,7 @@ export default function CatalogSidebar({
                       )}
                     </span>
                   </span>
-                  <small>{trace.subtitle}</small>
+                  <small>{displayTrace.subtitle}</small>
                 </span>
                 {isSelected ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
               </button>

@@ -2179,3 +2179,173 @@ export const DEEP_STEPS_EXECUTION: Record<string, DeepStepEnrichment> = {
     },
   },
 };
+
+export const DEEP_STEPS_EXECUTION_JVM: Record<string, DeepStepEnrichment> = {
+  // =========================================================================
+  // 1a. End-to-End Shuffle & Parquet Write -- Scala (flow-shuffle-aggregation:scala)
+  // =========================================================================
+  'flow-shuffle-aggregation:scala': {
+    traceId: 'flow-shuffle-aggregation',
+    extraInstances: DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].extraInstances,
+    expansions: {
+      0: {
+        steps: [
+          {
+            id: 'flow-shuffle-aggregation:step-0a',
+            parentId: 'flow-shuffle-aggregation:step-0',
+            title: 'Scala OrdersJob invokes DataFrameWriter.parquet() in-JVM',
+            explanation:
+              'OrdersJob calls orders.where("status = \'PAID\'").groupBy("region").count().write.mode("overwrite").parquet("hdfs:///out/by_region") directly on SparkSession inside the Driver JVM with zero Py4J loopback serialization, triggering eager DataFrameWriter execution.',
+            category: 'sql-planning-aqe',
+            keyState: 'Direct in-JVM DataFrameWriter.save() entered on SparkSession',
+            command:
+              'orders.where("status = \'PAID\'").groupBy("region").count().write.mode("overwrite").parquet("hdfs:///out/by_region")',
+            deepDiveComponentId: 'jvm-user-app',
+            detailsPassed: [
+              { name: 'entryPoint', value: 'DataFrameWriter.parquet("hdfs:///out/by_region")' },
+              { name: 'invocation', value: 'Direct in-JVM Scala call on driver-1 (zero Py4J loopback)' },
+              { name: 'saveMode', value: 'Overwrite (InsertIntoHadoopFsRelationCommand)' },
+            ],
+          },
+          ...DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].expansions[0].steps.slice(1),
+        ],
+        events: [
+          {
+            id: 'fsa-jvm-0a-1',
+            stepId: 'flow-shuffle-aggregation:step-0a',
+            kind: 'local',
+            fromInstance: 'jvm-user-app',
+            toInstance: 'spark-session',
+            fromComponent: 'jvm-user-app',
+            toComponent: 'spark-session',
+            channel: 'internal',
+            protocol: 'In-JVM Scala DataFrameWriter',
+            port: 'driver-1 in-JVM',
+            label: 'write.parquet() in-JVM',
+            info: 'Scala OrdersJob invokes write.mode("overwrite").parquet("hdfs:///out/by_region") directly on SparkSession inside the Driver JVM (zero Py4J loopback), triggering eager logical-to-physical query execution.',
+            size: 'in-memory',
+            command:
+              'orders.where("status = \'PAID\'").groupBy("region").count().write.mode("overwrite").parquet("hdfs:///out/by_region")',
+            fields: [
+              { name: 'entryPoint', value: 'DataFrameWriter.save("hdfs:///out/by_region")' },
+              { name: 'saveMode', value: 'Overwrite' },
+              { name: 'commandNode', value: 'InsertIntoHadoopFsRelationCommand' },
+            ],
+            senderState: 'Driver thread blocked on synchronous write.mode("overwrite").parquet() action',
+            receiverState: 'Handing logical plan to Catalyst sql-planner',
+          },
+          ...DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].expansions[0].events
+            .slice(2)
+            .map((ev) =>
+              ev.id === 'fsa-d-0b-1'
+                ? {
+                    ...ev,
+                    senderState:
+                      'Created QueryExecution for write.mode("overwrite").parquet("hdfs:///out/by_region")',
+                  }
+                : ev,
+            ),
+        ],
+      },
+      3: DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].expansions[3],
+      5: DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].expansions[5],
+      7: {
+        steps: DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].expansions[7].steps,
+        events: DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].expansions[7].events.map(
+          (ev) =>
+            ev.id === 'fsa-d-7d-1'
+              ? {
+                  ...ev,
+                  senderState:
+                    'Job committed on driver-1; write.mode("overwrite").parquet() returns to OrdersJob',
+                }
+              : ev,
+        ),
+      },
+    },
+  },
+
+  // =========================================================================
+  // 1b. End-to-End Shuffle & Parquet Write -- Java (flow-shuffle-aggregation:java)
+  // =========================================================================
+  'flow-shuffle-aggregation:java': {
+    traceId: 'flow-shuffle-aggregation',
+    extraInstances: DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].extraInstances,
+    expansions: {
+      0: {
+        steps: [
+          {
+            id: 'flow-shuffle-aggregation:step-0a',
+            parentId: 'flow-shuffle-aggregation:step-0',
+            title: 'Java OrdersJavaJob invokes DataFrameWriter.parquet() in-JVM',
+            explanation:
+              'OrdersJavaJob calls orders.where("status = \'PAID\'").groupBy("region").count().write().mode("overwrite").parquet("hdfs:///out/by_region") directly on SparkSession inside the Driver JVM with zero Py4J loopback serialization, triggering eager DataFrameWriter execution.',
+            category: 'sql-planning-aqe',
+            keyState: 'Direct in-JVM DataFrameWriter.save() entered on SparkSession',
+            command:
+              'orders.where("status = \'PAID\'").groupBy("region").count().write().mode("overwrite").parquet("hdfs:///out/by_region")',
+            deepDiveComponentId: 'jvm-user-app',
+            detailsPassed: [
+              { name: 'entryPoint', value: 'DataFrameWriter.parquet("hdfs:///out/by_region")' },
+              { name: 'invocation', value: 'Direct in-JVM Java call on driver-1 (zero Py4J loopback)' },
+              { name: 'saveMode', value: 'Overwrite (InsertIntoHadoopFsRelationCommand)' },
+            ],
+          },
+          ...DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].expansions[0].steps.slice(1),
+        ],
+        events: [
+          {
+            id: 'fsa-jvm-0a-1',
+            stepId: 'flow-shuffle-aggregation:step-0a',
+            kind: 'local',
+            fromInstance: 'jvm-user-app',
+            toInstance: 'spark-session',
+            fromComponent: 'jvm-user-app',
+            toComponent: 'spark-session',
+            channel: 'internal',
+            protocol: 'In-JVM Java DataFrameWriter',
+            port: 'driver-1 in-JVM',
+            label: 'write().parquet() in-JVM',
+            info: 'Java OrdersJavaJob invokes write().mode("overwrite").parquet("hdfs:///out/by_region") directly on SparkSession inside the Driver JVM (zero Py4J loopback), triggering eager logical-to-physical query execution.',
+            size: 'in-memory',
+            command:
+              'orders.where("status = \'PAID\'").groupBy("region").count().write().mode("overwrite").parquet("hdfs:///out/by_region")',
+            fields: [
+              { name: 'entryPoint', value: 'DataFrameWriter.save("hdfs:///out/by_region")' },
+              { name: 'saveMode', value: 'Overwrite' },
+              { name: 'commandNode', value: 'InsertIntoHadoopFsRelationCommand' },
+            ],
+            senderState: 'Driver thread blocked on synchronous write().mode("overwrite").parquet() action',
+            receiverState: 'Handing logical plan to Catalyst sql-planner',
+          },
+          ...DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].expansions[0].events
+            .slice(2)
+            .map((ev) =>
+              ev.id === 'fsa-d-0b-1'
+                ? {
+                    ...ev,
+                    senderState:
+                      'Created QueryExecution for write().mode("overwrite").parquet("hdfs:///out/by_region")',
+                  }
+                : ev,
+            ),
+        ],
+      },
+      3: DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].expansions[3],
+      5: DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].expansions[5],
+      7: {
+        steps: DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].expansions[7].steps,
+        events: DEEP_STEPS_EXECUTION['flow-shuffle-aggregation'].expansions[7].events.map(
+          (ev) =>
+            ev.id === 'fsa-d-7d-1'
+              ? {
+                  ...ev,
+                  senderState:
+                    'Job committed on driver-1; write().mode("overwrite").parquet() returns to OrdersJavaJob',
+                }
+              : ev,
+        ),
+      },
+    },
+  },
+};

@@ -324,7 +324,7 @@ test('3. invalid lang=ruby falls back to trace primary language (never breaks JV
       COMPONENT_TRACE_BY_ID,
     ),
   );
-  assert.equal(badScalaFlow.traceId, 'flow-scala-cluster-lifecycle');
+  assert.equal(badScalaFlow.traceId, 'flow-cluster-lifecycle');
   assert.equal(badScalaFlow.language, 'scala');
 
   const badJavaFlow = expectTraceRoute(
@@ -335,7 +335,7 @@ test('3. invalid lang=ruby falls back to trace primary language (never breaks JV
       COMPONENT_TRACE_BY_ID,
     ),
   );
-  assert.equal(badJavaFlow.traceId, 'flow-java-cluster-lifecycle');
+  assert.equal(badJavaFlow.traceId, 'flow-cluster-lifecycle');
   assert.equal(badJavaFlow.view, 'sequence');
   assert.equal(badJavaFlow.language, 'java');
 
@@ -650,15 +650,15 @@ test('8. getEffectiveTraceLanguages resolves trace and component languages unifo
   const compJvmUserApp = TRACE_BY_ID['comp-jvm-user-app'];
   const compDatasetEncoderUdf = TRACE_BY_ID['comp-dataset-encoder-udf'];
   const scenario21 = TRACE_BY_ID['scenario-21'];
-  const flowScalaLifecycle = TRACE_BY_ID['flow-scala-cluster-lifecycle'];
-  const flowJavaLifecycle = TRACE_BY_ID['flow-java-cluster-lifecycle'];
+  const flowClusterLifecycle = TRACE_BY_ID['flow-cluster-lifecycle'];
+  const flowUdfBoundary = TRACE_BY_ID['flow-python-udf-boundary'];
 
   assert.ok(compPythonDriver);
   assert.ok(compJvmUserApp);
   assert.ok(compDatasetEncoderUdf);
   assert.ok(scenario21);
-  assert.ok(flowScalaLifecycle);
-  assert.ok(flowJavaLifecycle);
+  assert.ok(flowClusterLifecycle);
+  assert.ok(flowUdfBoundary);
 
   assert.deepEqual(getEffectiveTraceLanguages(compPythonDriver), ['pyspark']);
   assert.deepEqual(getEffectiveTraceLanguages(compJvmUserApp), ['scala', 'java']);
@@ -668,8 +668,16 @@ test('8. getEffectiveTraceLanguages resolves trace and component languages unifo
     'java',
   ]);
   assert.deepEqual(getEffectiveTraceLanguages(scenario21), ['scala', 'java']);
-  assert.deepEqual(getEffectiveTraceLanguages(flowScalaLifecycle), ['scala']);
-  assert.deepEqual(getEffectiveTraceLanguages(flowJavaLifecycle), ['java']);
+  assert.deepEqual(getEffectiveTraceLanguages(flowClusterLifecycle), [
+    'pyspark',
+    'scala',
+    'java',
+  ]);
+  assert.deepEqual(getEffectiveTraceLanguages(flowUdfBoundary), [
+    'pyspark',
+    'scala',
+    'java',
+  ]);
 
   // Fallback when neither trace.languages nor component.languages is specified
   assert.deepEqual(getEffectiveTraceLanguages(makeMockTrace({ id: 'generic' })), [
@@ -681,22 +689,109 @@ test('8. getEffectiveTraceLanguages resolves trace and component languages unifo
   assert.equal(inferTracePrimaryLanguage(compPythonDriver), 'pyspark');
   assert.equal(inferTracePrimaryLanguage(compJvmUserApp), 'scala');
   assert.equal(inferTracePrimaryLanguage(scenario21), 'scala');
-  assert.equal(inferTracePrimaryLanguage(flowScalaLifecycle), 'scala');
-  assert.equal(inferTracePrimaryLanguage(flowJavaLifecycle), 'java');
+  assert.equal(inferTracePrimaryLanguage(flowClusterLifecycle), 'pyspark');
+  assert.equal(inferTracePrimaryLanguage(flowUdfBoundary), 'pyspark');
 });
 
-test('9. lossless encodeCatalogHash -> parseUrlHash on language-restricted traces', () => {
+test('8b. legacy lifecycle flow aliases resolve cleanly to unified trace IDs + expected language', () => {
+  assert.deepEqual(
+    parseUrlHash(
+      '#flow=flow-scala-cluster-lifecycle',
+      ALL_TRACES,
+      TRACE_BY_ID,
+      COMPONENT_TRACE_BY_ID,
+    ),
+    {
+      kind: 'trace',
+      traceId: 'flow-cluster-lifecycle',
+      view: 'topology',
+      language: 'scala',
+    },
+  );
+  assert.deepEqual(
+    parseUrlHash(
+      '#flow=flow-java-cluster-lifecycle',
+      ALL_TRACES,
+      TRACE_BY_ID,
+      COMPONENT_TRACE_BY_ID,
+    ),
+    {
+      kind: 'trace',
+      traceId: 'flow-cluster-lifecycle',
+      view: 'topology',
+      language: 'java',
+    },
+  );
+  assert.deepEqual(
+    parseUrlHash(
+      '#flow=flow-java-cluster-lifecycle&view=sequence',
+      ALL_TRACES,
+      TRACE_BY_ID,
+      COMPONENT_TRACE_BY_ID,
+    ),
+    {
+      kind: 'trace',
+      traceId: 'flow-cluster-lifecycle',
+      view: 'sequence',
+      language: 'java',
+    },
+  );
+  assert.deepEqual(
+    parseUrlHash(
+      '#flow=flow-jvm-udf-encoder-boundary',
+      ALL_TRACES,
+      TRACE_BY_ID,
+      COMPONENT_TRACE_BY_ID,
+    ),
+    {
+      kind: 'trace',
+      traceId: 'flow-python-udf-boundary',
+      view: 'topology',
+      language: 'scala',
+    },
+  );
+  assert.deepEqual(
+    parseUrlHash(
+      '#flow=flow-jvm-udf-encoder-boundary&lang=java&view=cluster',
+      ALL_TRACES,
+      TRACE_BY_ID,
+      COMPONENT_TRACE_BY_ID,
+    ),
+    {
+      kind: 'trace',
+      traceId: 'flow-python-udf-boundary',
+      view: 'cluster',
+      language: 'java',
+    },
+  );
+  assert.deepEqual(
+    parseUrlHash(
+      '#flow=flow-scala-cluster-lifecycle&lang=java',
+      ALL_TRACES,
+      TRACE_BY_ID,
+      COMPONENT_TRACE_BY_ID,
+    ),
+    {
+      kind: 'trace',
+      traceId: 'flow-cluster-lifecycle',
+      view: 'topology',
+      language: 'java',
+    },
+  );
+});
+
+test('9. lossless encodeCatalogHash -> parseUrlHash on language-restricted & unified traces', () => {
   const scenario21 = TRACE_BY_ID['scenario-21'];
   const compPythonDriver = TRACE_BY_ID['comp-python-driver'];
   const compJvmUserApp = TRACE_BY_ID['comp-jvm-user-app'];
-  const flowScalaLifecycle = TRACE_BY_ID['flow-scala-cluster-lifecycle'];
-  const flowJavaLifecycle = TRACE_BY_ID['flow-java-cluster-lifecycle'];
+  const flowClusterLifecycle = TRACE_BY_ID['flow-cluster-lifecycle'];
+  const flowUdfBoundary = TRACE_BY_ID['flow-python-udf-boundary'];
 
   assert.ok(scenario21);
   assert.ok(compPythonDriver);
   assert.ok(compJvmUserApp);
-  assert.ok(flowScalaLifecycle);
-  assert.ok(flowJavaLifecycle);
+  assert.ok(flowClusterLifecycle);
+  assert.ok(flowUdfBoundary);
 
   // Explicit exact hash shapes
   assert.equal(
@@ -720,18 +815,28 @@ test('9. lossless encodeCatalogHash -> parseUrlHash on language-restricted trace
     '#component=jvm-user-app&lang=pyspark',
   );
   assert.equal(
-    encodeCatalogHash(flowScalaLifecycle, 'topology', 'scala'),
-    '#flow=flow-scala-cluster-lifecycle&lang=scala',
+    encodeCatalogHash(flowClusterLifecycle, 'topology', 'scala'),
+    '#flow=flow-cluster-lifecycle&lang=scala',
   );
   assert.equal(
-    encodeCatalogHash(flowJavaLifecycle, 'cluster', 'java'),
-    '#flow=flow-java-cluster-lifecycle&lang=java&view=cluster',
+    encodeCatalogHash(flowClusterLifecycle, 'cluster', 'java'),
+    '#flow=flow-cluster-lifecycle&lang=java&view=cluster',
+  );
+  assert.equal(
+    encodeCatalogHash(flowUdfBoundary, 'sequence', 'java'),
+    '#flow=flow-python-udf-boundary&lang=java&view=sequence',
   );
 
-  // Lossless round-trip across ALL 3 languages and ALL 3 views on non-variant restricted traces
+  // Lossless round-trip across ALL 3 languages and ALL 3 views
   const languages: SparkLanguage[] = ['pyspark', 'scala', 'java'];
   const views: CanvasView[] = ['topology', 'cluster', 'sequence'];
-  for (const trace of [scenario21, compPythonDriver, compJvmUserApp]) {
+  for (const trace of [
+    scenario21,
+    compPythonDriver,
+    compJvmUserApp,
+    flowClusterLifecycle,
+    flowUdfBoundary,
+  ]) {
     for (const lang of languages) {
       for (const view of views) {
         const hash = encodeCatalogHash(trace, view, lang);
@@ -750,38 +855,6 @@ test('9. lossless encodeCatalogHash -> parseUrlHash on language-restricted trace
       }
     }
   }
-
-  // Round-trip on variant-group JVM lifecycle traces in their native languages
-  for (const view of views) {
-    assert.deepEqual(
-      parseUrlHash(
-        encodeCatalogHash(flowScalaLifecycle, view, 'scala'),
-        ALL_TRACES,
-        TRACE_BY_ID,
-        COMPONENT_TRACE_BY_ID,
-      ),
-      {
-        kind: 'trace',
-        traceId: 'flow-scala-cluster-lifecycle',
-        view,
-        language: 'scala',
-      },
-    );
-    assert.deepEqual(
-      parseUrlHash(
-        encodeCatalogHash(flowJavaLifecycle, view, 'java'),
-        ALL_TRACES,
-        TRACE_BY_ID,
-        COMPONENT_TRACE_BY_ID,
-      ),
-      {
-        kind: 'trace',
-        traceId: 'flow-java-cluster-lifecycle',
-        view,
-        language: 'java',
-      },
-    );
-  }
 });
 
 test('10. resolveLanguageAfterTraceSelect reconciles explicit lesson clicks', () => {
@@ -789,13 +862,13 @@ test('10. resolveLanguageAfterTraceSelect reconciles explicit lesson clicks', ()
   const compSparkContext = TRACE_BY_ID['comp-spark-context'];
   const compJvmUserApp = TRACE_BY_ID['comp-jvm-user-app'];
   const scenario21 = TRACE_BY_ID['scenario-21'];
-  const flowJavaLifecycle = TRACE_BY_ID['flow-java-cluster-lifecycle'];
+  const flowClusterLifecycle = TRACE_BY_ID['flow-cluster-lifecycle'];
 
   assert.ok(compPythonDriver);
   assert.ok(compSparkContext);
   assert.ok(compJvmUserApp);
   assert.ok(scenario21);
-  assert.ok(flowJavaLifecycle);
+  assert.ok(flowClusterLifecycle);
 
   // Clicking Python Driver while in Java switches to PySpark (and omits lang in URL)
   const pyAfterJava = resolveLanguageAfterTraceSelect(compPythonDriver, 'java');
@@ -817,29 +890,31 @@ test('10. resolveLanguageAfterTraceSelect reconciles explicit lesson clicks', ()
   assert.equal(resolveLanguageAfterTraceSelect(scenario21, 'pyspark'), 'scala');
   assert.equal(resolveLanguageAfterTraceSelect(scenario21, 'java'), 'java');
 
-  // Clicking Java lifecycle from Scala switches to Java
-  assert.equal(resolveLanguageAfterTraceSelect(flowJavaLifecycle, 'scala'), 'java');
+  // Unified lifecycle flow preserves active language (PySpark, Scala, or Java)
+  assert.equal(resolveLanguageAfterTraceSelect(flowClusterLifecycle, 'pyspark'), 'pyspark');
+  assert.equal(resolveLanguageAfterTraceSelect(flowClusterLifecycle, 'scala'), 'scala');
+  assert.equal(resolveLanguageAfterTraceSelect(flowClusterLifecycle, 'java'), 'java');
 });
 
-test('11. resolveExitSimulationTarget resolves variant and language cleanly', () => {
-  // PySpark lifecycle -> Simulation -> switch topbar to Java -> Back to Catalog
+test('11. resolveExitSimulationTarget resolves unified flow and language cleanly', () => {
+  // Unified lifecycle flows keep their stable traceId while adapting activeLanguage in place
   assert.deepEqual(
     resolveExitSimulationTarget('flow-cluster-lifecycle', 'java', ALL_TRACES),
-    { traceId: 'flow-java-cluster-lifecycle', language: 'java' },
+    { traceId: 'flow-cluster-lifecycle', language: 'java' },
   );
   assert.deepEqual(
     resolveExitSimulationTarget('flow-cluster-lifecycle', 'scala', ALL_TRACES),
-    { traceId: 'flow-scala-cluster-lifecycle', language: 'scala' },
+    { traceId: 'flow-cluster-lifecycle', language: 'scala' },
   );
   assert.deepEqual(
-    resolveExitSimulationTarget('flow-java-cluster-lifecycle', 'pyspark', ALL_TRACES),
+    resolveExitSimulationTarget('flow-cluster-lifecycle', 'pyspark', ALL_TRACES),
     { traceId: 'flow-cluster-lifecycle', language: 'pyspark' },
   );
 
-  // UDF boundary variant group
+  // Unified UDF boundary keeps stable traceId
   assert.deepEqual(
     resolveExitSimulationTarget('flow-python-udf-boundary', 'java', ALL_TRACES),
-    { traceId: 'flow-jvm-udf-encoder-boundary', language: 'java' },
+    { traceId: 'flow-python-udf-boundary', language: 'java' },
   );
 
   // Shared component preserves activeLanguage
@@ -1101,7 +1176,7 @@ test('15. resolveInitialCatalogTraceId restores history.state.catalogTraceId on 
   assert.equal(restored, 'flow-python-udf-boundary');
   assert.deepEqual(
     resolveExitSimulationTarget(restored, javaSimRoute.language, ALL_TRACES),
-    { traceId: 'flow-jvm-udf-encoder-boundary', language: 'java' },
+    { traceId: 'flow-python-udf-boundary', language: 'java' },
   );
 
   assert.equal(

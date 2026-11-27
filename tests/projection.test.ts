@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { COMPONENTS } from '../src/data/components.ts';
-import { DEEP_STEP_ENRICHMENTS } from '../src/data/deepSteps.ts';
+import {
+  DEEP_STEP_ENRICHMENTS,
+  DEEP_STEP_ENRICHMENTS_BY_LANG,
+  resolveDeepStepEnrichment,
+} from '../src/data/deepSteps.ts';
 import {
   ALL_STEP_CATEGORIES,
   CATEGORY_PRESETS,
@@ -16,6 +20,7 @@ import {
   type StepCategory,
 } from '../src/data/runModel.ts';
 import { ALL_TRACES, SCENARIO_TRACES } from '../src/data/traces.ts';
+import type { ComponentId, SparkLanguage } from '../src/data/types.ts';
 import { adaptTraceToRun, isLocalPort } from '../src/engine/adaptTrace.ts';
 import {
   isDriverRuntimeInstance,
@@ -33,10 +38,12 @@ import {
   getExpandableStepIds,
   getStepAncestors,
   projectRun,
+  reconcileSameTraceLanguageTransition,
   resolveEventAfterProjectionChange,
   resolveEventAfterToggleExpand,
   stepJumpEventId,
 } from '../src/engine/projection.ts';
+import { getEffectiveTraceLanguages } from '../src/engine/urlRoute.ts';
 
 /**
  * Phase 1 Contract Gate Fixture (requested by GPT-6.2 Astra Phase 0 review):
@@ -826,7 +833,7 @@ test('all enriched catalog traces adapt cleanly with valid trees, instances, and
   }
 });
 
-test('local port normalization classifies all qualified in-JVM/OS/local-dir events as local across all 109 traces and 9 enriched runs', () => {
+test('local port normalization classifies all qualified in-JVM/OS/local-dir events as local across all 106 traces and language-keyed enriched runs', () => {
   // Direct unit checks for qualified local ports vs real network/socket endpoints
   for (const localPort of [
     'in-JVM',
@@ -855,8 +862,9 @@ test('local port normalization classifies all qualified in-JVM/OS/local-dir even
     assert.equal(isLocalPort(wirePort), false, `Expected ${JSON.stringify(wirePort)} to stay wire`);
   }
 
-  assert.equal(ALL_TRACES.length, 109);
-  assert.equal(Object.keys(DEEP_STEP_ENRICHMENTS).length, 9);
+  assert.equal(ALL_TRACES.length, 106);
+  assert.equal(Object.keys(DEEP_STEP_ENRICHMENTS).length, 7);
+  assert.equal(Object.keys(DEEP_STEP_ENRICHMENTS_BY_LANG).length, 5);
 
   // Expanding Scala & Java cluster lifecycles must NEVER restore Python/Py4J components
   const pythonComps = new Set([
@@ -867,15 +875,16 @@ test('local port normalization classifies all qualified in-JVM/OS/local-dir even
     'python-worker',
     'python-runner',
   ]);
-  for (const jvmFlowId of ['flow-scala-cluster-lifecycle', 'flow-java-cluster-lifecycle']) {
-    const jvmRun = adaptTraceToRun(ALL_TRACES.find(t => t.id === jvmFlowId)!);
+  const clusterTrace = ALL_TRACES.find(t => t.id === 'flow-cluster-lifecycle')!;
+  for (const lang of ['scala', 'java'] as const) {
+    const jvmRun = adaptTraceToRun(clusterTrace, lang);
     const jvmExp = projectRun(jvmRun, new Set(getExpandableStepIds(jvmRun)), ALL_STEP_CATEGORIES);
-    assert.ok(jvmExp.visibleFrames.length > 20, `${jvmFlowId}: expected expanded frames`);
+    assert.ok(jvmExp.visibleFrames.length > 20, `flow-cluster-lifecycle (${lang}): expected expanded frames`);
     for (const frame of jvmExp.visibleFrames) {
       assert.equal(
         pythonComps.has(frame.event.fromComponent) || pythonComps.has(frame.event.toComponent),
         false,
-        `${jvmFlowId}/${frame.event.id}: pure JVM flow must never emit Python/Py4J event`,
+        `flow-cluster-lifecycle (${lang})/${frame.event.id}: pure JVM flow must never emit Python/Py4J event`,
       );
     }
   }
@@ -1682,8 +1691,8 @@ test('computeHiddenCategoriesForStep is depth-aware and excludes collapsed grand
   );
 });
 
-test('all 109 curated traces enforce same-hostZone invariant for local/in-JVM/loopback hops and validate observability + scenario-03 + locality fixes', () => {
-  assert.equal(ALL_TRACES.length, 109);
+test('all 106 curated traces enforce same-hostZone invariant for local/in-JVM/loopback hops and validate observability + scenario-03 + locality fixes', () => {
+  assert.equal(ALL_TRACES.length, 106);
 
   const violations: string[] = [];
   const checkEvent = (traceId: string, mode: string, run: ExecutionRun, ev: RunEvent) => {
@@ -2120,5 +2129,356 @@ test('process-level locality invariant rejects cross-process in-JVM hops and res
   assert.equal(clientDiscoveryRun.instances[fcdSessionToSc.fromInstance]?.hostZone, 'submit-host');
   assert.equal(isDriverRuntimeInstance(clientDiscoveryRun.instances[fcdSessionToSc.fromInstance]), true);
   assert.equal(isDriverRuntimeInstance(clientDiscoveryRun.instances[fcdSessionToSc.toInstance]), true);
+});
+
+test('Golden multi-language invariant: ALL 106 Scala & Java curated traces (collapsed & expanded) emit ZERO Python/Py4J components or orders.py/worker.py/PyDriver/PythonRunner references', () => {
+  assert.equal(ALL_TRACES.length, 106);
+
+  const PYTHON_ONLY_COMPONENTS = new Set<ComponentId>([
+    'python-driver',
+    'py4j-gateway',
+    'python-udf-operator',
+    'python-worker-factory',
+    'python-worker',
+    'python-runner',
+  ]);
+  const CONTRAST_NOTE_TRACES = new Set<string>([
+    'comp-jvm-user-app',
+  ]);
+  const STRICT_PYTHON_REF = /PyDriver|PythonRunner|orders\.py|worker\.py/i;
+  const EXTENDED_PYTHON_REF = /PyDriver|Python\s+Driver|PythonRunner|orders\.py|worker\.py/i;
+
+  const violations: string[] = [];
+
+  const checkEventInMode = (
+    lang: SparkLanguage,
+    traceId: string,
+    mode: 'raw' | 'collapsed' | 'expanded',
+    isContrastTrace: boolean,
+    run: ExecutionRun,
+    ev: RunEvent,
+  ) => {
+    if (
+      PYTHON_ONLY_COMPONENTS.has(ev.fromComponent) ||
+      PYTHON_ONLY_COMPONENTS.has(ev.toComponent)
+    ) {
+      violations.push(
+        `${lang}/${traceId}/${mode}/${ev.id}: Python-only endpoint ${ev.fromComponent} -> ${ev.toComponent}`,
+      );
+    }
+    if (STRICT_PYTHON_REF.test(ev.label)) {
+      violations.push(
+        `${lang}/${traceId}/${mode}/${ev.id}: forbidden token in event.label="${ev.label}"`,
+      );
+    }
+    if (ev.command && STRICT_PYTHON_REF.test(ev.command)) {
+      violations.push(
+        `${lang}/${traceId}/${mode}/${ev.id}: forbidden token in event.command="${ev.command}"`,
+      );
+    }
+    if (!isContrastTrace) {
+      if (EXTENDED_PYTHON_REF.test(ev.label)) {
+        violations.push(
+          `${lang}/${traceId}/${mode}/${ev.id}: Python Driver text in event.label="${ev.label}"`,
+        );
+      }
+      if (ev.command && EXTENDED_PYTHON_REF.test(ev.command)) {
+        violations.push(
+          `${lang}/${traceId}/${mode}/${ev.id}: Python Driver text in event.command="${ev.command}"`,
+        );
+      }
+      if (ev.senderState && EXTENDED_PYTHON_REF.test(ev.senderState)) {
+        violations.push(
+          `${lang}/${traceId}/${mode}/${ev.id}: forbidden token in event.senderState="${ev.senderState}"`,
+        );
+      }
+      if (ev.receiverState && EXTENDED_PYTHON_REF.test(ev.receiverState)) {
+        violations.push(
+          `${lang}/${traceId}/${mode}/${ev.id}: forbidden token in event.receiverState="${ev.receiverState}"`,
+        );
+      }
+    }
+
+    const localityErr = validateEventLocality(ev, run.instances);
+    if (localityErr) {
+      violations.push(`${lang}/${traceId}/${mode}/${ev.id}: locality ${localityErr}`);
+    }
+    const fromInst = run.instances[ev.fromInstance];
+    const toInst = run.instances[ev.toInstance];
+    if (fromInst && toInst && fromInst.hostZone === toInst.hostZone) {
+      const resolved = resolveMapRouteEndpoints(ev, run.instances);
+      if (COMPONENTS[resolved.from].hostZone !== COMPONENTS[resolved.to].hostZone) {
+        violations.push(
+          `${lang}/${traceId}/${mode}/${ev.id}: same-host event mapped across hostZones (${resolved.from} -> ${resolved.to})`,
+        );
+      }
+    }
+  };
+
+  for (const lang of ['scala', 'java'] as const satisfies readonly SparkLanguage[]) {
+    for (const trace of ALL_TRACES) {
+      if (!getEffectiveTraceLanguages(trace).includes(lang)) continue;
+      const run = adaptTraceToRun(trace, lang);
+      const isContrastTrace = CONTRAST_NOTE_TRACES.has(trace.id);
+
+      for (const inst of Object.values(run.instances)) {
+        if (PYTHON_ONLY_COMPONENTS.has(inst.componentId)) {
+          violations.push(
+            `${lang}/${trace.id}/instance/${inst.id}: Python-only componentId=${inst.componentId}`,
+          );
+        }
+        if (STRICT_PYTHON_REF.test(inst.shortLabel) || STRICT_PYTHON_REF.test(inst.label)) {
+          violations.push(
+            `${lang}/${trace.id}/instance/${inst.id}: forbidden token in label="${inst.label}" shortLabel="${inst.shortLabel}"`,
+          );
+        }
+        if (
+          !isContrastTrace &&
+          (EXTENDED_PYTHON_REF.test(inst.shortLabel) || EXTENDED_PYTHON_REF.test(inst.label))
+        ) {
+          violations.push(
+            `${lang}/${trace.id}/instance/${inst.id}: Python Driver text in label="${inst.label}" shortLabel="${inst.shortLabel}"`,
+          );
+        }
+      }
+
+      for (const ev of run.events) {
+        checkEventInMode(lang, trace.id, 'raw', isContrastTrace, run, ev);
+      }
+
+      const collapsed = projectRun(run, new Set(), ALL_STEP_CATEGORIES);
+      for (const frame of collapsed.visibleFrames) {
+        checkEventInMode(lang, trace.id, 'collapsed', isContrastTrace, run, frame.event);
+      }
+
+      const expandableIds = getExpandableStepIds(run);
+      const expanded = projectRun(run, new Set(expandableIds), ALL_STEP_CATEGORIES);
+      assert.deepEqual(
+        expanded.emptyExpandedStepIds,
+        [],
+        `${lang}/${trace.id}: unexpected emptyExpandedStepIds`,
+      );
+      for (const frame of expanded.visibleFrames) {
+        checkEventInMode(lang, trace.id, 'expanded', isContrastTrace, run, frame.event);
+      }
+    }
+  }
+
+  assert.deepEqual(
+    violations,
+    [],
+    `Scala/Java multi-language invariant violations:\n${violations.join('\n')}`,
+  );
+
+  // Explicit verification 1: flow-cluster-lifecycle (PySpark vs Scala vs Java, collapsed + expanded)
+  const clusterTrace = ALL_TRACES.find(t => t.id === 'flow-cluster-lifecycle')!;
+  const pyCluster = adaptTraceToRun(clusterTrace, 'pyspark');
+  const scalaCluster = adaptTraceToRun(clusterTrace, 'scala');
+  const javaCluster = adaptTraceToRun(clusterTrace, 'java');
+  assert.equal(pyCluster.id, 'flow-cluster-lifecycle');
+  assert.equal(scalaCluster.id, 'flow-cluster-lifecycle');
+  assert.equal(javaCluster.id, 'flow-cluster-lifecycle');
+  assert.equal(scalaCluster.name, 'Full Cluster-Mode Batch Lifecycle (Scala)');
+  assert.equal(javaCluster.name, 'Full Cluster-Mode Batch Lifecycle (Java)');
+  assert.ok(pyCluster.instances['python-driver'] && pyCluster.instances['py4j-gateway']);
+  assert.ok(scalaCluster.instances['jvm-user-app'] && !scalaCluster.instances['python-driver']);
+  assert.ok(javaCluster.instances['jvm-user-app'] && !javaCluster.instances['python-driver']);
+  const pyClusterExp = projectRun(pyCluster, new Set(getExpandableStepIds(pyCluster)), ALL_STEP_CATEGORIES);
+  const scalaClusterExp = projectRun(scalaCluster, new Set(getExpandableStepIds(scalaCluster)), ALL_STEP_CATEGORIES);
+  const javaClusterExp = projectRun(javaCluster, new Set(getExpandableStepIds(javaCluster)), ALL_STEP_CATEGORIES);
+  assert.ok(pyClusterExp.visibleFrames.length > pyCluster.events.length - 30);
+  assert.ok(getExpandableStepIds(scalaCluster).length === 4);
+  assert.ok(getExpandableStepIds(javaCluster).length === 4);
+  assert.ok(scalaClusterExp.visibleFrames.some(f => f.event.id === 'fscl-2-2a'));
+  assert.ok(javaClusterExp.visibleFrames.some(f => f.event.id === 'fjcl-3-2a'));
+
+  // Explicit verification 2: flow-client-discovery (PySpark vs Scala/Java, collapsed + expanded)
+  const clientTrace = ALL_TRACES.find(t => t.id === 'flow-client-discovery')!;
+  const pyClient = adaptTraceToRun(clientTrace, 'pyspark');
+  assert.ok(pyClient.instances['python-driver'] && pyClient.instances['py4j-gateway']);
+  for (const lang of ['scala', 'java'] as const) {
+    const jvmClient = adaptTraceToRun(clientTrace, lang);
+    assert.equal(jvmClient.id, 'flow-client-discovery');
+    assert.equal(jvmClient.deployMode, 'client');
+    assert.equal(jvmClient.instances['jvm-user-app']?.hostZone, 'submit-host');
+    assert.equal(jvmClient.instances['am-nm']?.hostZone, 'driver-jvm');
+    assert.match(jvmClient.instances['am-nm']?.hostLabel ?? '', /worker-a/);
+    assert.match(jvmClient.instances['application-master']?.hostLabel ?? '', /worker-a/);
+    assert.match(jvmClient.instances['yarn-allocator']?.hostLabel ?? '', /worker-a/);
+    assert.equal(jvmClient.instances['python-driver'], undefined);
+    assert.equal(jvmClient.instances['py4j-gateway'], undefined);
+    const jvmClientExpandable = getExpandableStepIds(jvmClient);
+    assert.deepEqual(jvmClientExpandable, [
+      'flow-client-discovery:step-0',
+      'flow-client-discovery:step-1',
+      'flow-client-discovery:step-4',
+      'flow-client-discovery:step-5',
+    ]);
+    const jvmClientExp = projectRun(jvmClient, new Set(jvmClientExpandable), ALL_STEP_CATEGORIES);
+    assert.ok(jvmClientExp.visibleFrames.some(f => f.event.id === 'fcd-jvm-0-2a'));
+    assert.ok(jvmClientExp.visibleFrames.some(f => f.event.id === 'fcd-jvm-1-1a'));
+    assert.ok(jvmClientExp.visibleFrames.some(f => f.event.id === 'fcd-5-1c'));
+  }
+
+  // Explicit verification 3: flow-shuffle-aggregation (PySpark vs Scala/Java, collapsed + expanded)
+  const shuffleTrace = ALL_TRACES.find(t => t.id === 'flow-shuffle-aggregation')!;
+  const pyShuffle = adaptTraceToRun(shuffleTrace, 'pyspark');
+  assert.ok(pyShuffle.instances['python-driver'] && pyShuffle.instances['py4j-gateway']);
+  for (const lang of ['scala', 'java'] as const) {
+    const jvmShuffle = adaptTraceToRun(shuffleTrace, lang);
+    assert.equal(jvmShuffle.id, 'flow-shuffle-aggregation');
+    assert.equal(jvmShuffle.deployMode, 'cluster');
+    assert.equal(jvmShuffle.instances['jvm-user-app']?.hostZone, 'driver-jvm');
+    assert.equal(jvmShuffle.instances['python-driver'], undefined);
+    assert.equal(jvmShuffle.instances['py4j-gateway'], undefined);
+    const sa1 = jvmShuffle.events.find(e => e.id === 'flow-shuffle-aggregation:sa-1')!;
+    assert.equal(sa1.fromInstance, 'jvm-user-app');
+    assert.equal(sa1.toInstance, 'spark-session');
+    assert.equal(sa1.kind, 'local');
+    const jvmShuffleExpandable = getExpandableStepIds(jvmShuffle);
+    assert.deepEqual(jvmShuffleExpandable, [
+      'flow-shuffle-aggregation:step-0',
+      'flow-shuffle-aggregation:step-3',
+      'flow-shuffle-aggregation:step-5',
+      'flow-shuffle-aggregation:step-7',
+    ]);
+    const jvmShuffleExp = projectRun(jvmShuffle, new Set(jvmShuffleExpandable), ALL_STEP_CATEGORIES);
+    assert.ok(jvmShuffleExp.visibleFrames.some(f => f.event.id === 'fsa-jvm-0a-1'));
+    assert.ok(jvmShuffleExp.visibleFrames.some(f => f.event.id === 'fsa-d-3b-1'));
+    assert.ok(jvmShuffleExp.visibleFrames.some(f => f.event.id === 'fsa-d-7d-1'));
+  }
+
+  // Explicit verification 4: flow-python-udf-boundary (PySpark vs Scala vs Java)
+  const udfTrace = ALL_TRACES.find(t => t.id === 'flow-python-udf-boundary')!;
+  const pyUdf = adaptTraceToRun(udfTrace, 'pyspark');
+  const scalaUdf = adaptTraceToRun(udfTrace, 'scala');
+  const javaUdf = adaptTraceToRun(udfTrace, 'java');
+  assert.equal(pyUdf.name, 'Python Driver Py4J vs Executor UDF Worker');
+  assert.equal(scalaUdf.id, 'flow-python-udf-boundary');
+  assert.equal(javaUdf.id, 'flow-python-udf-boundary');
+  assert.equal(scalaUdf.name, 'JVM Dataset Encoders vs In-JVM Scala/Java UDF');
+  assert.equal(javaUdf.name, 'JVM Dataset Encoders vs In-JVM Scala/Java UDF');
+  assert.ok(pyUdf.instances['python-worker'] && getExpandableStepIds(pyUdf).length === 3);
+  assert.equal(scalaUdf.instances['python-worker'], undefined);
+  assert.equal(javaUdf.instances['python-worker'], undefined);
+  assert.equal(getExpandableStepIds(scalaUdf).length, 0);
+  assert.equal(getExpandableStepIds(javaUdf).length, 0);
+  assert.equal(resolveDeepStepEnrichment('flow-python-udf-boundary', 'scala'), undefined);
+  assert.equal(resolveDeepStepEnrichment('flow-python-udf-boundary', 'java'), undefined);
+  assert.match(scalaUdf.subtitle, /Encoders\.product\[Order\].*TypeTag null guard/);
+  assert.match(javaUdf.subtitle, /Encoders\.bean -> JavaBeanEncoder.*UDF1<Double, Double>/);
+
+  // Explicit check: comp-spark-submit adapts to JVM User App in Scala and retains orders.py in PySpark
+  const sparkSubmitTrace = ALL_TRACES.find(t => t.id === 'comp-spark-submit')!;
+  assert.ok(sparkSubmitTrace, 'Missing comp-spark-submit trace');
+
+  const scalaSubmitRun = adaptTraceToRun(sparkSubmitTrace, 'scala');
+  const scalaJvmApp = scalaSubmitRun.instances['jvm-user-app'];
+  const scalaClientJvmApp = scalaSubmitRun.instances['client-jvm-user-app'];
+  assert.ok(scalaJvmApp, 'Expected jvm-user-app instance in Scala comp-spark-submit');
+  assert.match(
+    `${scalaJvmApp.label} ${scalaJvmApp.shortLabel}`,
+    /OrdersJob/,
+    'Expected OrdersJob label on Scala comp-spark-submit jvm-user-app',
+  );
+  assert.ok(
+    scalaClientJvmApp,
+    'Expected client-jvm-user-app instance in Scala comp-spark-submit',
+  );
+  assert.equal(
+    Object.values(scalaSubmitRun.instances).some(i => i.componentId === 'python-driver'),
+    false,
+    'Scala comp-spark-submit must emit zero python-driver instances',
+  );
+
+  const pySubmitRun = adaptTraceToRun(sparkSubmitTrace, 'pyspark');
+  assert.ok(
+    Object.values(pySubmitRun.instances).some(i => i.componentId === 'python-driver'),
+    'PySpark comp-spark-submit must retain python-driver',
+  );
+  assert.ok(
+    pySubmitRun.events.some(e =>
+      /orders\.py/i.test(`${e.label} ${e.command ?? ''} ${e.info}`),
+    ),
+    'PySpark comp-spark-submit must retain orders.py references',
+  );
+
+  // Explicit check: PySpark-only scenarios are tagged strictly ['pyspark']
+  const s08 = SCENARIO_TRACES.find(t => t.id === 'scenario-08')!;
+  const s12 = SCENARIO_TRACES.find(t => t.id === 'scenario-12')!;
+  assert.ok(s08 && s12, 'Missing scenario-08 or scenario-12');
+  assert.deepEqual([...getEffectiveTraceLanguages(s08)], ['pyspark']);
+  assert.deepEqual([...getEffectiveTraceLanguages(s12)], ['pyspark']);
+
+  // UI-state reconciliation regression 1: switching flow-python-udf-boundary PySpark -> Scala clears stale python-driver selection
+  const udfPyProj = projectRun(pyUdf, new Set(), ALL_STEP_CATEGORIES);
+  const udfToScala = reconcileSameTraceLanguageTransition({
+    nextRun: scalaUdf,
+    nextLanguage: 'scala',
+    currentExpandedStepIds: new Set(),
+    enabledCategories: ALL_STEP_CATEGORIES,
+    currentEventId: udfPyProj.visibleFrames[0].event.id,
+    currentFrame: udfPyProj.visibleFrames[0],
+    selectedComponentId: 'python-driver',
+    componentLanguages: COMPONENTS['python-driver'].languages,
+  });
+  assert.equal(
+    udfToScala.nextSelectedComponentId,
+    null,
+    'Switching PySpark -> Scala must clear stale python-driver component selection',
+  );
+
+  // UI-state reconciliation regression 2: switching scenario-02 Scala -> Java preserves surviving event scenario-02:s02-2
+  const s02Trace = SCENARIO_TRACES.find(t => t.id === 'scenario-02')!;
+  const s02Scala = adaptTraceToRun(s02Trace, 'scala');
+  const s02Java = adaptTraceToRun(s02Trace, 'java');
+  const s02ScalaProj = projectRun(s02Scala, new Set(), ALL_STEP_CATEGORIES);
+  const s02Ev2Frame = s02ScalaProj.visibleFrames.find(f => f.event.id === 'scenario-02:s02-2')!;
+  assert.ok(s02Ev2Frame, 'Expected scenario-02:s02-2 in Scala run');
+  const s02ToJava = reconcileSameTraceLanguageTransition({
+    nextRun: s02Java,
+    nextLanguage: 'java',
+    currentExpandedStepIds: new Set(),
+    enabledCategories: ALL_STEP_CATEGORIES,
+    currentEventId: 'scenario-02:s02-2',
+    currentFrame: s02Ev2Frame,
+    selectedComponentId: 'application-master',
+    componentLanguages: COMPONENTS['application-master'].languages,
+  });
+  assert.equal(
+    s02ToJava.nextEventId,
+    'scenario-02:s02-2',
+    'Surviving event scenario-02:s02-2 must stay selected across Scala -> Java switch',
+  );
+  assert.equal(
+    s02ToJava.nextSelectedComponentId,
+    'application-master',
+    'Valid shared component selection must be preserved across Scala -> Java switch',
+  );
+
+  // UI-state reconciliation regression 3: expanded flow-cluster-lifecycle step-0 survives Scala -> Java -> Back to Scala
+  const expandedStep0 = new Set(['flow-cluster-lifecycle:step-0']);
+  const scalaStep0Proj = projectRun(scalaCluster, expandedStep0, ALL_STEP_CATEGORIES);
+  const scalaToJavaExp = reconcileSameTraceLanguageTransition({
+    nextRun: javaCluster,
+    nextLanguage: 'java',
+    currentExpandedStepIds: expandedStep0,
+    enabledCategories: ALL_STEP_CATEGORIES,
+    currentEventId: scalaStep0Proj.visibleFrames[0].event.id,
+    currentFrame: scalaStep0Proj.visibleFrames[0],
+    selectedComponentId: null,
+  });
+  assert.deepEqual([...scalaToJavaExp.nextExpandedStepIds], ['flow-cluster-lifecycle:step-0']);
+  const javaBackToScalaExp = reconcileSameTraceLanguageTransition({
+    nextRun: scalaCluster,
+    nextLanguage: 'scala',
+    currentExpandedStepIds: scalaToJavaExp.nextExpandedStepIds,
+    enabledCategories: ALL_STEP_CATEGORIES,
+    currentEventId: scalaToJavaExp.nextEventId,
+    currentFrame: scalaToJavaExp.nextProjection.visibleFrames[0],
+    selectedComponentId: null,
+  });
+  assert.deepEqual([...javaBackToScalaExp.nextExpandedStepIds], ['flow-cluster-lifecycle:step-0']);
+  assert.ok(javaBackToScalaExp.nextProjection.visibleFrames.length > 26);
 });
 

@@ -1,7 +1,14 @@
 import { COMPONENTS } from '../data/components.ts';
+import { resolveTraceForLanguage } from '../data/jvmTraceOverrides.ts';
 import { ALL_TRACES } from '../data/traces.ts';
 import { CHANNEL_META, HOST_ZONES } from '../data/types.ts';
-import type { ChannelKind, ComponentId, HostZoneId } from '../data/types.ts';
+import type {
+  ChannelKind,
+  ComponentId,
+  HostZoneId,
+  SparkLanguage,
+} from '../data/types.ts';
+import { getEffectiveTraceLanguages } from './urlRoute.ts';
 
 export interface PeerInteractionItem {
   peerId: ComponentId;
@@ -91,6 +98,7 @@ function buildPeerList(map: Map<ComponentId, PeerAgg>): PeerInteractionItem[] {
 
 export function computePeerInteractions(
   componentId: ComponentId,
+  language?: SparkLanguage,
 ): PeerInteractionsSummary {
   const inbound = new Map<ComponentId, PeerAgg>();
   const outbound = new Map<ComponentId, PeerAgg>();
@@ -119,7 +127,13 @@ export function computePeerInteractions(
   };
 
   for (const trace of ALL_TRACES) {
-    for (const msg of trace.messages) {
+    if (language && !getEffectiveTraceLanguages(trace).includes(language)) {
+      continue;
+    }
+    const effectiveTrace = language
+      ? resolveTraceForLanguage(trace, language)
+      : trace;
+    for (const msg of effectiveTrace.messages) {
       if (msg.from === msg.to) continue;
       if (msg.to === componentId) {
         record(inbound, msg.from, msg.label, msg.channel, msg.protocol);

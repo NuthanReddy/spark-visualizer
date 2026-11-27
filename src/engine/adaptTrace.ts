@@ -1,5 +1,6 @@
 import { COMPONENTS } from '../data/components.ts';
-import { DEEP_STEP_ENRICHMENTS } from '../data/deepSteps.ts';
+import { resolveDeepStepEnrichment } from '../data/deepSteps.ts';
+import { resolveTraceForLanguage } from '../data/jvmTraceOverrides.ts';
 import type {
   DeepStepEnrichment,
   ExecutionRun,
@@ -8,7 +9,12 @@ import type {
   RuntimeInstance,
   StepCategory,
 } from '../data/runModel.ts';
-import type { ComponentId, TraceLesson, TraceMessage } from '../data/types.ts';
+import type {
+  ComponentId,
+  SparkLanguage,
+  TraceLesson,
+  TraceMessage,
+} from '../data/types.ts';
 import {
   CLIENT_HOST_DRIVER_COMPONENTS,
   resolveDefaultHostLabel,
@@ -244,19 +250,23 @@ function normalizeExtraInstance(
   return { ...extra };
 }
 
-export function adaptTraceToRun(trace: TraceLesson): ExecutionRun {
-  const isClientMode = trace.deployMode === 'client';
+export function adaptTraceToRun(
+  trace: TraceLesson,
+  language?: SparkLanguage,
+): ExecutionRun {
+  const effectiveTrace = resolveTraceForLanguage(trace, language);
+  const isClientMode = effectiveTrace.deployMode === 'client';
   const participantIds = Array.from(
     new Set<ComponentId>([
-      ...trace.focusNodes,
-      ...trace.messages.flatMap(m => [m.from, m.to]),
+      ...effectiveTrace.focusNodes,
+      ...effectiveTrace.messages.flatMap(m => [m.from, m.to]),
     ]),
   );
 
   const instances: Record<string, RuntimeInstance> = {};
   const customByComponent = new Map<ComponentId, RuntimeInstance[]>();
 
-  for (const custom of trace.customInstances ?? []) {
+  for (const custom of effectiveTrace.customInstances ?? []) {
     const inst: RuntimeInstance = {
       id: custom.id,
       componentId: custom.componentId,
@@ -279,7 +289,7 @@ export function adaptTraceToRun(trace: TraceLesson): ExecutionRun {
   }
 
   const referencedInstanceIds = new Set<string>();
-  for (const m of trace.messages) {
+  for (const m of effectiveTrace.messages) {
     referencedInstanceIds.add(m.fromInstance ?? m.from);
     referencedInstanceIds.add(m.toInstance ?? m.to);
   }
@@ -312,11 +322,16 @@ export function adaptTraceToRun(trace: TraceLesson): ExecutionRun {
     }
   }
 
-  for (const custom of trace.customInstances ?? []) {
+  for (const custom of effectiveTrace.customInstances ?? []) {
     addFocus(custom.id);
   }
 
-  const enrichment: DeepStepEnrichment | undefined = DEEP_STEP_ENRICHMENTS[trace.id];
+  // Resolve language-specific or pure-JVM deep-step enrichments cleanly.
+  const enrichment: DeepStepEnrichment | undefined = resolveDeepStepEnrichment(
+    effectiveTrace.id,
+    language,
+    effectiveTrace !== trace,
+  );
   if (enrichment) {
     // Register extra deep-only instances in `instances` without adding them to
     // `focusInstances`, so collapsed views stay minimal and expanded frames surface them.
@@ -345,24 +360,24 @@ export function adaptTraceToRun(trace: TraceLesson): ExecutionRun {
     }
   }
 
-  const baseSteps: RunStep[] = trace.steps.map((s, idx) => {
-    const firstMsg = trace.messages.find(m => m.step === idx);
+  const baseSteps: RunStep[] = effectiveTrace.steps.map((s, idx) => {
+    const firstMsg = effectiveTrace.messages.find(m => m.step === idx);
     const category: StepCategory = firstMsg
       ? inferStepCategory(firstMsg.from, firstMsg.to, firstMsg)
       : 'yarn-lifecycle';
     return {
-      id: `${trace.id}:step-${idx}`,
+      id: `${effectiveTrace.id}:step-${idx}`,
       title: s.title,
       explanation: s.explanation,
       category,
       keyState: s.keyState,
       command: s.command,
       detailsPassed: s.detailsPassed,
-      deepDiveComponentId: firstMsg?.to ?? trace.componentId,
+      deepDiveComponentId: firstMsg?.to ?? effectiveTrace.componentId,
     };
   });
 
-  const baseEvents: RunEvent[] = trace.messages.map(m => {
+  const baseEvents: RunEvent[] = effectiveTrace.messages.map(m => {
     const stepIdx = Math.max(0, Math.min(baseSteps.length - 1, m.step));
     const stepId = baseSteps[stepIdx].id;
     const inferredCat = inferStepCategory(m.from, m.to, m);
@@ -370,7 +385,7 @@ export function adaptTraceToRun(trace: TraceLesson): ExecutionRun {
     const toInst = m.toInstance ?? m.to;
     const localPort = isLocalPort(m.port);
     return {
-      id: `${trace.id}:${m.id}`,
+      id: `${effectiveTrace.id}:${m.id}`,
       stepId,
       kind:
         m.kind ??
@@ -486,17 +501,17 @@ export function adaptTraceToRun(trace: TraceLesson): ExecutionRun {
   }
 
   return {
-    id: trace.id,
+    id: effectiveTrace.id,
     sourceKind: 'catalog',
-    traceKind: trace.kind,
-    name: trace.name,
-    subtitle: trace.subtitle,
-    summary: trace.summary,
-    deployMode: trace.deployMode,
-    layerTag: trace.layerTag,
-    componentId: trace.componentId,
-    scenarioNumber: trace.scenarioNumber,
-    subsystem: trace.subsystem,
+    traceKind: effectiveTrace.kind,
+    name: effectiveTrace.name,
+    subtitle: effectiveTrace.subtitle,
+    summary: effectiveTrace.summary,
+    deployMode: effectiveTrace.deployMode,
+    layerTag: effectiveTrace.layerTag,
+    componentId: effectiveTrace.componentId,
+    scenarioNumber: effectiveTrace.scenarioNumber,
+    subsystem: effectiveTrace.subsystem,
     instances,
     focusInstances,
     steps,

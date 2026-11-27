@@ -220,8 +220,8 @@ export default function InspectorPanel({
   const inspectedComponent = COMPONENTS[inspectedComponentId];
 
   const peerInteractions = useMemo(
-    () => computePeerInteractions(inspectedComponentId),
-    [inspectedComponentId],
+    () => computePeerInteractions(inspectedComponentId, activeLanguage),
+    [inspectedComponentId, activeLanguage],
   );
 
   const { runtimeHostOverrides, actualRuntimeHosts } = useMemo(() => {

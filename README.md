@@ -16,13 +16,13 @@ npm run dev
 Open `http://127.0.0.1:5173`.
 
 - `npm run build` -- TypeScript check (`tsc -b`) + Vite production bundle (`dist/`)
-- `npm test` -- Validates all 71 components, pairwise non-overlap on the `1800 x 1180` Master Canvas, all 109 curated traces (12 lifecycle flows, 26 scenarios, 71 component deep-dives), language routing (`#lang=`), playback geometry, and the Multi-Language Simulator
+- `npm test` -- Validates all 71 components, pairwise non-overlap on the `1800 x 1180` Master Canvas, all 106 curated traces (9 dynamic lifecycle flows, 26 scenarios, 71 component deep-dives), language routing (`#lang=`), playback geometry, and the Multi-Language Simulator
 
 ## What you can explore
 
 - **Global `PySpark | Scala | Java` Language Switcher & `#lang=` URL Routing**:
   - Switch globally between **PySpark**, **Scala**, and **Java** (`#lang=pyspark|scala|java`).
-  - Automatically adapts language-paired lifecycle flows (e.g., Python Driver + Py4J vs JVM `--class` + `__app__.jar`, Python UDF worker IPC vs in-JVM Dataset Encoders and Scala/Java UDFs), filters language-specific components, and adapts simulator job and fault configurations.
+  - Automatically adapts unified lifecycle flows, scenarios, and component deep-dives in place (e.g., Python Driver + Py4J vs JVM `--class` + `__app__.jar`, Python UDF worker IPC vs in-JVM Dataset Encoders and Scala/Java UDFs), filters language-specific components, and adapts simulator job and fault configurations.
 - **Three synchronized views** (`V` to cycle):
   1. **Topology Canvas** -- Participating components grouped inside their real host/container boundaries with animated traveling packet orbs, glowing directional trails, ports, and protocol badges.
   2. **All 71 Master Canvas (`1800 x 1180`)** -- Every Spark-on-YARN component simultaneously on one zoomable, pannable architectural map across Submit Host, YARN Control, AM/Driver JVM, Worker Node A (Map), Worker Node B (Reduce/Python/Write), and HDFS/History. Click any node to inspect its LLD or jump to its dedicated trace.
@@ -30,8 +30,8 @@ Open `http://127.0.0.1:5173`.
 - **Step-by-step controls & Right-hand Step Details**:
   - Use **Prev Step** / **Next Step** (or `Left` / `Right`, `Space` to play/pause, `S` to step one message) to walk through each trace step by step.
   - The right panel displays the active step's **command / RPC invocation**, **details passed (arguments, flags, headers, IDs)**, **wire payload preview**, and **sender -> receiver state transitions**, alongside a **Component LLD** tab with interactive **Peer Interactions** (`Receives From` / `Sends To`), lifecycle ownership, failure clues, and pinned Apache Spark source links.
-- **109 curated traces**:
-  - **12 End-to-End Lifecycle Flows** (PySpark Cluster Mode, Client Mode & Discovery, Shuffle & Parquet Write, Python UDF Boundary, Scala Cluster Mode, Java Cluster Mode, JVM Dataset Encoders vs In-JVM Scala/Java UDF, Dynamic Allocation, Shuffle `FetchFailed` Recovery, MetricsSystem vs Live SparkUI & History Server Lifecycles, Push-Based Shuffle with ESS ON, and YARN Node Decommission & Block Migration with ESS OFF)
+- **106 curated traces** (zero duplicates):
+  - **9 Dynamic End-to-End Lifecycle Flows** (adapting cleanly across PySpark, Scala, and Java: Full Cluster-Mode Batch Lifecycle, Client-Mode Startup & Discovery, End-to-End Shuffle & Parquet Write, Python Driver Py4J vs Executor UDF Worker / JVM Dataset Encoders vs In-JVM Scala/Java UDF, Dynamic Allocation Scale-Up & Scale-Down, Shuffle `FetchFailed` Recovery, MetricsSystem vs Live SparkUI & History Server Lifecycles, Push-Based Shuffle with ESS ON, and YARN Node Decommission & Block Migration with ESS OFF)
   - **26 Failure / Behavior Scenarios** (01--26)
   - **71 Per-Component Deep-Dives** (one dedicated trace for every component)
 - **Multi-Language Simulator** (`G` to open):
