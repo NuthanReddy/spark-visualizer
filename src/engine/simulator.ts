@@ -42,7 +42,11 @@ import {
 const PYTHON_ONLY_COMPONENTS: ReadonlySet<ComponentId> = new Set<ComponentId>([
   'python-driver',
   'py4j-gateway',
+  'cloudpickle-serializer',
+  'python-accumulator-v2',
   'python-udf-operator',
+  'arrow-pandas-udf-engine',
+  'python-udtf-exec',
   'python-worker-factory',
   'python-worker',
   'python-runner',
@@ -614,6 +618,175 @@ export class SimRunBuilder {
       ...(execInst?.containerId ? { containerId: execInst.containerId } : {}),
       executorNumber: execNum,
       ...(attempt > 1 ? { attemptNumber: attempt } : {}),
+    });
+  }
+
+  execLocalComponentInstance(
+    execId: string,
+    componentId: ComponentId,
+    shortSuffix?: string,
+  ): string {
+    const execInst = this.instances[execId];
+    const execNum = execInst?.executorNumber ?? 1;
+    const attempt = execInst?.attemptNumber ?? 1;
+    const hostZone: 'worker-node-a' | 'worker-node-b' =
+      execInst?.hostZone === 'worker-node-b' ? 'worker-node-b' : 'worker-node-a';
+    const hostName = hostZone === 'worker-node-a' ? 'worker-a' : 'worker-b';
+    const spec = COMPONENTS[componentId];
+    const id = `${execId}/${componentId}`;
+    return this.ensureInstance(id, {
+      componentId,
+      label: `${spec.name} (Exec-${execNum})`,
+      shortLabel: shortSuffix ? `E${execNum} ${shortSuffix}` : `E${execNum} ${spec.shortName}`,
+      hostZone,
+      hostLabel: hostName,
+      processId: execInst?.processId ?? `Executor ${execNum} JVM`,
+      ...(execInst?.containerId ? { containerId: execInst.containerId } : {}),
+      executorNumber: execNum,
+      ...(attempt > 1 ? { attemptNumber: attempt } : {}),
+    });
+  }
+
+  emitSqlCatalystCodegenPlan(
+    stepId: string,
+    opts: {
+      hasShuffle: boolean;
+      isSkewJoin?: boolean;
+      dagLabel: string;
+      dagInfo: string;
+      dagCommand: string;
+      dagFields: TraceField[];
+      dagSenderState: string;
+      dagReceiverState: string;
+    },
+  ): void {
+    const analyzer = this.std('catalyst-analyzer');
+    const optimizer = this.std('catalyst-optimizer');
+    const sqlPlanner = this.std('sql-planner');
+    const wscg = this.std('whole-stage-codegen');
+    const dag = this.std('dag-scheduler');
+
+    this.addEvent({
+      stepId,
+      from: analyzer,
+      to: optimizer,
+      kind: 'local',
+      categoryOverride: 'sql-planning-aqe',
+      channel: 'internal',
+      protocol: 'Catalyst Analyzer -> RBO',
+      port: `${this.driverHost} in-JVM`,
+      label: 'Analyze & optimize AST',
+      info: 'Catalyst Analyzer resolves catalog schemas & ExprIds, then Catalyst Optimizer applies predicate pushdown and column pruning.',
+      size: 'in-memory',
+      command: 'Analyzer.executeAndCheck(plan) -> SparkOptimizer.execute(analyzedPlan)',
+      fields: [
+        { name: 'phase', value: 'Analyzed -> Optimized LogicalPlan' },
+        { name: 'rules', value: 'PushDownPredicates, ColumnPruning, ConstantFolding' },
+      ],
+      senderState: 'Resolved catalog attributes & types',
+      receiverState: 'Optimized logical plan ready for SparkPlanner',
+    });
+    this.addEvent({
+      stepId,
+      from: optimizer,
+      to: sqlPlanner,
+      kind: 'local',
+      categoryOverride: 'sql-planning-aqe',
+      channel: 'internal',
+      protocol: 'SparkPlanner Strategies',
+      port: `${this.driverHost} in-JVM`,
+      label: opts.isSkewJoin ? 'Plan SMJ operators' : opts.hasShuffle ? 'Plan HashAgg + Exchange' : 'Plan Scan + Filter',
+      info: opts.isSkewJoin
+        ? 'SQL Planner selects SortMergeJoinExec with co-partitioned SortExec inputs.'
+        : opts.hasShuffle
+          ? 'SQL Planner selects two-phase Partial/Final HashAggregateExec around a hash exchange.'
+          : 'SQL Planner lowers narrow Scan -> Filter -> Project with zero shuffle boundaries.',
+      size: 'in-memory',
+      command: 'SparkPlanner.plan(optimizedPlan) -> EnsureRequirements',
+      fields: [{ name: 'aqeEnabled', value: String(this.cfg.aqeEnabled) }],
+      senderState: 'Handed optimized LogicalPlan to SparkPlanner',
+      receiverState: opts.hasShuffle ? 'Inserting ShuffleExchangeExec' : 'Preparing WholeStageCodegenExec',
+    });
+    if (opts.hasShuffle) {
+      const exch = this.std('shuffle-exchange');
+      this.addEvent({
+        stepId,
+        from: sqlPlanner,
+        to: exch,
+        kind: 'local',
+        categoryOverride: 'sql-planning-aqe',
+        channel: 'internal',
+        protocol: 'EnsureRequirements',
+        port: `${this.driverHost} in-JVM`,
+        label: opts.isSkewJoin ? 'Insert 2x Exchange' : 'Insert ShuffleExchange',
+        info: 'EnsureRequirements inserts ShuffleExchangeExec with UnsafeRowSerializer to satisfy required ClusteredDistribution.',
+        size: 'in-memory',
+        command: `EnsureRequirements -> ShuffleExchangeExec(hashpartitioning(${opts.isSkewJoin ? 'cust_id' : 'region'}, ${this.cfg.numPartitions}))`,
+        fields: [
+          { name: 'partitions', value: String(this.cfg.numPartitions) },
+          { name: 'serializer', value: 'UnsafeRowSerializer (Tungsten binary)' },
+        ],
+        senderState: 'Satisfied child distribution requirements',
+        receiverState: 'Created ShuffleDependency; wrapping stages in WholeStageCodegen',
+      });
+      this.addEvent({
+        stepId,
+        from: exch,
+        to: wscg,
+        kind: 'local',
+        categoryOverride: 'sql-planning-aqe',
+        channel: 'internal',
+        protocol: 'CollapseCodegenStages',
+        port: `${this.driverHost} in-JVM`,
+        label: 'Fuse WholeStageCodegen',
+        info: 'CollapseCodegenStages wraps codegen-eligible operators in WholeStageCodegenExec.doCodeGen() to emit fused BufferedRowIterator Java source.',
+        size: 'in-memory',
+        command: 'WholeStageCodegenExec.doCodeGen() // *(1) map & *(2) reduce Java loops',
+        fields: [
+          { name: 'compiler', value: 'Janino SimpleCompiler (default on executors)' },
+          { name: 'format', value: 'Tungsten UnsafeRow (zero object boxing)' },
+        ],
+        senderState: 'Partitioned physical plan into codegen stages',
+        receiverState: 'Emitted WholeStageCodegen Java source for executors',
+      });
+    } else {
+      this.addEvent({
+        stepId,
+        from: sqlPlanner,
+        to: wscg,
+        kind: 'local',
+        categoryOverride: 'sql-planning-aqe',
+        channel: 'internal',
+        protocol: 'CollapseCodegenStages',
+        port: `${this.driverHost} in-JVM`,
+        label: 'Fuse WholeStageCodegen',
+        info: 'CollapseCodegenStages fuses Scan -> Filter -> Project into one WholeStageCodegenExec *(1) BufferedRowIterator Java loop.',
+        size: 'in-memory',
+        command: 'WholeStageCodegenExec.doCodeGen() // single fused *(1) stage',
+        fields: [
+          { name: 'compiler', value: 'Janino SimpleCompiler (default on executors)' },
+          { name: 'format', value: 'Tungsten UnsafeRow (zero object boxing)' },
+        ],
+        senderState: 'Handed narrow physical plan to codegen',
+        receiverState: 'Emitted fused *(1) WholeStageCodegen Java source',
+      });
+    }
+    this.addEvent({
+      stepId,
+      from: wscg,
+      to: dag,
+      kind: 'local',
+      categoryOverride: 'sql-planning-aqe',
+      channel: 'internal',
+      protocol: 'In-JVM Codegen -> DAG',
+      port: `${this.driverHost} in-JVM`,
+      label: opts.dagLabel,
+      info: opts.dagInfo,
+      size: 'in-memory',
+      command: opts.dagCommand,
+      fields: opts.dagFields,
+      senderState: opts.dagSenderState,
+      receiverState: opts.dagReceiverState,
     });
   }
 
@@ -2886,42 +3059,34 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       producerExec,
     );
   } else if (!state.abortedByFault && cfg.jobType === 'narrow-filter') {
-    const sqlPlanner = b.std('sql-planner');
-    const dag = b.std('dag-scheduler');
     const sNarrow = b.addStep({
       id: 'sim-step-narrow',
-      title: `Narrow Filter Stage: ${cfg.numPartitions} tasks across ${cfg.numExecutors} exec(s) (0 shuffles)`,
-      explanation: `Catalyst pushes status='PAID' down to Parquet scan. DAGScheduler creates ONE ResultStage (0 shuffles) with ${cfg.numPartitions} tasks (~${idealWavesPerStage} ideal wave(s) across ${totalSlots} initial slots).`,
+      title: `Narrow Filter Stage: Catalyst + WholeStageCodegen *(1) across ${cfg.numExecutors} exec(s) (0 shuffles)`,
+      explanation: `Catalyst Analyzer & Optimizer push status='PAID' down to Parquet scan; WholeStageCodegenExec fuses Scan -> Filter -> Project into stage *(1). DAGScheduler creates ONE ResultStage (0 shuffles) with ${cfg.numPartitions} tasks (~${idealWavesPerStage} ideal wave(s) across ${totalSlots} initial slots), compiled via Janino into Tungsten UnsafeRow loops on executors.`,
       category: 'sql-planning-aqe',
       keyState: isMidExecTaskAbort
         ? `ResultStage 0 submitted (${cfg.numPartitions} tasks); executor encounters mid-stage failure`
-        : `1 ResultStage | 0 ShuffleDependencies | ${cfg.numPartitions} tasks (~${idealWavesPerStage} ideal waves)`,
+        : `1 ResultStage | WholeStageCodegen *(1) | 0 ShuffleDependencies | ${cfg.numPartitions} tasks`,
       command: job.actionSink,
       detailsPassed: [
-        { name: 'stages', value: '1 (ResultStage 0 only)' },
+        { name: 'stages', value: '1 (ResultStage 0 only, fused *(1))' },
         { name: 'shuffles', value: '0 (narrow pipeline)' },
+        { name: 'codegen', value: 'WholeStageCodegen -> Janino -> Tungsten UnsafeRow' },
         { name: 'idealWaves', value: `${idealWavesPerStage} (${cfg.numPartitions} tasks / ${totalSlots} slots)` },
       ],
-      deepDiveComponentId: 'dag-scheduler',
+      deepDiveComponentId: 'whole-stage-codegen',
     });
-    b.addEvent({
-      stepId: sNarrow,
-      from: sqlPlanner,
-      to: dag,
-      kind: 'local',
-      channel: 'internal',
-      protocol: 'In-JVM Catalyst -> DAG',
-      port: `${b.driverHost} in-JVM`,
-      label: 'Plan 1-stage narrow DAG',
-      info: 'Catalyst pushes down status="PAID" with no Exchange; DAGScheduler creates a single ResultStage.',
-      size: 'in-memory',
-      command: 'DAGScheduler.submitJob(ResultStage 0, partitions = 0..' + (cfg.numPartitions - 1) + ')',
-      fields: [
+    b.emitSqlCatalystCodegenPlan(sNarrow, {
+      hasShuffle: false,
+      dagLabel: 'Plan 1-stage narrow DAG',
+      dagInfo: 'Catalyst pushes down status="PAID" and WholeStageCodegen fuses *(1) with no Exchange; DAGScheduler creates a single ResultStage.',
+      dagCommand: 'DAGScheduler.submitJob(ResultStage 0, partitions = 0..' + (cfg.numPartitions - 1) + ')',
+      dagFields: [
         { name: 'shuffleCount', value: '0' },
         { name: 'partitions', value: String(cfg.numPartitions) },
       ],
-      senderState: 'Single-stage physical plan built',
-      receiverState: 'Submitting TaskSet 0.0 directly (no map stage)',
+      dagSenderState: 'Single-stage fused codegen physical plan built',
+      dagReceiverState: 'Submitting TaskSet 0.0 directly (no map stage)',
     });
     b.addEvent({
       stepId: sNarrow,
@@ -2939,7 +3104,43 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         { name: 'idealWaves', value: String(idealWavesPerStage) },
       ],
       senderState: `Running up to ${Math.min(cfg.numPartitions, totalSlots)} concurrent tasks`,
-      receiverState: 'Scanning Parquet splits & filtering in-JVM',
+      receiverState: 'Compiling *(1) via Janino & filtering Tungsten UnsafeRows',
+    });
+    const narrowJanino = b.execLocalComponentInstance(producerExec, 'janino-code-generator', 'Janino');
+    const narrowTungsten = b.execLocalComponentInstance(producerExec, 'tungsten-unsafe-row', 'UnsafeRow');
+    b.addEvent({
+      stepId: sNarrow,
+      from: producerExec,
+      to: narrowJanino,
+      kind: 'local',
+      categoryOverride: 'sql-planning-aqe',
+      channel: 'internal',
+      protocol: 'Janino CodeGenerator',
+      port: `${producerHost} in-JVM`,
+      label: 'Compile *(1) filter loop',
+      info: `${producerExec} compiles/hits CodeGenerator.cache (Janino) for WholeStageCodegenExec *(1) Scan -> Filter -> Project.`,
+      size: 'in-memory',
+      command: 'CodeGenerator.compile(stage1FilterCode) -> GeneratedIterator',
+      fields: [{ name: 'compiler', value: 'Janino SimpleCompiler (cached)' }],
+      senderState: 'Running compiled BufferedRowIterator on executor JVM',
+      receiverState: 'Compiled *(1) bytecode ready',
+    });
+    b.addEvent({
+      stepId: sNarrow,
+      from: narrowJanino,
+      to: narrowTungsten,
+      kind: 'local',
+      categoryOverride: 'sql-planning-aqe',
+      channel: 'internal',
+      protocol: 'Tungsten UnsafeRow',
+      port: `${producerHost} in-JVM`,
+      label: 'Filter binary UnsafeRows',
+      info: 'Compiled *(1) loop evaluates status="PAID" directly on 8-byte aligned Tungsten UnsafeRow memory (0 object boxing).',
+      size: 'in-memory',
+      command: 'GeneratedIterator.processNext() // UnsafeRow zero-copy filter',
+      fields: [{ name: 'memoryPool', value: 'TaskMemoryManager binary pages' }],
+      senderState: 'Evaluating fused filter predicate',
+      receiverState: 'Streaming filtered UnsafeRows to Parquet writer',
     });
     if (willScaleUp) {
       emitDynamicAllocationScaleUp();
@@ -3031,42 +3232,36 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     const isSkewJoin = cfg.jobType === 'sort-merge-skew';
     const isSkewedProfile = cfg.dataProfile === 'skewed';
     const aqeSplits = isSkewJoin && cfg.aqeEnabled && isSkewedProfile;
-    const sqlPlanner = b.std('sql-planner');
     const dag = b.std('dag-scheduler');
 
     if (willScaleUp || isMidExecTaskAbort || isSpillOom) {
       const sMapSubmit = b.addStep({
         id: 'sim-step-map-submit',
         title: isSkewJoin
-          ? `Submit ShuffleMapStage 0 (${cfg.numPartitions} map tasks; ${isSkewedProfile ? '640 MiB hot p0' : 'uniform 48 MiB'})`
-          : `Submit ShuffleMapStage 0: ${cfg.numPartitions} map tasks across ${cfg.numExecutors} initial exec(s)`,
-        explanation: `Catalyst inserts ShuffleExchangeExec and DAGScheduler submits ShuffleMapStage 0 (${cfg.numPartitions} tasks; ${Math.min(cfg.numPartitions, totalSlots)} running on initial slots, ${Math.max(0, cfg.numPartitions - totalSlots)} queued in pending backlog).`,
+          ? `Catalyst + WholeStageCodegen -> ShuffleMapStage 0 (${cfg.numPartitions} maps; ${isSkewedProfile ? '640 MiB hot p0' : 'uniform 48 MiB'})`
+          : `Catalyst + WholeStageCodegen -> ShuffleMapStage 0: ${cfg.numPartitions} map tasks across ${cfg.numExecutors} exec(s)`,
+        explanation: `Catalyst Analyzer & Optimizer push predicates down, SQL Planner inserts ShuffleExchangeExec, WholeStageCodegenExec fuses *(1) map & *(2) reduce stages, and DAGScheduler submits ShuffleMapStage 0 (${cfg.numPartitions} tasks; ${Math.min(cfg.numPartitions, totalSlots)} running on initial slots, ${Math.max(0, cfg.numPartitions - totalSlots)} queued in pending backlog).`,
         category: 'sql-planning-aqe',
-        keyState: `ShuffleMapStage 0 submitted (${cfg.numPartitions} map tasks)`,
-        command: 'EnsureRequirements -> DAGScheduler.submitStage(ShuffleMapStage 0)',
+        keyState: `Catalyst + WholeStageCodegen *(1,2) -> ShuffleMapStage 0 submitted (${cfg.numPartitions} map tasks)`,
+        command: 'Analyzer -> Optimizer -> ShuffleExchangeExec -> WholeStageCodegenExec -> DAGScheduler.submitStage(0)',
         detailsPassed: [
           { name: 'partitions', value: String(cfg.numPartitions) },
           { name: 'initialSlots', value: String(totalSlots) },
+          { name: 'codegen', value: 'WholeStageCodegen *(1) map & *(2) reduce' },
         ],
-        deepDiveComponentId: 'dag-scheduler',
+        deepDiveComponentId: 'whole-stage-codegen',
       });
-      b.addEvent({
-        stepId: sMapSubmit,
-        from: sqlPlanner,
-        to: dag,
-        kind: 'local',
-        channel: 'internal',
-        protocol: 'In-JVM Catalyst -> DAG',
-        port: `${b.driverHost} in-JVM`,
-        label: isSkewJoin ? 'Plan SMJ (2 shuffles)' : 'Plan Exchange (2 stages)',
-        info: isSkewJoin
-          ? 'Catalyst plans SortMergeJoinExec with 2 ShuffleExchange boundaries.'
-          : 'Catalyst inserts ShuffleExchangeExec(hashpartitioning(region, 200)), splitting into 2 stages.',
-        size: 'in-memory',
-        command: 'EnsureRequirements -> DAGScheduler.submitJob()',
-        fields: [{ name: 'aqeEnabled', value: String(cfg.aqeEnabled) }],
-        senderState: 'Physical plan ready',
-        receiverState: 'Submitting ShuffleMapStage 0',
+      b.emitSqlCatalystCodegenPlan(sMapSubmit, {
+        hasShuffle: true,
+        isSkewJoin,
+        dagLabel: isSkewJoin ? 'Plan SMJ (2 shuffles)' : 'Plan Exchange (2 stages)',
+        dagInfo: isSkewJoin
+          ? 'Catalyst + WholeStageCodegen plan SortMergeJoinExec with 2 ShuffleExchange boundaries.'
+          : 'Catalyst + WholeStageCodegen fuse Partial/Final HashAggregate around ShuffleExchangeExec.',
+        dagCommand: 'WholeStageCodegenExec.doCodeGen() -> DAGScheduler.submitJob()',
+        dagFields: [{ name: 'aqeEnabled', value: String(cfg.aqeEnabled) }],
+        dagSenderState: 'Fused WholeStageCodegen physical plan ready',
+        dagReceiverState: 'Submitting ShuffleMapStage 0',
       });
       b.addEvent({
         stepId: sMapSubmit,
@@ -3084,7 +3279,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           { name: 'initialSlots', value: String(totalSlots) },
         ],
         senderState: 'Initial map wave dispatched',
-        receiverState: 'Running ShuffleMapTasks on worker-a',
+        receiverState: 'Compiling *(1) via Janino & running ShuffleMapTasks on worker-a',
       });
       if (willScaleUp) {
         emitDynamicAllocationScaleUp();
@@ -3105,13 +3300,14 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       const sPlanMap = b.addStep({
         id: 'sim-step-map',
         title: isSkewJoin
-          ? `Map Stages write shuffle outputs (${isSkewedProfile ? '640 MiB hot partition 0' : 'uniform 48 MiB'})`
-          : `ShuffleMapStage 0: ${cfg.numPartitions} map tasks write .data/.index & report MapStatus`,
-        explanation: `DAGScheduler runs ShuffleMapStage 0 across ${state.liveExecs.length} live executor(s). Map tasks commit consolidated .data/.index files via IndexShuffleBlockResolver (logical mapIndex=${targetPart}, physical mapId=${initialMapId}) and return MapStatus to DAGScheduler -> MapOutputTrackerMaster.`,
+          ? `Map Stages compile *(1) via Janino & write shuffle outputs (${isSkewedProfile ? '640 MiB hot p0' : 'uniform 48 MiB'})`
+          : `ShuffleMapStage 0: Janino *(1) Partial HashAgg writes .data/.index & reports MapStatus`,
+        explanation: `Catalyst Analyzer -> Optimizer -> ShuffleExchange -> WholeStageCodegen *(1) drive ShuffleMapStage 0 across ${state.liveExecs.length} live executor(s). Executors compile *(1) via Janino over Tungsten UnsafeRows (${isSkewJoin ? 'key-partitioned join sides' : 'Partial HashAggregate'}), commit consolidated .data/.index via IndexShuffleBlockResolver (mapIndex=${targetPart}, mapId=${initialMapId}), and return MapStatus to DAGScheduler -> MapOutputTrackerMaster.`,
         category: 'sql-planning-aqe',
-        keyState: `Map stage complete | serving via ${cfg.externalShuffleService ? `ESS ${producerHost}:7337` : `${producerExec} BM ${producerBmPort}`}`,
-        command: 'DAGScheduler.submitStage(ShuffleMapStage 0) -> BypassMergeSortShuffleWriter.write()',
+        keyState: `Janino *(1) + Map stage complete | serving via ${cfg.externalShuffleService ? `ESS ${producerHost}:7337` : `${producerExec} BM ${producerBmPort}`}`,
+        command: 'WholeStageCodegen -> Janino -> Tungsten UnsafeRow -> BypassMergeSortShuffleWriter.write()',
         detailsPassed: [
+          { name: 'codegen', value: 'WholeStageCodegen *(1) -> Janino -> Tungsten UnsafeRow' },
           { name: 'shuffleWriter', value: 'BypassMergeSortShuffleWriter (default <= 200 parts)' },
           { name: 'servingEndpoint', value: shuffleServerPort },
           { name: 'mapIndexVsMapId', value: `logical mapIndex=${targetPart}, physical mapId=${initialMapId}` },
@@ -3121,23 +3317,77 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         isMacro: true,
       });
       if (!willScaleUp && !isSpillOom) {
+        b.emitSqlCatalystCodegenPlan(sPlanMap, {
+          hasShuffle: true,
+          isSkewJoin,
+          dagLabel: isSkewJoin ? 'Plan SMJ (2 shuffles)' : 'Plan Exchange (2 stages)',
+          dagInfo: isSkewJoin
+            ? 'Catalyst + WholeStageCodegen plan SortMergeJoinExec with 2 ShuffleExchange boundaries.'
+            : 'Catalyst + WholeStageCodegen fuse Partial/Final HashAggregate around ShuffleExchangeExec.',
+          dagCommand: 'WholeStageCodegenExec.doCodeGen() -> DAGScheduler.submitJob()',
+          dagFields: [{ name: 'aqeEnabled', value: String(cfg.aqeEnabled) }],
+          dagSenderState: 'Fused WholeStageCodegen physical plan ready',
+          dagReceiverState: 'Submitting ShuffleMapStage 0',
+        });
+      }
+      const mapJanino = b.execLocalComponentInstance(producerExec, 'janino-code-generator', 'Janino');
+      const mapTungsten = b.execLocalComponentInstance(producerExec, 'tungsten-unsafe-row', 'UnsafeRow');
+      b.addEvent({
+        stepId: sPlanMap,
+        from: producerExec,
+        to: mapJanino,
+        kind: 'local',
+        categoryOverride: 'sql-planning-aqe',
+        channel: 'internal',
+        protocol: 'Janino CodeGenerator',
+        port: `${producerHost} in-JVM`,
+        label: 'Compile *(1) map loop',
+        info: `${producerExec} compiles/hits Janino CodeGenerator.cache for WholeStageCodegenExec *(1) map pipeline.`,
+        size: 'in-memory',
+        command: 'CodeGenerator.compile(stage1CodeAndComment) -> GeneratedIterator',
+        fields: [{ name: 'compiler', value: 'Janino SimpleCompiler (Guava cache)' }],
+        senderState: 'Executing fused *(1) map stage',
+        receiverState: 'Compiled BufferedRowIterator bytecode active',
+      });
+      b.addEvent({
+        stepId: sPlanMap,
+        from: mapJanino,
+        to: mapTungsten,
+        kind: 'local',
+        categoryOverride: 'sql-planning-aqe',
+        channel: 'internal',
+        protocol: 'Tungsten UnsafeRow',
+        port: `${producerHost} in-JVM`,
+        label: isSkewJoin ? 'Project binary join keys' : 'Partial HashAgg UnsafeRow',
+        info: isSkewJoin
+          ? 'Compiled *(1) projects join keys into compact Tungsten UnsafeRow buffers for UnsafeRowSerializer shuffle.'
+          : 'Compiled *(1) accumulates partial region counts in Tungsten UnsafeFixedWidthAggregationMap before shuffle write.',
+        size: 'in-memory',
+        command: isSkewJoin
+          ? 'UnsafeProjection -> UnsafeRowSerializer'
+          : 'HashAggregateExec(partial_count) -> UnsafeFixedWidthAggregationMap',
+        fields: [{ name: 'format', value: '8-byte aligned binary UnsafeRow' }],
+        senderState: 'Processed map partition in zero-boxing binary loop',
+        receiverState: 'Feeding UnsafeRows into BypassMergeSortShuffleWriter',
+      });
+      if (!isSkewJoin) {
+        const mapHashAgg = b.execLocalComponentInstance(producerExec, 'hash-aggregate', 'HashAgg');
         b.addEvent({
           stepId: sPlanMap,
-          from: sqlPlanner,
-          to: dag,
+          from: mapTungsten,
+          to: mapHashAgg,
           kind: 'local',
+          categoryOverride: 'sql-planning-aqe',
           channel: 'internal',
-          protocol: 'In-JVM Catalyst -> DAG',
-          port: `${b.driverHost} in-JVM`,
-          label: isSkewJoin ? 'Plan SMJ (2 shuffles)' : 'Plan Exchange (2 stages)',
-          info: isSkewJoin
-            ? 'Catalyst plans SortMergeJoinExec with 2 ShuffleExchange boundaries.'
-            : 'Catalyst inserts ShuffleExchangeExec(hashpartitioning(region, 200)), splitting into 2 stages.',
+          protocol: 'Two-Level HashAggregate',
+          port: `${producerHost} in-JVM`,
+          label: 'Partial HashAgg (map)',
+          info: 'HashAggregateExec pre-combines rows per region in a two-level Tungsten hash map before writing shuffle blocks.',
           size: 'in-memory',
-          command: 'EnsureRequirements -> DAGScheduler.submitJob()',
-          fields: [{ name: 'aqeEnabled', value: String(cfg.aqeEnabled) }],
-          senderState: 'Physical plan ready',
-          receiverState: 'Submitting ShuffleMapStage 0',
+          command: 'HashAggregateExec(partial_count(1)) -> TungstenAggregationIterator',
+          fields: [{ name: 'aggPhase', value: 'Map-side Partial HashAggregate' }],
+          senderState: 'Fed filtered UnsafeRows',
+          receiverState: 'Emitting compact partial (region, count) rows to ShuffleWriter',
         });
       }
       b.addEvent({
@@ -3180,7 +3430,92 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         receiverState: 'MapStatus recorded; ready for reduce stage',
       });
 
-      // Expandable map-stage internals
+      // Expandable map-stage internals: (1) Catalyst + WholeStageCodegen + Janino + Tungsten, (2) Shuffle Commit + MapStatus
+      const sMapCodegenSub = b.addStep({
+        id: 'sim-step-map-codegen',
+        parentId: sPlanMap,
+        title: 'Catalyst Analyzer -> Optimizer -> WholeStageCodegen *(1) -> Janino -> Tungsten UnsafeRow',
+        explanation: `Inside ${b.driverHost} JVM, Catalyst Analyzer resolves schemas, Catalyst Optimizer pushes filters down, ShuffleExchangeExec creates ShuffleDependency(0), and WholeStageCodegenExec.doCodeGen() generates Java stage *(1). On ${producerHost}, Janino compiles *(1) and evaluates rows in binary Tungsten UnsafeRow${isSkewJoin ? ' key projections' : ' + two-level HashAggregate'}.`,
+        category: 'sql-planning-aqe',
+        keyState: 'Stage *(1) Catalyst + WholeStageCodegen + Janino + Tungsten complete',
+        command: 'Analyzer -> Optimizer -> ShuffleExchange -> WholeStageCodegen -> Janino -> UnsafeRow',
+        detailsPassed: [
+          { name: 'driverCodegen', value: 'WholeStageCodegenExec.doCodeGen() *(1)' },
+          { name: 'executorCompile', value: 'Janino CodeGenerator -> Tungsten UnsafeRow' },
+        ],
+        deepDiveComponentId: 'whole-stage-codegen',
+      });
+      b.emitSqlCatalystCodegenPlan(sMapCodegenSub, {
+        hasShuffle: true,
+        isSkewJoin,
+        dagLabel: isSkewJoin ? 'Plan SMJ (2 shuffles)' : 'Plan Exchange (2 stages)',
+        dagInfo: isSkewJoin
+          ? 'Catalyst + WholeStageCodegen plan SortMergeJoinExec with 2 ShuffleExchange boundaries.'
+          : 'Catalyst + WholeStageCodegen fuse Partial/Final HashAggregate around ShuffleExchangeExec.',
+        dagCommand: 'WholeStageCodegenExec.doCodeGen() -> DAGScheduler.submitJob()',
+        dagFields: [{ name: 'aqeEnabled', value: String(cfg.aqeEnabled) }],
+        dagSenderState: 'Fused WholeStageCodegen physical plan ready',
+        dagReceiverState: 'Submitting ShuffleMapStage 0',
+      });
+      b.addEvent({
+        stepId: sMapCodegenSub,
+        from: producerExec,
+        to: mapJanino,
+        kind: 'local',
+        categoryOverride: 'sql-planning-aqe',
+        channel: 'internal',
+        protocol: 'Janino CodeGenerator',
+        port: `${producerHost} in-JVM`,
+        label: 'Compile *(1) map loop',
+        info: `${producerExec} compiles/hits Janino CodeGenerator.cache for WholeStageCodegenExec *(1) map pipeline.`,
+        size: 'in-memory',
+        command: 'CodeGenerator.compile(stage1CodeAndComment) -> GeneratedIterator',
+        fields: [{ name: 'compiler', value: 'Janino SimpleCompiler (Guava cache)' }],
+        senderState: 'Executing fused *(1) map stage',
+        receiverState: 'Compiled BufferedRowIterator bytecode active',
+      });
+      b.addEvent({
+        stepId: sMapCodegenSub,
+        from: mapJanino,
+        to: mapTungsten,
+        kind: 'local',
+        categoryOverride: 'sql-planning-aqe',
+        channel: 'internal',
+        protocol: 'Tungsten UnsafeRow',
+        port: `${producerHost} in-JVM`,
+        label: isSkewJoin ? 'Project binary join keys' : 'Partial HashAgg UnsafeRow',
+        info: isSkewJoin
+          ? 'Compiled *(1) projects join keys into compact Tungsten UnsafeRow buffers for UnsafeRowSerializer shuffle.'
+          : 'Compiled *(1) accumulates partial region counts in Tungsten UnsafeFixedWidthAggregationMap before shuffle write.',
+        size: 'in-memory',
+        command: isSkewJoin
+          ? 'UnsafeProjection -> UnsafeRowSerializer'
+          : 'HashAggregateExec(partial_count) -> UnsafeFixedWidthAggregationMap',
+        fields: [{ name: 'format', value: '8-byte aligned binary UnsafeRow' }],
+        senderState: 'Processed map partition in zero-boxing binary loop',
+        receiverState: 'Feeding UnsafeRows into BypassMergeSortShuffleWriter',
+      });
+      if (!isSkewJoin) {
+        const mapHashAgg = b.execLocalComponentInstance(producerExec, 'hash-aggregate', 'HashAgg');
+        b.addEvent({
+          stepId: sMapCodegenSub,
+          from: mapTungsten,
+          to: mapHashAgg,
+          kind: 'local',
+          categoryOverride: 'sql-planning-aqe',
+          channel: 'internal',
+          protocol: 'Two-Level HashAggregate',
+          port: `${producerHost} in-JVM`,
+          label: 'Partial HashAgg (map)',
+          info: 'HashAggregateExec pre-combines rows per region in a two-level Tungsten hash map before writing shuffle blocks.',
+          size: 'in-memory',
+          command: 'HashAggregateExec(partial_count(1)) -> TungstenAggregationIterator',
+          fields: [{ name: 'aggPhase', value: 'Map-side Partial HashAggregate' }],
+          senderState: 'Fed filtered UnsafeRows',
+          receiverState: 'Emitting compact partial (region, count) rows to ShuffleWriter',
+        });
+      }
+
       const sMapSub = b.addStep({
         id: 'sim-step-map-sub',
         parentId: sPlanMap,
@@ -3422,7 +3757,37 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           senderState: 'Closed chunk stream',
           receiverState: isTaskResultLost
             ? 'Reducer computed partition; sending IndirectTaskResult to driver'
-            : 'Final HashAggregate / SortMergeJoin complete',
+            : 'Feeding shuffle stream into stage *(2) Final operator',
+        });
+        const reduceOpId = isSkewJoin ? 'sort-merge-join' : 'hash-aggregate';
+        const reduceOp = b.execLocalComponentInstance(
+          reduceConsumer.consumerExec,
+          reduceOpId,
+          isSkewJoin ? 'SortMergeJoin' : 'Final HashAgg',
+        );
+        b.addEvent({
+          stepId: sFetch,
+          from: reduceConsumer.consumerExec,
+          to: reduceOp,
+          kind: 'local',
+          categoryOverride: 'sql-planning-aqe',
+          channel: 'internal',
+          protocol: isSkewJoin ? 'WholeStageCodegen SMJ *(2)' : 'WholeStageCodegen Agg *(2)',
+          port: `${reduceConsumer.hostName} in-JVM`,
+          label: isSkewJoin ? 'Run SortMergeJoin *(2)' : 'Run Final HashAgg *(2)',
+          info: isSkewJoin
+            ? `Reducer on ${reduceConsumer.hostName} executes compiled WholeStageCodegen *(2) SortExec + SortMergeJoinExec over sorted UnsafeRow streams.`
+            : `Reducer on ${reduceConsumer.hostName} executes compiled WholeStageCodegen *(2) Final HashAggregateExec over fetched partial UnsafeRows.`,
+          size: 'in-memory',
+          command: isSkewJoin
+            ? 'SortExec -> SortMergeJoinExec.doExecute() // compiled *(2)'
+            : 'HashAggregateExec(final count(1)) // compiled *(2)',
+          fields: [
+            { name: 'operator', value: isSkewJoin ? 'SortMergeJoinExec' : 'Final HashAggregateExec' },
+            { name: 'codegenStage', value: '*(2) Janino BufferedRowIterator' },
+          ],
+          senderState: 'Completed compiled *(2) reduce stage',
+          receiverState: 'Final UnsafeRows ready for Parquet write',
         });
         if (isTaskResultLost) {
           taskResultLostHandled = true;
@@ -3442,18 +3807,37 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
 
       const sBcast = b.addStep({
         id: 'sim-step-bcast',
-        title: `BroadcastExchange + TorrentBroadcast across ${cfg.numExecutors} executor(s)`,
-        explanation: `Driver collects small dimension table (10.8 MiB) into a HashedRelation. TorrentBroadcast stores ALL 3 serialized pieces (4 + 4 + 2.8 MiB; 4 MiB blockSize) on Driver BM; executors fetch in randomized order and advertise immediately (${cfg.numExecutors >= 2 ? 'enabling peer-to-peer E1 -> E2 fetches' : 'direct from Driver BM with 1 executor, no E-to-E hop'}). Expand for TorrentBroadcast internals.`,
+        title: `Catalyst + WholeStageCodegen -> BroadcastExchange + TorrentBroadcast (${cfg.numExecutors} execs)`,
+        explanation: `Catalyst Analyzer & Optimizer select BroadcastHashJoinExec and WholeStageCodegenExec fuses the probe loop. Driver collects small dimension table (10.8 MiB) into a HashedRelation; TorrentBroadcast stores ALL 3 serialized pieces (4 + 4 + 2.8 MiB; 4 MiB blockSize) on Driver BM; executors fetch in randomized order and advertise immediately (${cfg.numExecutors >= 2 ? 'enabling peer-to-peer E1 -> E2 fetches' : 'direct from Driver BM with 1 executor, no E-to-E hop'}). Expand for TorrentBroadcast internals.`,
         category: 'broadcast-torrent',
-        keyState: `Broadcast HashedRelation ready on all ${cfg.numExecutors} executor(s); 0 large-table shuffle`,
-        command: 'BroadcastExchangeExec -> TorrentBroadcast.writeBlocks() -> BroadcastHashJoinExec',
+        keyState: `WholeStageCodegen BHJ + Broadcast HashedRelation ready on ${cfg.numExecutors} exec(s); 0 large shuffle`,
+        command: 'Catalyst -> WholeStageCodegen -> BroadcastExchangeExec -> TorrentBroadcast.writeBlocks() -> BroadcastHashJoinExec',
         detailsPassed: [
           { name: 'pieceSizes', value: '4 + 4 + 2.8 MiB (10.8 MiB total; 4 MiB blockSize)' },
           { name: 'driverStores', value: 'ALL 3 serialized pieces (broadcast_0_piece0..2)' },
+          { name: 'codegen', value: 'WholeStageCodegen -> Janino BHJ probe -> Tungsten UnsafeRow' },
           { name: 'p2pHops', value: cfg.numExecutors >= 2 ? 'Enabled (illustrative E1 -> E2)' : 'None (1 executor)' },
         ],
         deepDiveComponentId: 'broadcast-manager',
         isMacro: true,
+      });
+      const bcastWscg = b.std('whole-stage-codegen');
+      b.addEvent({
+        stepId: sBcast,
+        from: b.std('sql-planner'),
+        to: bcastWscg,
+        kind: 'local',
+        categoryOverride: 'sql-planning-aqe',
+        channel: 'internal',
+        protocol: 'JoinSelection + Codegen',
+        port: `${b.driverHost} in-JVM`,
+        label: 'Plan BHJ + Codegen',
+        info: 'JoinSelection picks BroadcastHashJoinExec (build <= 10 MiB threshold) and WholeStageCodegenExec fuses the streamed probe loop.',
+        size: 'in-memory',
+        command: 'JoinSelection -> BroadcastHashJoinExec + WholeStageCodegenExec.doCodeGen()',
+        fields: [{ name: 'joinStrategy', value: 'BroadcastHashJoinExec (0 large-table shuffle)' }],
+        senderState: 'Selected BroadcastHashJoinExec',
+        receiverState: 'Fused probe stage; triggering BroadcastExchangeExec build',
       });
       b.addEvent({
         stepId: sBcast,
@@ -3527,7 +3911,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           protocol: 'In-JVM HashedRelation Probe',
           port: `${probeConsumer.hostName} in-JVM`,
           label: 'Probe streamed fact rows',
-          info: `BroadcastHashJoinExec on ${probeConsumer.hostName} probes read-only HashedRelation per streamed row with zero large-table shuffle.`,
+          info: `BroadcastHashJoinExec on ${probeConsumer.hostName} probes read-only HashedRelation per streamed row inside WholeStageCodegen *(2) with zero large-table shuffle.`,
           size: 'in-memory',
           command: 'BroadcastHashJoinExec.doExecute() -> hashedRelation.asReadOnlyCopy()',
           fields: [
@@ -3535,7 +3919,51 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
             { name: 'largeSideShuffle', value: '0 B (avoided!)' },
           ],
           senderState: 'Deserialized HashedRelation shared across executor threads',
-          receiverState: 'Joined rows streaming to Parquet writer',
+          receiverState: 'Joined UnsafeRows streaming via compiled WholeStageCodegen loop',
+        });
+        const bhjJanino = b.execLocalComponentInstance(
+          probeConsumer.consumerExec,
+          'janino-code-generator',
+          'Janino',
+        );
+        const bhjTungsten = b.execLocalComponentInstance(
+          probeConsumer.consumerExec,
+          'tungsten-unsafe-row',
+          'UnsafeRow',
+        );
+        b.addEvent({
+          stepId: sBcast,
+          from: probeConsumer.consumerExec,
+          to: bhjJanino,
+          kind: 'local',
+          categoryOverride: 'sql-planning-aqe',
+          channel: 'internal',
+          protocol: 'WholeStageCodegen BHJ',
+          port: `${probeConsumer.hostName} in-JVM`,
+          label: 'Compile BHJ probe loop',
+          info: `Janino compiles WholeStageCodegenExec fusing Scan -> BroadcastHashJoinExec probe -> Project over Tungsten UnsafeRows on ${probeConsumer.hostName}.`,
+          size: 'in-memory',
+          command: 'CodeGenerator.compile(bhjProbeCode) -> GeneratedIterator',
+          fields: [{ name: 'compiler', value: 'Janino SimpleCompiler' }],
+          senderState: 'Probing HashedRelation in fused loop',
+          receiverState: 'Emitting joined Tungsten UnsafeRows',
+        });
+        b.addEvent({
+          stepId: sBcast,
+          from: bhjJanino,
+          to: bhjTungsten,
+          kind: 'local',
+          categoryOverride: 'sql-planning-aqe',
+          channel: 'internal',
+          protocol: 'Tungsten UnsafeRow',
+          port: `${probeConsumer.hostName} in-JVM`,
+          label: 'Emit joined UnsafeRows',
+          info: 'Joined fact + dimension columns are written directly into binary Tungsten UnsafeRow buffers without JVM object boxing.',
+          size: 'in-memory',
+          command: 'GenerateUnsafeRowJoiner -> UnsafeRow',
+          fields: [{ name: 'format', value: 'Tungsten binary UnsafeRow' }],
+          senderState: 'Joined row buffer populated',
+          receiverState: 'Streaming to FileFormatWriter',
         });
       }
 
@@ -3937,6 +4365,29 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       ],
       deepDiveComponentId: 'dataset-encoder-udf',
     });
+    const closureCleaner = b.std('closure-cleaner');
+    b.addEvent({
+      stepId: sJvmPlan,
+      from: jvmApp,
+      to: closureCleaner,
+      kind: 'local',
+      categoryOverride: 'sql-planning-aqe',
+      channel: 'internal',
+      protocol: 'SparkClosureCleaner (ASM)',
+      port: `${b.driverHost} in-JVM`,
+      label: b.isJava ? 'Clean Java SerializedLambda' : 'Clean Scala $anonfun$',
+      info: b.isJava
+        ? 'SparkClosureCleaner validates Java MapFunction / UDF1 SerializedLambda serializability on the driver before task dispatch.'
+        : 'SparkClosureCleaner inspects Scala Function1 ASM bytecode, strips unused $outer pointers, and verifies JavaSerializer serializability on the driver.',
+      size: 'in-memory',
+      command: 'SparkClosureCleaner.clean(userFn, checkSerializable=true)',
+      fields: [
+        { name: 'cleaner', value: 'SparkClosureCleaner (ASM9 + JavaSerializer check)' },
+        { name: 'jvmOnly', value: 'Scala/Java native closure cleaning (0 cloudpickle)' },
+      ],
+      senderState: 'Cleaned user Dataset.map & UDF closures on driver',
+      receiverState: 'Closures verified Serializable for executor shipping',
+    });
     b.addEvent({
       stepId: sJvmPlan,
       from: jvmApp,
@@ -4113,6 +4564,42 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         ],
         senderState: 'Evaluated typed Dataset & scalar JVM UDF in-JVM',
         receiverState: 'Produced Tungsten UnsafeRow output for Parquet write',
+      });
+      const jvmJanino = b.execLocalComponentInstance(execConsumer.consumerExec, 'janino-code-generator', 'Janino');
+      const jvmTungsten = b.execLocalComponentInstance(execConsumer.consumerExec, 'tungsten-unsafe-row', 'UnsafeRow');
+      b.addEvent({
+        stepId: sJvmExec,
+        from: execEncoder,
+        to: jvmJanino,
+        kind: 'local',
+        categoryOverride: 'sql-planning-aqe',
+        channel: 'internal',
+        protocol: 'Janino CodeGenerator',
+        port: `${execConsumer.hostName} in-JVM`,
+        label: 'Compile inline UDF loop',
+        info: `Janino compiles WholeStageCodegenExec fusing MapElements + inline ${b.isJava ? 'Java UDF1' : 'ScalaUDF'} inside one BufferedRowIterator on ${execConsumer.hostName}.`,
+        size: 'in-memory',
+        command: 'CodeGenerator.compile(fusedDatasetUdfCode) -> GeneratedIterator',
+        fields: [{ name: 'compiler', value: 'Janino SimpleCompiler (cached)' }],
+        senderState: 'Inlined ScalaUDF/Java UDF1 into generated Java bytecode',
+        receiverState: 'Compiled fused iterator writing Tungsten UnsafeRows',
+      });
+      b.addEvent({
+        stepId: sJvmExec,
+        from: jvmJanino,
+        to: jvmTungsten,
+        kind: 'local',
+        categoryOverride: 'sql-planning-aqe',
+        channel: 'internal',
+        protocol: 'Tungsten UnsafeRow',
+        port: `${execConsumer.hostName} in-JVM`,
+        label: 'Write scored UnsafeRow',
+        info: 'Scored Dataset + scalar JVM UDF results are serialized directly into binary Tungsten UnsafeRow pages for Parquet encoding.',
+        size: 'in-memory',
+        command: 'SerializeFromObject -> UnsafeRow -> SingleDirectoryDataWriter',
+        fields: [{ name: 'format', value: 'Tungsten binary UnsafeRow (0 Python IPC)' }],
+        senderState: 'Evaluated inline UDF inside compiled loop',
+        receiverState: 'Output UnsafeRows ready for Parquet write',
       });
       b.addEvent({
         stepId: sJvmExec,

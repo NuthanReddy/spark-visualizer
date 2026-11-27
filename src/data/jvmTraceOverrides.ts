@@ -5743,41 +5743,203 @@ function buildFlowShuffleAggregation(trace: TraceLesson, v: JvmLangVars): TraceL
   const writeShort = v.isJava ? 'write().mode("overwrite").parquet()' : 'write.mode("overwrite").parquet()';
 
   const step0 = {
-    title: `${v.langLabel} write action invokes SparkSession in-JVM & Catalyst plans 2 stages`,
+    title: `${v.langLabel} write invokes Catalyst Analyzer -> Optimizer -> WholeStageCodegen *(1,2)`,
     explanation:
-      `${v.appShort} executes ${writeCall} directly inside the Driver JVM (zero Py4J loopback). SparkSession passes the logical plan to Catalyst sql-planner, which pushes down status='PAID', inserts partial HashAggregate, ShuffleExchangeExec(hashpartitioning(region, 200)), final HashAggregate, and InsertIntoHadoopFsRelationCommand.`,
-    keyState: 'Physical plan has 1 Exchange boundary -> 2 stages (pure JVM)',
+      `${v.appShort} executes ${writeCall} directly inside the Driver JVM (zero Py4J loopback). SparkSession drives Catalyst Analyzer (schema binding), Catalyst Optimizer (predicate pushdown + column pruning), SQL Planner, ShuffleExchangeExec(hashpartitioning(region, 200)), and WholeStageCodegenExec.doCodeGen() to fuse map *(1) and reduce *(2) Java loops before submitting the 2-stage DAG.`,
+    keyState: 'Catalyst + ShuffleExchange + WholeStageCodegen *(1,2) fused in pure JVM',
     command: writeCall,
     detailsPassed: [
       { name: 'invocation', value: `Direct in-JVM ${v.langLabel} DataFrameWriter call (zero Py4J)` },
       { name: 'pushedFilter', value: 'IsNotNull(status) AND EqualTo(status, "PAID")' },
       { name: 'exchange', value: 'ShuffleExchangeExec(hashpartitioning(region, 200))' },
-      { name: 'saveMode', value: 'overwrite -> hdfs:///out/by_region' },
+      { name: 'codegen', value: 'WholeStageCodegenExec *(1) map & *(2) reduce Java source' },
     ],
   };
 
+  const step2 = {
+    ...trace.steps[2],
+    title: 'Map task compiles *(1) via Janino, scans Parquet into Tungsten UnsafeRow & Partial HashAggregate',
+    explanation:
+      'On worker-a, ShuffleMapTask (taskId=12) compiles/hits Janino CodeGenerator for WholeStageCodegen stage *(1), streams its Parquet split from local HDFS DataNode :9866 into binary Tungsten UnsafeRow pages, filters status=\'PAID\', and accumulates partial per-region counts in HashAggregateExec (UnsafeFixedWidthAggregationMap) before feeding ShuffleWriter.',
+    keyState: 'Janino compiled *(1) | Tungsten UnsafeRow + Partial HashAggregate on worker-a',
+  };
+
+  const step5 = {
+    ...trace.steps[5],
+    title: 'ShuffleReader streams remote blocks into Janino *(2) & Final HashAggregate',
+    explanation:
+      'ShuffleBlockFetcherIterator fetches remote shuffle slices over Netty (worker-a:42001 -> worker-b) bounded by spark.reducer.maxSizeInFlight (48m). Janino CodeGenerator executes stage *(2) Final HashAggregateExec over Tungsten UnsafeRows before writing Parquet.',
+    keyState: 'Remote shuffle bytes merged by Janino *(2) Final HashAggregate on worker-b',
+  };
+
   const remainingMessages = trace.messages
-    .filter((m) => m.id !== 'sa-1' && m.id !== 'sa-1b')
-    .map((m) => {
-      if (m.id === 'sa-12') {
-        return {
-          ...m,
-          senderState: `Driver commitJob() finished; ${writeShort} returns to ${v.appShort}`,
-        };
+    .filter((m) => m.id !== 'sa-1' && m.id !== 'sa-1b' && m.id !== 'sa-2' && m.id !== 'sa-2b' && m.id !== 'sa-5c')
+    .flatMap((m) => {
+      if (m.id === 'sa-5b') {
+        return [
+          m,
+          {
+            id: 'sa-jvm-5b-janino',
+            step: 2,
+            from: 'task-attempt' as const,
+            to: 'janino-code-generator' as const,
+            toInstance: 'worker-a-janino',
+            kind: 'local' as const,
+            channel: 'internal' as const,
+            protocol: 'Janino CodeGenerator',
+            port: 'worker-a in-JVM',
+            label: 'Compile stage *(1) loop',
+            info: 'Task 12 compiles/hits CodeGenerator.cache (Janino SimpleCompiler) for WholeStageCodegenExec stage *(1) fusing Scan -> Filter -> Partial HashAggregate.',
+            size: 'in-memory',
+            command: 'CodeGenerator.compile(stage1CodeAndComment) -> GeneratedIterator',
+            fields: [
+              { name: 'compiler', value: 'Janino SimpleCompiler (Guava SHA-256 cache)' },
+              { name: 'fusedOps', value: '*(1) ColumnarToRow -> Filter(PAID) -> Partial HashAggregate' },
+            ],
+            senderState: 'Executing compiled BufferedRowIterator.processNext()',
+            receiverState: 'Returned cached GeneratedIterator bytecode for stage *(1)',
+          },
+          {
+            id: 'sa-jvm-5b-tungsten',
+            step: 2,
+            from: 'janino-code-generator' as const,
+            fromInstance: 'worker-a-janino',
+            to: 'tungsten-unsafe-row' as const,
+            toInstance: 'worker-a-tungsten',
+            kind: 'local' as const,
+            channel: 'internal' as const,
+            protocol: 'Tungsten Binary Row',
+            port: 'worker-a in-JVM',
+            label: 'Filter 1.85M UnsafeRows',
+            info: 'Compiled stage *(1) evaluates status="PAID" directly on 8-byte-aligned Tungsten UnsafeRow memory with zero Java object boxing.',
+            size: '1.85M rows',
+            command: 'GeneratedIterator.processNext() // UnsafeRow binary filter',
+            fields: [
+              { name: 'rowsMatched', value: '1,850,000 PAID rows (zero JVM GC allocation)' },
+              { name: 'memoryLayout', value: '8-byte aligned UnsafeRow in TaskMemoryManager pages' },
+            ],
+            senderState: 'Streaming filtered UnsafeRow pointers into HashAggregate',
+            receiverState: 'Zero-copy binary rows ready for partial aggregation',
+          },
+          {
+            id: 'sa-jvm-5b-agg',
+            step: 2,
+            from: 'tungsten-unsafe-row' as const,
+            fromInstance: 'worker-a-tungsten',
+            to: 'hash-aggregate' as const,
+            toInstance: 'worker-a-hashagg',
+            kind: 'local' as const,
+            channel: 'internal' as const,
+            protocol: 'Tungsten HashAggregate',
+            port: 'worker-a in-JVM',
+            label: 'Partial HashAgg (480 keys)',
+            info: 'HashAggregateExec accumulates partial counts across 480 region keys inside two-level VectorizedHashMap / UnsafeFixedWidthAggregationMap.',
+            size: '480 partial rows',
+            command: 'HashAggregateExec(partial_count(1)) -> UnsafeFixedWidthAggregationMap',
+            fields: [
+              { name: 'aggMode', value: 'Map-side Partial HashAggregate (two-level Tungsten map)' },
+              { name: 'reduction', value: '1,850,000 rows -> 480 partial (region, count) rows' },
+            ],
+            senderState: 'All filtered rows aggregated into partial map',
+            receiverState: 'Draining 480 partial UnsafeRows to ShuffleWriter',
+          },
+          {
+            id: 'sa-5c',
+            step: 2,
+            from: 'hash-aggregate' as const,
+            fromInstance: 'worker-a-hashagg',
+            to: 'shuffle-writer' as const,
+            kind: 'local' as const,
+            channel: 'internal' as const,
+            protocol: 'In-JVM Iterator Pipeline',
+            port: 'worker-a in-JVM',
+            label: 'Feed partial counts',
+            info: 'Partial HashAggregate streams 480 (region, partialCount) UnsafeRows into BypassMergeSortShuffleWriter.write(), hashing by Murmur3(region) % 200.',
+            size: 'in-memory',
+            command: 'bypassMergeSortShuffleWriter.write(partialHashAggregateIterator)',
+            fields: [
+              { name: 'shuffleId', value: '0' },
+              { name: 'mapId', value: '12 (partition 12)' },
+              { name: 'writer', value: 'BypassMergeSortShuffleWriter (UnsafeRowSerializer)' },
+            ],
+            senderState: 'Finished draining partial HashAggregate map',
+            receiverState: 'Partitioned rows into 200 temp files; committing .data/.index',
+          },
+        ];
       }
-      return m;
+      if (m.id === 'sa-9') {
+        return [
+          m,
+          {
+            id: 'sa-jvm-9b-agg',
+            step: 5,
+            from: 'shuffle-reader' as const,
+            to: 'janino-code-generator' as const,
+            kind: 'local' as const,
+            channel: 'internal' as const,
+            protocol: 'Janino Stage *(2)',
+            port: 'worker-b in-JVM',
+            label: 'Compile *(2) Final Agg',
+            info: 'Reducer on worker-b compiles/hits Janino CodeGenerator for WholeStageCodegen stage *(2) wrapping Final HashAggregateExec.',
+            size: 'in-memory',
+            command: 'CodeGenerator.compile(stage2FinalAgg) -> GeneratedIterator',
+            fields: [
+              { name: 'codegenStage', value: '*(2) Final HashAggregateExec' },
+              { name: 'serializer', value: 'UnsafeRowSerializer (zero object boxing)' },
+            ],
+            senderState: 'Streaming deserialized partial UnsafeRows into stage *(2)',
+            receiverState: 'Compiled Final HashAggregate loop active on worker-b',
+          },
+          {
+            id: 'sa-jvm-9c-agg',
+            step: 5,
+            from: 'janino-code-generator' as const,
+            to: 'hash-aggregate' as const,
+            kind: 'local' as const,
+            channel: 'internal' as const,
+            protocol: 'Final HashAggregateExec',
+            port: 'worker-b in-JVM',
+            label: 'Merge final region counts',
+            info: 'Final HashAggregateExec merges all 16 map partial counts per region inside UnsafeFixedWidthAggregationMap and feeds FileFormatWriter.',
+            size: '14 region rows',
+            command: 'HashAggregateExec(final count(1)) -> SingleDirectoryDataWriter',
+            fields: [
+              { name: 'aggMode', value: 'Reduce-side Final HashAggregate' },
+              { name: 'outputRows', value: '14 regions for partition 42' },
+            ],
+            senderState: 'Executed compiled stage *(2) aggregation loop',
+            receiverState: 'Final counts ready for Parquet encoding',
+          },
+        ];
+      }
+      if (m.id === 'sa-12') {
+        return [
+          {
+            ...m,
+            senderState: `Driver commitJob() finished; ${writeShort} returns to ${v.appShort}`,
+          },
+        ];
+      }
+      return [m];
     });
 
   return {
     ...preserveMeta(trace),
     name: `End-to-End Shuffle & Parquet Write (${v.langLabel})`,
     subtitle: v.isJava
-      ? 'orders.where("status = \'PAID\'").groupBy("region").count().write().mode("overwrite").parquet(...) across map, shuffle & commit'
-      : 'orders.where("status = \'PAID\'").groupBy("region").count().write.mode("overwrite").parquet(...) across map, shuffle & commit',
+      ? 'orders.where("status = \'PAID\'").groupBy("region").count().write().mode("overwrite").parquet(...) via Catalyst, WholeStageCodegen & Tungsten'
+      : 'orders.where("status = \'PAID\'").groupBy("region").count().write.mode("overwrite").parquet(...) via Catalyst, WholeStageCodegen & Tungsten',
     summary:
-      `Follows a pure-JVM ${v.langLabel} SQL aggregation and Parquet write from ${v.appShort} in-JVM DataFrameWriter action through Catalyst planning, two-stage DAG scheduling, HDFS block scan, BypassMergeSortShuffleWriter MapStatus registration via DAGScheduler, remote BlockTransferService shuffle fetch, Parquet part writing, and FileCommitProtocol algorithm 2 commit.`,
+      `Follows a pure-JVM ${v.langLabel} SQL aggregation and Parquet write from ${v.appShort} in-JVM DataFrameWriter through Catalyst Analyzer, Catalyst Optimizer, ShuffleExchangeExec, WholeStageCodegen *(1,2), Janino bytecode compilation, Tungsten UnsafeRow, two-phase HashAggregateExec, ShuffleWriter/Reader, and FileCommitProtocol algorithm 2.`,
     focusNodes: [
       'jvm-user-app',
+      'catalyst-analyzer',
+      'catalyst-optimizer',
+      'shuffle-exchange',
+      'whole-stage-codegen',
+      'janino-code-generator',
+      'tungsten-unsafe-row',
+      'hash-aggregate',
       ...trace.focusNodes.filter(
         (id) => id !== 'python-driver' && id !== 'py4j-gateway',
       ),
@@ -5792,9 +5954,39 @@ function buildFlowShuffleAggregation(trace: TraceLesson, v: JvmLangVars): TraceL
         hostLabel: 'driver-1 (AM)',
         processId: 'AM Driver JVM',
       },
+      {
+        id: 'worker-a-janino',
+        componentId: 'janino-code-generator',
+        hostZone: 'worker-node-a',
+        label: 'Janino CodeGen (Exec 1)',
+        shortLabel: 'Janino (A)',
+        hostLabel: 'worker-a',
+        processId: 'Executor 1 JVM (worker-a)',
+        executorNumber: 1,
+      },
+      {
+        id: 'worker-a-tungsten',
+        componentId: 'tungsten-unsafe-row',
+        hostZone: 'worker-node-a',
+        label: 'Tungsten UnsafeRow (Exec 1)',
+        shortLabel: 'UnsafeRow (A)',
+        hostLabel: 'worker-a',
+        processId: 'Executor 1 JVM (worker-a)',
+        executorNumber: 1,
+      },
+      {
+        id: 'worker-a-hashagg',
+        componentId: 'hash-aggregate',
+        hostZone: 'worker-node-a',
+        label: 'Partial HashAggregate (Exec 1)',
+        shortLabel: 'Partial HashAgg',
+        hostLabel: 'worker-a',
+        processId: 'Executor 1 JVM (worker-a)',
+        executorNumber: 1,
+      },
       ...(trace.customInstances ?? []),
     ],
-    steps: [step0, ...trace.steps.slice(1)],
+    steps: [step0, trace.steps[1], step2, trace.steps[3], trace.steps[4], step5, ...trace.steps.slice(6)],
     messages: [
       {
         id: 'sa-1',
@@ -5817,7 +6009,128 @@ function buildFlowShuffleAggregation(trace: TraceLesson, v: JvmLangVars): TraceL
           { name: 'entryPoint', value: 'Direct in-JVM DataFrameWriter.save() (zero Py4J)' },
         ],
         senderState: `${v.appShort} blocked on synchronous ${writeShort} action`,
-        receiverState: 'Handing logical write plan to Catalyst sql-planner',
+        receiverState: 'Handing logical write plan to Catalyst Analyzer',
+      },
+      {
+        id: 'sa-jvm-0-analyze',
+        step: 0,
+        from: 'spark-session',
+        to: 'catalyst-analyzer',
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'Catalyst Analyzer',
+        port: 'driver-1 in-JVM',
+        label: 'Resolve catalog & types',
+        info: 'Catalyst Analyzer binds orders Parquet schema, resolves [status, region] ExprIds, and type-checks count(1) on driver-1.',
+        size: 'in-memory',
+        command: 'Analyzer.executeAndCheck(unresolvedPlan)',
+        fields: [
+          { name: 'boundSchema', value: 'status#12: string, region#13: string' },
+          { name: 'aggType', value: 'count(1) AS count#42L (bigint)' },
+        ],
+        senderState: 'Created QueryExecution for write.parquet()',
+        receiverState: 'Produced resolved Analyzed LogicalPlan',
+      },
+      {
+        id: 'sa-jvm-0-opt',
+        step: 0,
+        from: 'catalyst-analyzer',
+        to: 'catalyst-optimizer',
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'Catalyst Optimizer',
+        port: 'driver-1 in-JVM',
+        label: 'Pushdown PAID + prune',
+        info: 'Catalyst Optimizer pushes status="PAID" down into Parquet scan filters and prunes all unused columns.',
+        size: 'in-memory',
+        command: 'SparkOptimizer.execute(analyzedPlan) // PushDownPredicates + ColumnPruning',
+        fields: [
+          { name: 'pushedFilter', value: 'IsNotNull(status) AND EqualTo(status, "PAID")' },
+          { name: 'prunedCols', value: '[status, region] only' },
+        ],
+        senderState: 'Handed analyzed plan to SparkOptimizer',
+        receiverState: 'Produced optimized LogicalPlan',
+      },
+      {
+        id: 'sa-2',
+        step: 0,
+        from: 'catalyst-optimizer',
+        to: 'sql-planner',
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'SparkPlanner Strategies',
+        port: 'driver-1 in-JVM',
+        label: 'Plan 2-phase HashAgg',
+        info: 'SQL Planner lowers Aggregate into map-side Partial HashAggregate and reduce-side Final HashAggregate.',
+        size: 'in-memory',
+        command: 'SparkPlanner.plan(optimizedPlan) -> Partial HashAgg + Final HashAgg',
+        fields: [
+          { name: 'partialAgg', value: 'HashAggregate(keys=[region], partial_count(1))' },
+          { name: 'finalAgg', value: 'HashAggregate(keys=[region], count(1))' },
+        ],
+        senderState: 'Optimized plan ready for physical strategy selection',
+        receiverState: 'Selected Partial/Final HashAggregateExec; running EnsureRequirements',
+      },
+      {
+        id: 'sa-jvm-0-exch',
+        step: 0,
+        from: 'sql-planner',
+        to: 'shuffle-exchange',
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'EnsureRequirements',
+        port: 'driver-1 in-JVM',
+        label: 'Insert Exchange(200)',
+        info: 'EnsureRequirements inserts ShuffleExchangeExec(hashpartitioning(region, 200)) with UnsafeRowSerializer between Partial and Final HashAggregate.',
+        size: 'in-memory',
+        command: 'EnsureRequirements -> ShuffleExchangeExec(hashpartitioning(region, 200))',
+        fields: [
+          { name: 'partitioning', value: 'HashPartitioning(region, 200)' },
+          { name: 'serializer', value: 'UnsafeRowSerializer (binary Tungsten rows)' },
+        ],
+        senderState: 'Satisfied ClusteredDistribution(region) requirement',
+        receiverState: 'Created ShuffleDependency(shuffleId=0) boundary',
+      },
+      {
+        id: 'sa-jvm-0-codegen',
+        step: 0,
+        from: 'shuffle-exchange',
+        to: 'whole-stage-codegen',
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'CollapseCodegenStages',
+        port: 'driver-1 in-JVM',
+        label: 'Fuse Codegen *(1) & *(2)',
+        info: 'CollapseCodegenStages wraps map pipeline *(1) and reduce pipeline *(2) in WholeStageCodegenExec; doCodeGen() emits tight Java BufferedRowIterator source on driver-1.',
+        size: 'in-memory',
+        command: 'WholeStageCodegenExec.doCodeGen() // *(1) Scan+Filter+PartialAgg, *(2) FinalAgg',
+        fields: [
+          { name: 'stage1Codegen', value: '*(1) FileScan -> Filter -> Partial HashAggregate' },
+          { name: 'stage2Codegen', value: '*(2) Final HashAggregate (consumes ShuffleExchange)' },
+        ],
+        senderState: 'Split query into 2 codegen-eligible stages',
+        receiverState: 'Generated Java source ready for executor Janino compilation',
+      },
+      {
+        id: 'sa-2b',
+        step: 0,
+        from: 'whole-stage-codegen',
+        to: 'dag-scheduler',
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM SparkContext.runJob',
+        port: 'driver-1 in-JVM',
+        label: 'Submit 2-stage DAG',
+        info: 'FileFormatWriter invokes SparkContext.runJob() on the codegen-wrapped ShuffledRowRDD, submitting the 2-stage lineage graph to DAGScheduler.',
+        size: 'in-memory',
+        command: 'sparkContext.runJob(shuffledRowRdd, FileFormatWriter.executeTask)',
+        fields: [
+          { name: 'jobId', value: '1 (FileFormatWriter.write)' },
+          { name: 'shuffleDependency', value: 'ShuffleDependency(shuffleId=0, HashPartitioner(200))' },
+          { name: 'stagesPlanned', value: 'ShuffleMapStage 0 (*(1)) -> ResultStage 1 (*(2))' },
+        ],
+        senderState: 'Submitted fused WholeStageCodegen executedPlan',
+        receiverState: 'Cutting RDD lineage at ShuffleDependency into Stage 0 & Stage 1',
       },
       ...remainingMessages,
     ],

@@ -186,19 +186,33 @@ const DATA_COMPONENTS = new Set<ComponentId>([
   'block-transfer-service',
   'memory-manager',
   'serializer-manager',
+  'kryo-registrator',
   'context-cleaner',
   'block-manager-decommissioner',
   'transport-context',
   'rdd-cache',
+  'columnar-cache',
   'broadcast-manager',
+  'shuffle-exchange',
   'shuffle-writer',
   'shuffle-reader',
   'shuffle-block-resolver',
   'external-shuffle-service',
   'push-based-shuffle',
+  'jvm-partitioner-pair-rdd',
   'broadcast-exchange',
   'broadcast-hash-join',
+  'sort-merge-join',
+  'hash-aggregate',
+  'window-sort-exec',
+  'tungsten-unsafe-row',
+  'janino-code-generator',
+  'whole-stage-codegen',
   'dataset-encoder-udf',
+  'typed-dataset-ops',
+  'key-value-grouped-dataset',
+  'scala-java-udf',
+  'typed-aggregator',
   'file-format-writer',
   'file-commit-protocol',
   'datasource-v2',
@@ -207,7 +221,11 @@ const DATA_COMPONENTS = new Set<ComponentId>([
 const PYTHON_COMPONENTS = new Set<ComponentId>([
   'python-driver',
   'py4j-gateway',
+  'cloudpickle-serializer',
+  'python-accumulator-v2',
   'python-udf-operator',
+  'arrow-pandas-udf-engine',
+  'python-udtf-exec',
   'python-worker-factory',
   'python-worker',
   'python-runner',
@@ -2003,7 +2021,9 @@ export default function App() {
               SPARK <em>VISUALIZER</em>
             </span>
             <span className="brand-tagline">
-              SPARK ON YARN | {COMPONENT_LIST.length} COMPONENTS | {ALL_TRACES.length} TRACES
+              {(SPARK_LANGUAGES.find((l) => l.id === activeLanguage)?.label ?? 'PySpark').toUpperCase()} ON YARN |{' '}
+              {COMPONENT_LIST.filter((c) => !c.languages || c.languages.includes(activeLanguage)).length}/
+              {COMPONENT_LIST.length} COMPONENTS | {ALL_TRACES.length} TRACES
             </span>
           </span>
         </a>
@@ -2015,16 +2035,20 @@ export default function App() {
         >
           {SPARK_LANGUAGES.map((langMeta) => {
             const isActive = activeLanguage === langMeta.id;
+            const langCompCount = COMPONENT_LIST.filter(
+              (c) => !c.languages || c.languages.includes(langMeta.id),
+            ).length;
             return (
               <button
                 key={langMeta.id}
                 type="button"
                 className={`lang-btn lang-${langMeta.id} ${isActive ? 'active' : ''}`}
                 aria-pressed={isActive}
-                title={langMeta.description}
+                title={`${langMeta.label} (${langCompCount}/${COMPONENT_LIST.length} components): ${langMeta.description}`}
                 onClick={() => handleLanguageChange(langMeta.id)}
               >
-                {langMeta.label}
+                <span>{langMeta.label}</span>
+                <span className="lang-btn-count">{langCompCount}</span>
               </button>
             );
           })}
@@ -2187,7 +2211,11 @@ export default function App() {
                   onClick={() => handleViewChange('cluster')}
                 >
                   <MapIcon size={13} aria-hidden="true" />
-                  <span>All {COMPONENT_LIST.length} Map</span>
+                  <span>
+                    {SPARK_LANGUAGES.find((l) => l.id === activeLanguage)?.short ?? 'PySpark'} Map (
+                    {COMPONENT_LIST.filter((c) => !c.languages || c.languages.includes(activeLanguage)).length}/
+                    {COMPONENT_LIST.length})
+                  </span>
                 </button>
                 <button
                   type="button"

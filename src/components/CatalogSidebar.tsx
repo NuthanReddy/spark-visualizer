@@ -119,7 +119,7 @@ export default function CatalogSidebar({
   onCloseMobile,
 }: CatalogSidebarProps) {
   const selectedEntryRef = useRef<HTMLDivElement>(null);
-  const [langFocusOnly, setLangFocusOnly] = useState(false);
+  const [langFocusOnly, setLangFocusOnly] = useState(true);
 
   const activeFrameIndex = activeEventId
     ? (projection.frameIndexByEventId.get(activeEventId) ?? -1)
@@ -199,15 +199,41 @@ export default function CatalogSidebar({
     return rows;
   }, [activeRun, projection, expandedStepIds, activeFrame]);
 
+  const langLifecycleTraces = useMemo(
+    () =>
+      lifecycleTraces.filter((trace) =>
+        getEffectiveTraceLanguages(trace).includes(activeLanguage),
+      ),
+    [lifecycleTraces, activeLanguage],
+  );
+
+  const langScenarioTraces = useMemo(
+    () =>
+      scenarioTraces.filter((trace) =>
+        getEffectiveTraceLanguages(trace).includes(activeLanguage),
+      ),
+    [scenarioTraces, activeLanguage],
+  );
+
+  const langComponentTraces = useMemo(
+    () =>
+      componentTraces.filter((trace) =>
+        getEffectiveTraceLanguages(trace).includes(activeLanguage),
+      ),
+    [componentTraces, activeLanguage],
+  );
+
+  const activeComponentPool = langFocusOnly ? langComponentTraces : componentTraces;
+
   const subsystemCounts = useMemo(() => {
     const counts: Partial<Record<SubsystemId, number>> = {};
-    for (const trace of componentTraces) {
+    for (const trace of activeComponentPool) {
       if (trace.subsystem) {
         counts[trace.subsystem] = (counts[trace.subsystem] ?? 0) + 1;
       }
     }
     return counts;
-  }, [componentTraces]);
+  }, [activeComponentPool]);
 
   const baseTraces = useMemo(() => {
     if (mode === 'lifecycle') return lifecycleTraces;
@@ -235,6 +261,18 @@ export default function CatalogSidebar({
 
   const totalCount =
     lifecycleTraces.length + scenarioTraces.length + componentTraces.length;
+  const activeLangTotalCount =
+    langLifecycleTraces.length + langScenarioTraces.length + langComponentTraces.length;
+  const displayedLifecycleCount = langFocusOnly
+    ? langLifecycleTraces.length
+    : lifecycleTraces.length;
+  const displayedScenarioCount = langFocusOnly
+    ? langScenarioTraces.length
+    : scenarioTraces.length;
+  const displayedComponentCount = langFocusOnly
+    ? langComponentTraces.length
+    : componentTraces.length;
+  const displayedTotalCount = langFocusOnly ? activeLangTotalCount : totalCount;
 
   const totalSkippedEvents = useMemo(
     () => projection.skippedSpans.reduce((sum, span) => sum + span.eventCount, 0),
@@ -394,8 +432,15 @@ export default function CatalogSidebar({
     <aside className="catalog-panel panel" aria-label="Spark trace and component catalog">
       <div className="section-heading">
         <h1>TRACE CATALOG</h1>
-        <span className="catalog-total" title="Total interactive traces">
-          {totalCount}
+        <span
+          className="catalog-total"
+          title={
+            langFocusOnly
+              ? `${activeLanguageLabel}: ${activeLangTotalCount} active traces (${totalCount} total across all languages)`
+              : `All ${totalCount} interactive traces across PySpark, Scala & Java`
+          }
+        >
+          {displayedTotalCount}
         </span>
         <button
           type="button"
@@ -416,7 +461,7 @@ export default function CatalogSidebar({
           onClick={() => onModeChange('lifecycle')}
         >
           <span>Lifecycle</span>
-          <span className="tab-count">{lifecycleTraces.length}</span>
+          <span className="tab-count">{displayedLifecycleCount}</span>
         </button>
         <button
           type="button"
@@ -426,7 +471,7 @@ export default function CatalogSidebar({
           onClick={() => onModeChange('scenario')}
         >
           <span>Scenarios</span>
-          <span className="tab-count">{scenarioTraces.length}</span>
+          <span className="tab-count">{displayedScenarioCount}</span>
         </button>
         <button
           type="button"
@@ -436,7 +481,7 @@ export default function CatalogSidebar({
           onClick={() => onModeChange('component')}
         >
           <span>Components</span>
-          <span className="tab-count">{componentTraces.length}</span>
+          <span className="tab-count">{displayedComponentCount}</span>
         </button>
       </nav>
 
@@ -452,7 +497,7 @@ export default function CatalogSidebar({
             aria-pressed={subsystemFilter === 'all'}
             onClick={() => onSubsystemFilterChange('all')}
           >
-            All <span>{componentTraces.length}</span>
+            All <span>{displayedComponentCount}</span>
           </button>
           {SUBSYSTEM_ORDER.map((sub) => (
             <button
@@ -479,20 +524,21 @@ export default function CatalogSidebar({
         <div className="sidebar-lang-filter-pills">
           <button
             type="button"
-            className={`sidebar-lang-chip ${!langFocusOnly ? 'active' : ''}`}
-            aria-pressed={!langFocusOnly}
-            onClick={() => setLangFocusOnly(false)}
-          >
-            All <span>{baseTraces.length}</span>
-          </button>
-          <button
-            type="button"
             className={`sidebar-lang-chip ${langFocusOnly ? 'active' : ''}`}
             aria-pressed={langFocusOnly}
             title={`Show only traces supporting ${activeLanguageLabel}`}
             onClick={() => setLangFocusOnly(true)}
           >
             {activeLanguageLabel} <span>{langMatchedTraces.length}</span>
+          </button>
+          <button
+            type="button"
+            className={`sidebar-lang-chip ${!langFocusOnly ? 'active' : ''}`}
+            aria-pressed={!langFocusOnly}
+            title="Show traces across all languages"
+            onClick={() => setLangFocusOnly(false)}
+          >
+            All <span>{baseTraces.length}</span>
           </button>
         </div>
       </div>

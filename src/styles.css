@@ -5046,6 +5046,7 @@ kbd {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 5px;
   padding: 5px 10px;
   font-family: var(--font-mono);
   font-size: 10px;
@@ -5054,6 +5055,64 @@ kbd {
   color: var(--muted);
   border-right: 1px solid var(--border);
   white-space: nowrap;
+}
+
+.lang-btn-count {
+  font-size: 9px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  padding: 0 4px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--border) 42%, transparent);
+  color: var(--faint);
+}
+
+.lang-btn.active .lang-btn-count {
+  background: color-mix(in srgb, currentColor 18%, transparent);
+  color: currentColor;
+}
+
+.cluster-map-lang-hud {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.cluster-map-lang-hud strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.cluster-map-lang-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--accent);
+  flex-shrink: 0;
+}
+
+.cluster-map-lang-hud.lang-pyspark .cluster-map-lang-dot {
+  background: var(--ch-python);
+}
+
+.cluster-map-lang-hud.lang-scala .cluster-map-lang-dot {
+  background: var(--ch-data);
+}
+
+.cluster-map-lang-hud.lang-java .cluster-map-lang-dot {
+  background: var(--ch-rpc);
 }
 
 .lang-btn:last-child {

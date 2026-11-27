@@ -659,6 +659,37 @@ export default function ClusterMapCanvas({
   );
   const totalAtDepth = visibleCount + hiddenCount;
 
+  const langCoverage = useMemo(() => {
+    const total = COMPONENT_LIST.length;
+    let active = 0;
+    let shared = 0;
+    let specific = 0;
+    for (const c of COMPONENT_LIST) {
+      const langs = c.languages;
+      const isShared = !langs || langs.length >= 3;
+      const isSupported = !langs || langs.includes(activeLanguage);
+      if (isSupported) {
+        active += 1;
+        if (isShared) shared += 1;
+        else specific += 1;
+      }
+    }
+    const label =
+      activeLanguage === 'pyspark'
+        ? 'PySpark'
+        : activeLanguage === 'scala'
+          ? 'Scala'
+          : 'Java';
+    return {
+      label,
+      active,
+      shared,
+      specific,
+      dimmed: total - active,
+      total,
+    };
+  }, [activeLanguage]);
+
   return (
     <div
       className="cluster-map-wrap"
@@ -670,6 +701,21 @@ export default function ClusterMapCanvas({
         background: 'var(--page)',
       }}
     >
+      {/* Active-language coverage HUD */}
+      <div
+        className={`cluster-map-lang-hud lang-${activeLanguage}`}
+        aria-label={`${langCoverage.label} active architecture component summary`}
+      >
+        <span className="cluster-map-lang-dot" aria-hidden="true" />
+        <strong>
+          {langCoverage.label}: {langCoverage.active}/{langCoverage.total}
+        </strong>
+        <span>
+          {langCoverage.shared} shared JVM/SQL + {langCoverage.specific} {langCoverage.label}
+          -specific · {langCoverage.dimmed} other dimmed
+        </span>
+      </div>
+
       {/* Floating pan/zoom HUD */}
       <div
         className="cluster-map-controls"
@@ -768,7 +814,7 @@ export default function ClusterMapCanvas({
               transition: opacity 150ms ease;
             }
             .cluster-node.map-node-lang-dim {
-              opacity: 0.44;
+              opacity: 0.22;
             }
             .cluster-node.map-node-lang-dim .sv-map-card {
               stroke-dasharray: 4 3;

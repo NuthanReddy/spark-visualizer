@@ -1,7 +1,7 @@
 import type { ComponentSpec } from './types';
 
 export type CatalystJvmComponentId =
-  // 11 Shared Core / Catalyst / Codegen / Tungsten / SQL components
+  // 13 Shared Core / Catalyst / Codegen / Tungsten / SQL components
   | 'security-manager'
   | 'user-classloader'
   | 'resource-profile-manager'
@@ -13,14 +13,26 @@ export type CatalystJvmComponentId =
   | 'tungsten-unsafe-row'
   | 'hash-aggregate'
   | 'sort-merge-join'
-  // 7 Scala & Java Native JVM components (NOT in PySpark)
+  | 'window-sort-exec'
+  | 'dynamic-partition-pruning'
+  // 12 Scala & Java Native JVM components (NOT in PySpark)
   | 'closure-cleaner'
   | 'kryo-registrator'
   | 'typed-dataset-ops'
+  | 'key-value-grouped-dataset'
   | 'scala-java-udf'
   | 'typed-aggregator'
+  | 'spark-session-extensions'
+  | 'jvm-partitioner-pair-rdd'
+  | 'jvm-accumulator-v2'
   | 'scala-repl-compiler'
-  | 'java-spark-api';
+  | 'scala-reflection-implicits'
+  | 'java-spark-api'
+  // 4 PySpark-Specific Engine Components (NOT in Scala/Java)
+  | 'cloudpickle-serializer'
+  | 'python-accumulator-v2'
+  | 'arrow-pandas-udf-engine'
+  | 'python-udtf-exec';
 
 const SPARK_SHA = 'dada2a6db5d73b152d6ba16e4fe21406f86abfe3';
 const SPARK_BLOB = `https://github.com/apache/spark/blob/${SPARK_SHA}`;
@@ -888,5 +900,515 @@ export const CATALYST_JVM_COMPONENTS: Record<CatalystJvmComponentId, ComponentSp
       },
     ],
     docFile: 'java-spark-api.md',
+  },
+
+  'spark-session-extensions': {
+    id: 'spark-session-extensions',
+    name: 'SparkSessionExtensions (Catalyst Hooks)',
+    shortName: 'SessionExtensions',
+    subsystem: 'sql-execution',
+    hostZone: 'driver-jvm',
+    subZone: 'SQL PLANNING & SCHEDULERS',
+    clusterPos: [618, 606],
+    languages: ['scala', 'java'],
+    port: 'in-JVM plugin',
+    process: 'Driver JVM SparkSessionExtensions builder hook (Analyzer / Optimizer / Strategy / Columnar / Parser)',
+    role: 'Exposes the JVM-only Catalyst extension API (SparkSession.builder.withExtensions / spark.sql.extensions) allowing Scala and Java libraries (Delta Lake, Iceberg, Photon, custom engines) to inject custom Catalyst Analyzer rules, Optimizer rules, physical SparkPlanner Strategies, SQL parsers, columnar rules, and AQE query-stage prep rules directly into SessionState.',
+    keyDistinction:
+      'Custom Catalyst Rule[LogicalPlan], Strategy, and ColumnarRule extensions run strictly inside the Driver JVM and must be authored in Scala or Java (PySpark cannot register Python Catalyst rules).',
+    startedBy: 'Invoked during SparkSession.builder.withExtensions(...) or via spark.sql.extensions class names at SessionState creation',
+    monitoredBy: 'df.explain("extended") showing injected custom rules/operators and QueryPlanningTracker timings',
+    stoppedBy: 'Bound for the lifetime of the SparkSession and cloned into child sessions',
+    inputs: [
+      'Scala Function1[SparkSessionExtensions, Unit] or Java Consumer<SparkSessionExtensions>',
+      'Custom Resolution/Check/Optimizer rules, Planner Strategies, FunctionDescriptions, and ColumnarRules',
+    ],
+    outputs: [
+      'Extended Catalyst Analyzer, SparkOptimizer, SparkPlanner, and Columnar transition pipeline inside SessionState',
+      'Custom physical operators (e.g., MERGE INTO, custom scans, GPU columnar transitions)',
+    ],
+    internalState: [
+      'resolutionRuleBuilders, postHocResolutionRuleBuilders, optimizerRules, plannerStrategyBuilders',
+      'parserBuilders, injectedFunctions, columnarRuleBuilders, and adaptiveRuleBuilders',
+      'Ordered extension registration list applied on BaseSessionStateBuilder.build()',
+    ],
+    failureClues: [
+      'ClassNotFoundException in spark.sql.extensions means the Scala/Java extension JAR was omitted from --jars / driver classpath',
+      'Non-idempotent custom Catalyst Optimizer rule triggers maxIterations (100) warning and driver planning stalls',
+      'Unregistered custom logical node reaching SparkPlanner fails with "No plan for ..." strategy error',
+    ],
+    sourceLinks: [
+      {
+        label: 'SparkSessionExtensions rule & strategy hooks',
+        url: `${SPARK_BLOB}/sql/core/src/main/scala/org/apache/spark/sql/SparkSessionExtensions.scala#L55-L210`,
+      },
+    ],
+    docFile: 'spark-session-extensions.md',
+  },
+
+  'scala-reflection-implicits': {
+    id: 'scala-reflection-implicits',
+    name: 'ScalaReflection & spark.implicits',
+    shortName: 'ScalaReflection',
+    subsystem: 'driver-runtime',
+    hostZone: 'driver-jvm',
+    subZone: 'AM BRIDGE & DRIVER CORE',
+    clusterPos: [360, 734],
+    languages: ['scala'],
+    port: 'in-JVM TypeTag',
+    process: 'Driver JVM org.apache.spark.sql.catalyst.ScalaReflection + SQLImplicits (spark.implicits._)',
+    role: 'Inspects Scala compile-time TypeTag / Product / Option / Seq / Map metadata to synthesize Spark SQL StructTypes and zero-reflection ExpressionEncoder[T] serializers/deserializers powering spark.implicits._ conversions (.toDS(), .toDF(), .as[Order], $"col").',
+    keyDistinction:
+      'ScalaReflection + spark.implicits._ is exclusively Scala: Java uses JavaTypeInference + Encoders.bean(Order.class), while PySpark uses untyped Row/DataFrame schemas without compile-time Product encoders.',
+    startedBy: 'Triggered at compile-time/runtime whenever Scala code imports spark.implicits._ and creates a typed Dataset[T] or ScalaUDF',
+    monitoredBy: 'Scala compile-time implicit resolution errors ("Unable to find encoder for type stored in a Dataset") and Catalyst schema inspection',
+    stoppedBy: 'Compiled Encoder expressions are cached in Catalyst QueryExecution and garbage-collected with the plan',
+    inputs: [
+      'Scala case classes, tuples, Value Classes, Sealed Traits, and TypeTag[T] implicit evidence',
+      'SQLImplicits conversions (localSeqToDatasetHolder, rddToDatasetHolder, StringToColumn $"col")',
+    ],
+    outputs: [
+      'AgnosticEncoder[T] -> ExpressionEncoder[T] (Catalyst serializer & deserializer AST expressions)',
+      'Exact nullability metadata (primitive Double/Int vs Option[T]) driving ScalaUDF null guards',
+    ],
+    internalState: [
+      'ScalaReflection.encoderFor recursive TypeTag inspector and constructor/accessor binder',
+      'SQLImplicits low-priority/high-priority encoder implicits on SparkSession',
+      'Thread-safe Scala reflection mirror lock guarding universe symbol inspection',
+    ],
+    failureClues: [
+      '"Unable to find encoder for type stored in a Dataset" means missing import spark.implicits._ or unsupported non-Product type (use Encoders.kryo)',
+      'Case class defined inside a method body captures $outer reference; define case classes in a top-level package or Scala object',
+      'Primitive Scala fields (Double/Int) infer nullable=false unless wrapped in Option[T]',
+    ],
+    sourceLinks: [
+      {
+        label: 'ScalaReflection TypeTag & Product encoder synthesis',
+        url: `${SPARK_BLOB}/sql/api/src/main/scala/org/apache/spark/sql/catalyst/ScalaReflection.scala#L60-L195`,
+      },
+    ],
+    docFile: 'scala-reflection-implicits.md',
+  },
+
+  'dynamic-partition-pruning': {
+    id: 'dynamic-partition-pruning',
+    name: 'Dynamic Partition Pruning (DPP)',
+    shortName: 'Dynamic Part Pruning',
+    subsystem: 'sql-execution',
+    hostZone: 'driver-jvm',
+    subZone: 'SQL PLANNING & SCHEDULERS',
+    clusterPos: [818, 606],
+    languages: ['pyspark', 'scala', 'java'],
+    port: 'in-JVM / Broadcast',
+    process: 'Driver Catalyst PartitionPruning optimizer rule + PlanDynamicPruningFilters + SubqueryBroadcastExec',
+    role: 'Detects star-schema joins where a filtered dimension table joins a partitioned fact table on its partition column, inserts a DynamicPruningExpression subquery that reuses the BroadcastExchangeExec hash build, and skips reading non-matching HDFS partition directories before launching scan tasks.',
+    keyDistinction:
+      'Static partition pruning uses literal filters known at compile time; DPP evaluates the dimension side at runtime via SubqueryBroadcastExec and prunes fact-table FileSourceScanExec / BatchScanExec partitions dynamically.',
+    startedBy: 'Catalyst PartitionPruning rule (spark.sql.optimizer.dynamicPartitionPruning.enabled=true) and PlanDynamicPruningFilters physical strategy',
+    monitoredBy: 'SQL UI "dynamic partition pruning" scan metric (number of partitions pruned / read) and SubqueryBroadcastExec nodes',
+    stoppedBy: 'Broadcast subquery completes once the dimension BroadcastExchangeExec finishes, then fact scan tasks launch on surviving partitions only',
+    inputs: [
+      'Partitioned fact table scan joined to a selectively filtered dimension table on partition keys',
+      'BroadcastExchangeExec HashedRelation reused by SubqueryBroadcastExec (zero duplicate shuffle)',
+    ],
+    outputs: [
+      'Runtime DynamicPruningExpression filter keys applied inside FileSourceScanExec / BatchScanExec',
+      'Drastically reduced HDFS NameNode file listings, scan tasks, and shuffle bytes read',
+    ],
+    internalState: [
+      'PartitionPruning heuristic estimating pruning benefit ratio (reuseBroadcastOnly / fallbackFilterRatio)',
+      'SubqueryBroadcastExec reusing BroadcastQueryStageExec under AQE',
+      'Partition directory pruning filter evaluated before split creation',
+    ],
+    failureClues: [
+      'Missing SubqueryBroadcastExec in df.explain() when joining partitioned fact tables means filter was not selective enough or join was not broadcastable',
+      'Wrapping partition key in an opaque UDF blocks DPP because Catalyst cannot prove partition-column alignment',
+      'Verify SQL UI "number of partitions read" vs total table partitions to confirm runtime pruning fired',
+    ],
+    sourceLinks: [
+      {
+        label: 'PartitionPruning Catalyst optimizer rule',
+        url: `${SPARK_BLOB}/sql/core/src/main/scala/org/apache/spark/sql/execution/dynamicpruning/PartitionPruning.scala#L42-L165`,
+      },
+      {
+        label: 'SubqueryBroadcastExec runtime key broadcast',
+        url: `${SPARK_BLOB}/sql/core/src/main/scala/org/apache/spark/sql/execution/SubqueryBroadcastExec.scala#L35-L120`,
+      },
+    ],
+    docFile: 'dynamic-partition-pruning.md',
+  },
+
+  'key-value-grouped-dataset': {
+    id: 'key-value-grouped-dataset',
+    name: 'KeyValueGroupedDataset (MapGroups)',
+    shortName: 'KeyValueGroupedDS',
+    subsystem: 'sql-execution',
+    hostZone: 'worker-node-b',
+    clusterPos: [1818, 1114],
+    languages: ['scala', 'java'],
+    port: 'in-JVM groups',
+    process: 'Driver KeyValueGroupedDataset[K, V] + Executor MapGroupsExec / FlatMapGroupsExec / CoGroupExec',
+    role: 'Executes strongly-typed Scala and Java keyed group transformations (ds.groupByKey(k).mapGroups, flatMapGroups, reduceGroups, cogroup, agg) by shuffling on encoded key K, sorting partitions by K, and streaming typed (K, Iterator[V]) JVM objects directly into user closures on executor threads.',
+    keyDistinction:
+      'KeyValueGroupedDataset is exclusive to Scala and Java (PySpark uses untyped GroupedData / applyInPandas over Arrow sockets); unlike Typed Aggregator UDAFs, mapGroups shuffles all raw group values without map-side partial reduction.',
+    startedBy: 'Planned when Scala/Java code calls ds.groupByKey(...).mapGroups / flatMapGroups / cogroup',
+    monitoredBy: 'SQL UI MapGroups / CoGroup nodes, ShuffleExchange bytes written, and executor GC metrics',
+    stoppedBy: 'Finishes once all sorted key groups on each reduce partition are iterated and re-encoded to UnsafeRow',
+    inputs: [
+      'Shuffle-partitioned and key-sorted InternalRow stream from ShuffleExchangeExec + SortExec',
+      'Key Encoder[K], Value Encoder[V], Output Encoder[U], and cleaned Scala/Java group function',
+    ],
+    outputs: [
+      'Typed output objects serialized back into Tungsten UnsafeRow via SerializeFromObjectExec',
+      'Full stateful per-key streaming (or cogroup across two KeyValueGroupedDatasets) in pure JVM',
+    ],
+    internalState: [
+      'GroupedIterator grouping consecutive rows sharing equal UnsafeRow key prefix without buffering entire groups unless user materializes',
+      'DeserializeToObject key/value decoders + SerializeFromObject output encoder',
+      'CoGroupExec lockstep dual-side key group iterator for ds1.cogroup(ds2)',
+    ],
+    failureClues: [
+      'Prefer ds.groupByKey(...).agg(myAggregator.toColumn) or reduceGroups over mapGroups when partial map-side combining is possible (avoids full raw shuffle)',
+      'Calling iterator.toList inside mapGroups on a skewed hot key causes executor JVM heap OOM',
+      'EnsureRequirements inserts ShuffleExchange + SortExec automatically before MapGroupsExec',
+    ],
+    sourceLinks: [
+      {
+        label: 'KeyValueGroupedDataset Scala/Java typed group API',
+        url: `${SPARK_BLOB}/sql/core/src/main/scala/org/apache/spark/sql/classic/KeyValueGroupedDataset.scala#L60-L210`,
+      },
+      {
+        label: 'MapGroupsExec & CoGroupExec physical operators',
+        url: `${SPARK_BLOB}/sql/core/src/main/scala/org/apache/spark/sql/execution/objects.scala#L310-L430`,
+      },
+    ],
+    docFile: 'key-value-grouped-dataset.md',
+  },
+
+  'window-sort-exec': {
+    id: 'window-sort-exec',
+    name: 'WindowExec & Tungsten SortExec',
+    shortName: 'Window & SortExec',
+    subsystem: 'sql-execution',
+    hostZone: 'worker-node-b',
+    clusterPos: [2024, 1114],
+    languages: ['pyspark', 'scala', 'java'],
+    port: 'in-JVM frame',
+    process: 'Executor JVM SortExec (UnsafeExternalRowSorter + codegen) & WindowExec (WindowFunctionFrame)',
+    role: 'Executes SQL ORDER BY / local partition sorts via Tungsten SortExec (participating in WholeStageCodegenExec via UnsafeExternalRowSorter) and analytic window functions (ROW_NUMBER, RANK, LAG, rolling SUM OVER PARTITION BY ... ORDER BY ...) via WindowExec frame processors backed by spillable ExternalAppendOnlyUnsafeRowArray.',
+    keyDistinction:
+      'SortExec fuses into WholeStageCodegenExec using Tungsten binary pointer sorting, while WindowExec consumes sorted partition streams and maintains sliding/unbounded/range frame buffers that spill to local disk when a single window partition grows large.',
+    startedBy: 'SparkPlanner BasicOperators / EnsureRequirements inserts SortExec and WindowExec for ORDER BY, SortMergeJoin, and OVER() expressions',
+    monitoredBy: 'SQL UI Sort & Window metrics (peakMemory, spillSize, sortTime) and WindowGroupLimitExec top-K optimization',
+    stoppedBy: 'Releases UnsafeExternalRowSorter and ExternalAppendOnlyUnsafeRowArray spill files on task completion',
+    inputs: [
+      'Partitioned InternalRow / UnsafeRow stream (ShuffleExchangeExec by PARTITION BY keys)',
+      'Window expressions (AggregateWindowFunction, OffsetWindowFunction, Sliding/Unbounded/Range WindowFunctionFrame)',
+    ],
+    outputs: [
+      'Key-ordered UnsafeRow stream (SortExec) or input rows augmented with computed window columns (WindowExec)',
+      'Spilled sorted runs / partition buffers on local disk when execution memory fills',
+    ],
+    internalState: [
+      'UnsafeExternalRowSorter prefix-key pointer array with spillable merge sort',
+      'WindowFunctionFrame implementations (UnboundedPreceding, Sliding, Offset, SegmentTree)',
+      'ExternalAppendOnlyUnsafeRowArray buffering the current PARTITION BY window group',
+    ],
+    failureClues: [
+      'Window function without PARTITION BY forces ShuffleExchangeExec(SinglePartition) — all data moves to 1 executor task!',
+      'Huge spillSize on WindowExec points to a skewed PARTITION BY key with millions of rows in one window buffer',
+      'Top-N window filters (WHERE row_number() <= K) trigger WindowGroupLimitExec partial map-side pruning',
+    ],
+    sourceLinks: [
+      {
+        label: 'WindowExec partition buffering & frame evaluation',
+        url: `${SPARK_BLOB}/sql/core/src/main/scala/org/apache/spark/sql/execution/window/WindowExec.scala#L40-L155`,
+      },
+      {
+        label: 'SortExec WholeStageCodegen & UnsafeExternalRowSorter',
+        url: `${SPARK_BLOB}/sql/core/src/main/scala/org/apache/spark/sql/execution/SortExec.scala#L38-L130`,
+      },
+    ],
+    docFile: 'window-sort-exec.md',
+  },
+
+  'jvm-partitioner-pair-rdd': {
+    id: 'jvm-partitioner-pair-rdd',
+    name: 'JVM Partitioner & PairRDDFunctions',
+    shortName: 'JVM Partitioner',
+    subsystem: 'shuffle',
+    hostZone: 'worker-node-a',
+    clusterPos: [672, 1196],
+    languages: ['scala', 'java'],
+    port: 'in-JVM Partitioner',
+    process: 'Driver/Executor JVM org.apache.spark.Partitioner (Hash / Range / Custom) + PairRDDFunctions',
+    role: 'Controls exact RDD shuffle key-to-partition routing in Scala and Java via HashPartitioner, reservoir-sampled RangePartitioner, or user-defined Partitioner subclasses, enabling co-partitioned zero-shuffle joins, map-side combineByKeyWithClassTag, and single-pass repartitionAndSortWithinPartitions.',
+    keyDistinction:
+      'Custom JVM Partitioner subclasses and PairRDDFunctions (combineByKeyWithClassTag, repartitionAndSortWithinPartitions) execute natively inside the executor JVM without Python worker portable_hash serialization.',
+    startedBy: 'Invoked by Scala PairRDDFunctions / JavaPairRDD transformations (partitionBy, reduceByKey, groupByKey, sortByKey, repartitionAndSortWithinPartitions)',
+    monitoredBy: 'RDD partition skew distribution in Spark UI Stage task metrics and DAGScheduler ShuffleDependency reuse',
+    stoppedBy: 'Partitioner metadata persists on ShuffledRDD so downstream co-partitioned joins skip redundant shuffles',
+    inputs: [
+      'JVM (K, V) pairs, numPartitions, optional Ordering[K], and custom getPartition(key: Any): Int logic',
+      'Reservoir sample bounds computed on driver for RangePartitioner',
+    ],
+    outputs: [
+      'Deterministic reduce partition index [0, numPartitions) fed straight into SortShuffleWriter / ExternalSorter',
+      'Co-partitioned ShuffledRDD preserving known Partitioner to eliminate downstream shuffles',
+    ],
+    internalState: [
+      'Partitioner.numPartitions, getPartition(key), and equals/hashCode (critical for Spark shuffle reuse!)',
+      'RangePartitioner sorted rangeBounds array broadcast or shipped in closure',
+      'Aggregator[K, V, C] map-side combiner wired into ExternalSorter',
+    ],
+    failureClues: [
+      'Forgetting to override equals()/hashCode() on a custom Partitioner breaks co-partitioned join detection and forces extra shuffles',
+      'RangePartitioner triggers a small sampling job on the driver before submitting the sort stage',
+      'Using groupByKey() instead of reduceByKey() / aggregateByKey() disables map-side combining and explodes shuffle bytes',
+    ],
+    sourceLinks: [
+      {
+        label: 'Partitioner, HashPartitioner & RangePartitioner',
+        url: `${SPARK_BLOB}/core/src/main/scala/org/apache/spark/Partitioner.scala#L30-L185`,
+      },
+    ],
+    docFile: 'jvm-partitioner-pair-rdd.md',
+  },
+
+  'jvm-accumulator-v2': {
+    id: 'jvm-accumulator-v2',
+    name: 'AccumulatorV2 (Typed JVM Accumulators)',
+    shortName: 'AccumulatorV2',
+    subsystem: 'observability',
+    hostZone: 'driver-jvm',
+    subZone: 'CAPACITY, LIVENESS & MASTERS',
+    clusterPos: [1476, 606],
+    languages: ['scala', 'java'],
+    port: 'in-JVM / Heartbeat',
+    process: 'Driver AccumulatorContext + Executor typed AccumulatorV2[IN, OUT] (Long / Double / Collection / Custom)',
+    role: 'Provides write-only, task-isolated distributed counters and custom typed aggregators (LongAccumulator, DoubleAccumulator, CollectionAccumulator, or custom AccumulatorV2[IN, OUT]) updated directly in executor JVM tasks and merged back on the driver via Heartbeat and TaskEnd CompletionEvent updates.',
+    keyDistinction:
+      'Scala and Java support arbitrary custom typed AccumulatorV2[IN, OUT] classes merged directly inside the Driver JVM with zero PythonAccumulatorV2 loopback socket server.',
+    startedBy: 'Registered on driver via sc.longAccumulator / sc.collectionAccumulator / sc.register(customAcc) into AccumulatorContext',
+    monitoredBy: 'Spark UI Stage Accumulators table, LiveListenerBus SparkListenerTaskEnd / ExecutorMetricsUpdate',
+    stoppedBy: 'WeakReference tracked in AccumulatorContext and deregistered by ContextCleaner when GCed on driver',
+    inputs: [
+      'Executor task acc.add(v) mutations on task-cloned copyAndReset() AccumulatorV2 instances',
+      'Serialized AccumulableInfo deltas piggybacked on Executor Heartbeats (live) and TaskEnd (authoritative)',
+    ],
+    outputs: [
+      'Merged driver-side acc.value read after action completion (exactly-once per succeeded task in actions)',
+      'Spark UI Accumulator metrics visible live during stage execution',
+    ],
+    internalState: [
+      'AccumulatorContext global ConcurrentHashMap[Long, WeakReference[AccumulatorV2]] on driver',
+      'Per-task cloned AccumulatorV2 instances merged via acc.merge(other) on DAGScheduler event loop',
+      'countFailedValues flag controlling whether failed/speculative attempts merge into driver total',
+    ],
+    failureClues: [
+      'Updating an AccumulatorV2 inside a lazy transformation (map/filter) can double-count if a stage is recomputed or tasks retry; rely on actions for exact counts',
+      'Putting huge lists inside CollectionAccumulator bloats Heartbeat and TaskEnd RPC payloads and can OOM the driver',
+      'Always call sc.register(customAcc) on the driver before shipping it inside a task closure',
+    ],
+    sourceLinks: [
+      {
+        label: 'AccumulatorV2 contract, copyAndReset & merge',
+        url: `${SPARK_BLOB}/core/src/main/scala/org/apache/spark/util/AccumulatorV2.scala#L45-L185`,
+      },
+    ],
+    docFile: 'jvm-accumulator-v2.md',
+  },
+
+  // =========================================================================
+  // 4 PySpark-Specific Internals (NOT in Scala / Java)
+  // =========================================================================
+  'cloudpickle-serializer': {
+    id: 'cloudpickle-serializer',
+    name: 'CloudPickleSerializer & PythonFunction',
+    shortName: 'CloudPickle',
+    subsystem: 'python-output',
+    hostZone: 'driver-jvm',
+    subZone: 'CAPACITY, LIVENESS & MASTERS',
+    clusterPos: [1276, 670],
+    languages: ['pyspark'],
+    port: 'Python pickle',
+    process: 'Python Driver pyspark.serializers.CloudPickleSerializer -> Py4J -> PythonFunction bytes',
+    role: 'Serializes Python lambdas, nested UDF closures, dynamically defined classes, and captured global references on the Python driver via bundled cloudpickle into command byte arrays embedded inside JVM PythonFunction / SimplePythonFunction objects for executor shipping.',
+    keyDistinction:
+      'CloudPickleSerializer is PySpark\'s closure-packaging counterpart to Scala/Java\'s ASM SparkClosureCleaner: it pickles Python bytecode & closure cells on the Python driver rather than cleaning JVM .class $outer fields.',
+    startedBy: 'Invoked automatically on the Python driver whenever rdd.map/filter or @udf / @pandas_udf / @udtf is registered or executed',
+    monitoredBy: 'Python PicklingError / TypeError on driver before stage launch and serialized PythonFunction byte size',
+    stoppedBy: 'Synchronous per-closure serialization on the Python driver; pickled bytes live inside the JVM TaskDescription',
+    inputs: [
+      'Python callable (UDF, UDTF, mapPartitions lambda), captured closure variables, and module references',
+      'Optional serializer pair (CPickleSerializer vs ArrowStreamPandasSerializer) for partition data',
+    ],
+    outputs: [
+      'Pickled command byte array handed across Py4J into JVM SimplePythonFunction',
+      'PicklingError if a closure captures an unpicklable object (e.g., SparkContext, socket, open file handle)',
+    ],
+    internalState: [
+      'Bundled pyspark.cloudpickle bytecode & global-variable graph walker',
+      'Python major.minor version header verified by pyspark.worker on executors',
+      'Captured broadcast variable IDs replacing large closures with compact Broadcast handles',
+    ],
+    failureClues: [
+      'PicklingError: "Could not serialize object: Exception: It appears that you are attempting to reference SparkContext" is PySpark\'s exact analog to Scala TaskNotSerializableException',
+      'ModuleNotFoundError on worker during unpickle means a custom Python module was imported by reference instead of shipped via --py-files / venv archive',
+      'Large pickled closures (> tens of MiB) bloat every LaunchTask RPC — wrap lookup tables in sc.broadcast()',
+    ],
+    sourceLinks: [
+      {
+        label: 'CloudPickleSerializer & BatchedSerializer',
+        url: `${SPARK_BLOB}/python/pyspark/serializers.py#L430-L530`,
+      },
+      {
+        label: 'SimplePythonFunction JVM command wrapper',
+        url: `${SPARK_BLOB}/core/src/main/scala/org/apache/spark/api/python/PythonRDD.scala#L60-L125`,
+      },
+    ],
+    docFile: 'cloudpickle-serializer.md',
+  },
+
+  'python-accumulator-v2': {
+    id: 'python-accumulator-v2',
+    name: 'PythonAccumulatorV2 & AccumulatorServer',
+    shortName: 'PyAccumulatorV2',
+    subsystem: 'observability',
+    hostZone: 'driver-jvm',
+    subZone: 'CAPACITY, LIVENESS & MASTERS',
+    clusterPos: [1476, 670],
+    languages: ['pyspark'],
+    port: '127.0.0.1 TCP',
+    process: 'Driver JVM PythonAccumulatorV2 <-> Python Driver TCP AccumulatorServer (pyspark.accumulators)',
+    role: 'Bridges Python worker accumulator updates back to the Python driver: executor pyspark.worker pickles per-task accumulator deltas after END_OF_DATA_SECTION, the JVM ships those byte arrays to driver PythonAccumulatorV2, and PythonAccumulatorV2 opens an authenticated loopback socket to the Python driver AccumulatorServer to merge updates via AccumulatorParam.addInPlace.',
+    keyDistinction:
+      'Unlike Scala/Java AccumulatorV2 (which merges directly inside the Driver JVM with zero sockets), PythonAccumulatorV2 must relay pickled byte arrays across an authenticated driver-local TCP AccumulatorServer so Python driver code can unpickle and merge custom Python AccumulatorParam objects.',
+    startedBy: 'PySpark SparkContext lazily starts AccumulatorServer on 127.0.0.1 and registers PythonAccumulatorV2 in JVM SparkContext on first sc.accumulator()',
+    monitoredBy: 'AccumulatorServer socket auth logs and Spark UI Stage Accumulators metrics',
+    stoppedBy: 'AccumulatorServer TCP listener shuts down during SparkContext.stop()',
+    inputs: [
+      'Task-local Python _accumulatorRegistry pickled updates emitted by pyspark.worker',
+      'JVM AccumulatorV2.merge(other) forwarding byte arrays to Driver JVM PythonAccumulatorV2',
+    ],
+    outputs: [
+      'Authenticated loopback TCP writes from Driver JVM PythonAccumulatorV2 to Python AccumulatorServer',
+      'Merged Python driver Accumulator.value updated via AccumulatorParam.addInPlace',
+    ],
+    internalState: [
+      'Driver JVM PythonAccumulatorV2(serverHost, serverPort, secretToken) byte-array buffer list',
+      'Python driver AccumulatorServer (SocketServer.TCPServer on 127.0.0.1 with auth secret)',
+      'Worker-side pyspark.accumulators._accumulatorRegistry flushed at task completion',
+    ],
+    failureClues: [
+      'Socket failure between Driver JVM and Python AccumulatorServer points to loopback firewall or dead Python driver process',
+      'Python accumulators are NOT displayed as typed values inside the JVM until unpickled on the Python driver',
+      'Updating sc.accumulator inside lazy RDD transformations can double-count on task retry/recompute, identical to JVM AccumulatorV2',
+    ],
+    sourceLinks: [
+      {
+        label: 'PythonAccumulatorV2 JVM bridge to AccumulatorServer',
+        url: `${SPARK_BLOB}/core/src/main/scala/org/apache/spark/api/python/PythonRDD.scala#L685-L760`,
+      },
+      {
+        label: 'Python AccumulatorServer & AccumulatorParam',
+        url: `${SPARK_BLOB}/python/pyspark/accumulators.py#L190-L295`,
+      },
+    ],
+    docFile: 'python-accumulator-v2.md',
+  },
+
+  'arrow-pandas-udf-engine': {
+    id: 'arrow-pandas-udf-engine',
+    name: 'Arrow & Pandas UDF Vectorized Engine',
+    shortName: 'Arrow/Pandas UDF',
+    subsystem: 'sql-execution',
+    hostZone: 'worker-node-b',
+    clusterPos: [1200, 1196],
+    languages: ['pyspark'],
+    port: 'Arrow IPC',
+    process: 'Executor JVM ArrowEvalPythonExec / FlatMapGroupsInPandasExec / MapInPandasExec <-> pyarrow RecordBatch',
+    role: 'Accelerates PySpark Pandas UDFs (@pandas_udf), mapInPandas, mapInArrow, and groupBy().applyInPandas() by converting Tungsten UnsafeRow chunks into columnar Apache Arrow RecordBatches in the Executor JVM, streaming them over the local worker socket into pyarrow/pandas/NumPy C vectorized kernels, and decoding returning Arrow batches back into UnsafeRow.',
+    keyDistinction:
+      'Eliminates row-at-a-time Python pickle overhead by transferring up to spark.sql.execution.arrow.maxRecordsPerBatch (default 10,000) columnar values per IPC batch directly into vectorized C/NumPy/Pandas operations.',
+    startedBy: 'Catalyst ExtractPythonUDFs / SparkStrategies lowers Pandas UDFs and applyInPandas into ArrowEvalPythonExec, MapInPandasExec, or FlatMapGroupsInPandasExec',
+    monitoredBy: 'SQL UI ArrowEvalPython / FlatMapGroupsInPandas metrics (arrow batches, Python worker RSS in YARN memoryOverhead)',
+    stoppedBy: 'Closes ArrowStreamWriter / ArrowStreamReader and releases Netty off-heap Arrow buffers on task completion',
+    inputs: [
+      'Tungsten InternalRow stream encoded into Arrow RecordBatches via ArrowWriter (bounded by maxRecordsPerBatch)',
+      'Serialized Pandas UDF / applyInPandas Python function and target Arrow schema',
+    ],
+    outputs: [
+      'Columnar Arrow IPC stream over local socket to pyspark.worker -> pandas.Series / DataFrame / pyarrow.RecordBatch',
+      'Returned Arrow ColumnarBatch decoded back into JVM InternalRow / UnsafeRow',
+    ],
+    internalState: [
+      'ArrowRootAllocator off-heap Arrow buffers in Executor JVM',
+      'ArrowStreamPandasUDFSerializer / ArrowStreamGroupUDFSerializer in Python worker',
+      'spark.sql.execution.arrow.maxRecordsPerBatch & maxBytesPerBatch batching controls',
+    ],
+    failureClues: [
+      'ArrowTypeError / schema mismatch occurs when the returned pandas.Series dtype diverges from the declared Spark returnType',
+      'Large groupBy().applyInPandas() groups load the ENTIRE group into one pandas DataFrame in Python worker RAM — causing YARN PMEM kill (exit 143 / -104) if memoryOverhead is undersized',
+      'Lower spark.sql.execution.arrow.maxRecordsPerBatch for very wide tables to cap Arrow IPC buffer RAM',
+    ],
+    sourceLinks: [
+      {
+        label: 'FlatMapGroupsInPandasExec grouped Arrow execution',
+        url: `${SPARK_BLOB}/sql/core/src/main/scala/org/apache/spark/sql/execution/python/FlatMapGroupsInPandasExec.scala#L35-L125`,
+      },
+      {
+        label: 'ArrowStreamPandasUDFSerializer Python Arrow IPC',
+        url: `${SPARK_BLOB}/python/pyspark/sql/pandas/serializers.py#L140-L265`,
+      },
+    ],
+    docFile: 'arrow-pandas-udf-engine.md',
+  },
+
+  'python-udtf-exec': {
+    id: 'python-udtf-exec',
+    name: 'Python UDTF Operator (EvalPythonUDTF)',
+    shortName: 'Python UDTF Exec',
+    subsystem: 'sql-execution',
+    hostZone: 'worker-node-b',
+    clusterPos: [1406, 1196],
+    languages: ['pyspark'],
+    port: 'UDTF socket IPC',
+    process: 'Executor JVM EvalPythonUDTFExec / ArrowEvalPythonUDTFExec + Driver analyze() <-> pyspark.sql.udtf',
+    role: 'Executes PySpark User-Defined Table Functions (@udtf) that yield 0..N output rows per input row or partitioned TABLE argument: runs optional polymorphic analyze() during Catalyst analysis on the driver, then streams input batches via EvalPythonUDTFExec / ArrowEvalPythonUDTFExec to Python worker eval() and terminate() generators.',
+    keyDistinction:
+      'Unlike scalar EvalPythonExec (strictly 1 output value per input row), Python UDTF operators yield arbitrary multi-column, multi-row tables, support TABLE(...) input partitioning/ordering, and can dynamically compute their output schema via analyze().',
+    startedBy: 'Catalyst plans PythonUDTF / LATERAL udtf(...) into EvalPythonUDTFExec or ArrowEvalPythonUDTFExec',
+    monitoredBy: 'SQL UI EvalPythonUDTF / ArrowEvalPythonUDTF metrics (rows yielded, worker timings, HybridRowQueue spill)',
+    stoppedBy: 'Calls Python UDTF terminate() at end of partition/group, drains yielded rows, and releases worker on END_OF_STREAM',
+    inputs: [
+      'Scalar arguments or partitioned/ordered TABLE(...) input row streams',
+      'CloudPickled Python UDTF class implementing eval(*args), optional terminate(), and optional static analyze()',
+    ],
+    outputs: [
+      '0..N generated multi-column rows per input row (lateral-joined with pass-through columns when required)',
+      'Polymorphic output StructType resolved at analysis time when analyze() is defined',
+    ],
+    internalState: [
+      'EvalPythonUDTFExec (pickled) vs ArrowEvalPythonUDTFExec (Arrow-vectorized, enabled by default when pyarrow is available)',
+      'Partitioned TABLE argument ShuffleExchangeExec + SortExec inserted by EnsureRequirements',
+      'Python worker UDTF instance persisting state across eval() calls until terminate()',
+    ],
+    failureClues: [
+      'analyze() runs inside a short-lived driver-side Python worker during Catalyst analysis — import or type errors fail before any YARN stage launches',
+      'Returning a tuple/list whose column count differs from returnType / analyze() fails the task with UDTF_INVALID_OUTPUT_ROW_TYPE',
+      'Infinite or exploding yield loops inside eval() amplify downstream row counts and can spill HybridRowQueue / shuffle disk',
+    ],
+    sourceLinks: [
+      {
+        label: 'EvalPythonUDTFExec physical table-function operator',
+        url: `${SPARK_BLOB}/sql/core/src/main/scala/org/apache/spark/sql/execution/python/EvalPythonUDTFExec.scala#L45-L150`,
+      },
+      {
+        label: 'PySpark @udtf decorator & AnalyzeResult contract',
+        url: `${SPARK_BLOB}/python/pyspark/sql/udtf.py#L45-L160`,
+      },
+    ],
+    docFile: 'python-udtf-exec.md',
   },
 };

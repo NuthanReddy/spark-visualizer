@@ -71,7 +71,11 @@ export function inferStepCategory(
     from === 'python-runner' ||
     to === 'python-runner' ||
     from === 'python-udf-operator' ||
-    to === 'python-udf-operator'
+    to === 'python-udf-operator' ||
+    from === 'arrow-pandas-udf-engine' ||
+    to === 'arrow-pandas-udf-engine' ||
+    from === 'python-udtf-exec' ||
+    to === 'python-udtf-exec'
   ) {
     return 'python-worker-ipc';
   }
@@ -80,6 +84,8 @@ export function inferStepCategory(
     to === 'python-driver' ||
     from === 'py4j-gateway' ||
     to === 'py4j-gateway' ||
+    from === 'cloudpickle-serializer' ||
+    to === 'cloudpickle-serializer' ||
     hay.includes('py4j') ||
     hay.includes('pythonrunner')
   ) {
@@ -145,6 +151,8 @@ export function inferStepCategory(
     to === 'closure-cleaner' ||
     from === 'scala-repl-compiler' ||
     to === 'scala-repl-compiler' ||
+    from === 'scala-reflection-implicits' ||
+    to === 'scala-reflection-implicits' ||
     from === 'java-spark-api' ||
     to === 'java-spark-api'
   ) {
@@ -153,6 +161,10 @@ export function inferStepCategory(
   if (
     from === 'heartbeat-receiver' ||
     to === 'heartbeat-receiver' ||
+    from === 'jvm-accumulator-v2' ||
+    to === 'jvm-accumulator-v2' ||
+    from === 'python-accumulator-v2' ||
+    to === 'python-accumulator-v2' ||
     from === 'listener-bus' ||
     to === 'listener-bus' ||
     from === 'app-status-store' ||
@@ -184,6 +196,8 @@ export function inferStepCategory(
   if (
     from === 'session-catalog' ||
     to === 'session-catalog' ||
+    from === 'spark-session-extensions' ||
+    to === 'spark-session-extensions' ||
     from === 'catalyst-analyzer' ||
     to === 'catalyst-analyzer' ||
     from === 'catalyst-optimizer' ||
@@ -196,6 +210,8 @@ export function inferStepCategory(
     to === 'sql-planner' ||
     from === 'adaptive-query-execution' ||
     to === 'adaptive-query-execution' ||
+    from === 'dynamic-partition-pruning' ||
+    to === 'dynamic-partition-pruning' ||
     from === 'whole-stage-codegen' ||
     to === 'whole-stage-codegen' ||
     from === 'janino-code-generator' ||
@@ -206,10 +222,14 @@ export function inferStepCategory(
     to === 'hash-aggregate' ||
     from === 'sort-merge-join' ||
     to === 'sort-merge-join' ||
+    from === 'window-sort-exec' ||
+    to === 'window-sort-exec' ||
     from === 'dataset-encoder-udf' ||
     to === 'dataset-encoder-udf' ||
     from === 'typed-dataset-ops' ||
     to === 'typed-dataset-ops' ||
+    from === 'key-value-grouped-dataset' ||
+    to === 'key-value-grouped-dataset' ||
     from === 'scala-java-udf' ||
     to === 'scala-java-udf' ||
     from === 'typed-aggregator' ||
@@ -222,6 +242,12 @@ export function inferStepCategory(
     to === 'task-set-manager'
   ) {
     return 'sql-planning-aqe';
+  }
+  if (
+    from === 'jvm-partitioner-pair-rdd' ||
+    to === 'jvm-partitioner-pair-rdd'
+  ) {
+    return 'shuffle-internals';
   }
   if (
     from === 'serializer-manager' ||

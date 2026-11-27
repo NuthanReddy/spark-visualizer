@@ -15,17 +15,19 @@ import { computeClusterCardSize } from '../src/engine/mapGeometry.ts';
 import { computePeerInteractions } from '../src/engine/peerInteractions.ts';
 import { advanceTimeline, buildEdgeCurve, MESSAGE_DURATION_MS } from '../src/playback.ts';
 
-test('catalog defines all 89 components with non-overlapping Master Canvas coordinates and Scala/Java > PySpark counts', () => {
-  assert.equal(COMPONENT_LIST.length, 89);
+test('catalog defines all 100 components with non-overlapping Master Canvas coordinates and balanced multi-language Venn coverage', () => {
+  assert.equal(COMPONENT_LIST.length, 100);
   const ids = new Set(COMPONENT_LIST.map(c => c.id));
-  assert.equal(ids.size, 89);
+  assert.equal(ids.size, 100);
 
+  const sharedComps = COMPONENT_LIST.filter(c => (c.languages?.length ?? 0) === 3).length;
   const pysparkComps = COMPONENT_LIST.filter(c => c.languages?.includes('pyspark')).length;
   const scalaComps = COMPONENT_LIST.filter(c => c.languages?.includes('scala')).length;
   const javaComps = COMPONENT_LIST.filter(c => c.languages?.includes('java')).length;
-  assert.equal(pysparkComps, 81);
-  assert.equal(scalaComps, 82);
-  assert.equal(javaComps, 82);
+  assert.equal(sharedComps, 77);
+  assert.equal(pysparkComps, 87);
+  assert.equal(scalaComps, 89);
+  assert.equal(javaComps, 88);
   assert.ok(scalaComps > pysparkComps && javaComps > pysparkComps);
 
   const subZoneByLabel = new Map(DRIVER_SUB_ZONES.map(s => [s.label, s.rect]));
@@ -109,11 +111,11 @@ test('catalog defines all 89 components with non-overlapping Master Canvas coord
   }
 });
 
-test('traces cover 11 lifecycle flows, 28 scenarios, and all 89 components', () => {
+test('traces cover 11 lifecycle flows, 28 scenarios, and all 100 components', () => {
   assert.equal(LIFECYCLE_TRACES.length, 11);
   assert.equal(SCENARIO_TRACES.length, 28);
-  assert.equal(COMPONENT_TRACES.length, 89);
-  assert.equal(ALL_TRACES.length, 128);
+  assert.equal(COMPONENT_TRACES.length, 100);
+  assert.equal(ALL_TRACES.length, 139);
 
   for (const flow of LIFECYCLE_TRACES) {
     if (flow.id === 'flow-typed-dataset-aggregator') {

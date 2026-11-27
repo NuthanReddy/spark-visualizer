@@ -13,6 +13,7 @@ export const CLIENT_HOST_DRIVER_COMPONENTS: ReadonlySet<ComponentId> = new Set<C
   'py4j-gateway',
   'jvm-user-app',
   'closure-cleaner',
+  'scala-reflection-implicits',
   'delegation-token-manager',
   'security-manager',
   'spark-session',
@@ -22,12 +23,14 @@ export const CLIENT_HOST_DRIVER_COMPONENTS: ReadonlySet<ComponentId> = new Set<C
   'rpc-file-server',
   'serializer-manager',
   'session-catalog',
+  'spark-session-extensions',
   'catalyst-analyzer',
   'catalyst-optimizer',
   'columnar-cache',
   'sql-planner',
   'shuffle-exchange',
   'adaptive-query-execution',
+  'dynamic-partition-pruning',
   'broadcast-exchange',
   'whole-stage-codegen',
   'dag-scheduler',
@@ -40,6 +43,9 @@ export const CLIENT_HOST_DRIVER_COMPONENTS: ReadonlySet<ComponentId> = new Set<C
   'executor-monitor',
   'resource-profile-manager',
   'heartbeat-receiver',
+  'jvm-accumulator-v2',
+  'python-accumulator-v2',
+  'cloudpickle-serializer',
   'health-tracker',
   'output-commit-coordinator',
   'block-manager-master',
@@ -84,12 +90,12 @@ export function resolveProcessKey(inst: RuntimeInstance): string {
 
   switch (zone) {
     case 'submit-host':
-      if (comp === 'python-driver') {
+      if (comp === 'python-driver' || comp === 'cloudpickle-serializer') {
         return 'submit-host:python-driver';
       }
       return 'submit-host:driver-jvm';
     case 'driver-jvm':
-      if (comp === 'python-driver') {
+      if (comp === 'python-driver' || comp === 'cloudpickle-serializer') {
         return `driver-jvm:python-driver-a${attempt}`;
       }
       if (comp === 'node-manager') {
