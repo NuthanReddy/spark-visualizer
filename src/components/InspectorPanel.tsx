@@ -33,8 +33,13 @@ import type {
   RunEvent,
   StepCategory,
 } from '../data/runModel';
-import { CHANNEL_META, HOST_ZONES, SUBSYSTEM_META } from '../data/types';
-import type { ComponentId, TraceField } from '../data/types';
+import {
+  CHANNEL_META,
+  HOST_ZONES,
+  SPARK_LANGUAGES,
+  SUBSYSTEM_META,
+} from '../data/types';
+import type { ComponentId, SparkLanguage, TraceField } from '../data/types';
 import { computePeerInteractions } from '../engine/peerInteractions';
 
 export type InspectorTab = 'step' | 'component' | 'overview';
@@ -46,6 +51,7 @@ export interface InspectorPanelProps {
   projection: ProjectedTimeline;
   activeEventId: string | null;
   selectedComponentId: ComponentId | null;
+  activeLanguage?: SparkLanguage;
   onPrevStep: () => void;
   onNextStep: () => void;
   onSelectStep: (stepId: string) => void;
@@ -103,6 +109,7 @@ export default function InspectorPanel({
   projection,
   activeEventId,
   selectedComponentId,
+  activeLanguage = 'pyspark',
   onPrevStep,
   onNextStep,
   onSelectStep,
@@ -970,6 +977,64 @@ export default function InspectorPanel({
                 <span className="micro-label">KEY DISTINCTION</span>
                 <p>{inspectedComponent.keyDistinction}</p>
               </div>
+            </section>
+
+            <section className="inspector-section">
+              <h3 className="comp-section-label">LANGUAGES</h3>
+              <div className="comp-languages-row">
+                {SPARK_LANGUAGES.map((langMeta) => {
+                  const isSupported =
+                    !inspectedComponent.languages ||
+                    inspectedComponent.languages.includes(langMeta.id);
+                  const isActiveLang = activeLanguage === langMeta.id;
+                  const toneClass =
+                    langMeta.id === 'pyspark'
+                      ? 'lang-badge-py'
+                      : langMeta.id === 'scala'
+                        ? 'lang-badge-scala'
+                        : 'lang-badge-java';
+                  return (
+                    <span
+                      key={langMeta.id}
+                      className={[
+                        'lang-badge',
+                        toneClass,
+                        isSupported ? 'is-supported' : 'is-unsupported',
+                        isActiveLang ? 'is-active-lang' : '',
+                      ]
+                        .filter(Boolean)
+                        .join(' ')}
+                      title={
+                        isSupported
+                          ? `${inspectedComponent.shortName} is active in ${langMeta.label} jobs${
+                              isActiveLang ? ' (selected language)' : ''
+                            }`
+                          : `${inspectedComponent.shortName} is not used in pure ${langMeta.label} jobs`
+                      }
+                    >
+                      <span>{langMeta.label}</span>
+                      {!isSupported && (
+                        <span className="lang-badge-state">N/A</span>
+                      )}
+                    </span>
+                  );
+                })}
+              </div>
+              {inspectedComponent.id === 'dataset-encoder-udf' ? (
+                <p className="comp-lang-note">
+                  Scala/Java typed Dataset encoders + JVM UDFs; PySpark invokes Java UDFs via spark.udf.registerJavaFunction
+                </p>
+              ) : inspectedComponent.languages?.length === 1 &&
+                inspectedComponent.languages[0] === 'pyspark' ? (
+                <p className="comp-lang-note">
+                  PySpark-only runtime boundary; absent in pure Scala/Java jobs
+                </p>
+              ) : inspectedComponent.languages &&
+                !inspectedComponent.languages.includes('pyspark') ? (
+                <p className="comp-lang-note">
+                  Scala/Java JVM entry point; PySpark enters via deploy.PythonRunner and Py4J instead
+                </p>
+              ) : null}
             </section>
 
             <section className="inspector-section">

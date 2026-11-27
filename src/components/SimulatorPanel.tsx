@@ -21,16 +21,20 @@ import {
   SIMULATED_FAULTS,
   SIMULATED_JOBS,
   SIMULATION_PRESETS,
+  SPARK_LANGUAGES,
+  adaptSimConfigForLanguage,
   validateSimulationConfig,
 } from '../engine/simulatorTypes';
 import type {
   FaultCategoryId,
   FaultMeta,
+  JobTypeMeta,
   PythonUdfMode,
   SimulatedDataProfile,
   SimulatedFault,
   SimulatedJobType,
   SimulationConfig,
+  SparkLanguage,
 } from '../engine/simulatorTypes';
 
 export interface SimulatorPanelProps {
@@ -49,6 +53,7 @@ const PARTITION_OPTIONS: ReadonlyArray<4 | 8 | 12 | 24> = [4, 8, 12, 24];
 
 function configsEqual(a: SimulationConfig, b: SimulationConfig): boolean {
   return (
+    a.language === b.language &&
     a.jobType === b.jobType &&
     a.dataProfile === b.dataProfile &&
     a.deployMode === b.deployMode &&
@@ -76,6 +81,27 @@ function formatSeverityLabel(severity: FaultMeta['severity']): string {
   }
 }
 
+function getJobLanguageHint(
+  job: JobTypeMeta,
+  language: SparkLanguage,
+): string | null {
+  if (job.languages.includes(language)) return null;
+  if (job.languages.length === 1 && job.languages[0] === 'pyspark') {
+    return '[PySpark only]';
+  }
+  if (
+    job.languages.length === 2 &&
+    job.languages.includes('scala') &&
+    job.languages.includes('java')
+  ) {
+    return '[Scala / Java]';
+  }
+  const labels = job.languages.map(
+    (id) => SPARK_LANGUAGES.find((l) => l.id === id)?.label ?? id,
+  );
+  return `[${labels.join(' / ')}]`;
+}
+
 function getFaultRequirementHint(
   faultId: SimulatedFault,
   draft: SimulationConfig,
@@ -86,6 +112,12 @@ function getFaultRequirementHint(
   const job = JOB_TYPE_MAP[draft.jobType];
   const unmet: string[] = [];
 
+  if (req.jvmApp && draft.language === 'pyspark') {
+    unmet.push('Scala / Java');
+  }
+  if (req.pysparkOnly && draft.language !== 'pyspark') {
+    unmet.push('PySpark');
+  }
   if (req.shuffle && !job.hasShuffle) {
     unmet.push('Shuffle job');
   }
@@ -100,6 +132,9 @@ function getFaultRequirementHint(
   }
   if (req.pythonUdf && !job.hasPythonUdf) {
     unmet.push('Python UDF');
+  }
+  if (req.sqlCodegen && !job.hasSqlCodegen) {
+    unmet.push('SQL DataFrame job');
   }
   if (req.clusterMode && draft.deployMode !== 'cluster') {
     unmet.push('Cluster mode');
@@ -167,6 +202,8 @@ export default function SimulatorPanel({
   const containers = draft.numExecutors + 1;
   const slots = draft.numExecutors * draft.executorCores;
   const idealWaves = Math.ceil(draft.numPartitions / slots);
+  const draftLanguageLabel =
+    SPARK_LANGUAGES.find((l) => l.id === draft.language)?.label ?? 'PySpark';
 
   const isDefaultDraft = configsEqual(draft, DEFAULT_SIMULATION_CONFIG);
   const hasUnappliedChanges =
@@ -277,6 +314,33 @@ export default function SimulatorPanel({
           <div className="sim-col-heading">1. WORKLOAD &amp; DATA</div>
 
           <div className="sim-field">
+            <span className="sim-label">Application Language</span>
+            <div
+              className="sim-segmented sim-lang-toggle"
+              role="group"
+              aria-label="Simulation application language"
+            >
+              {SPARK_LANGUAGES.map((lang) => {
+                const isActive = draft.language === lang.id;
+                return (
+                  <button
+                    key={lang.id}
+                    type="button"
+                    className={`lang-${lang.id}${isActive ? ' active' : ''}`}
+                    aria-pressed={draft.language === lang.id}
+                    title={lang.description}
+                    onClick={() =>
+                      onDraftChange(adaptSimConfigForLanguage(draft, lang.id))
+                    }
+                  >
+                    {lang.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="sim-field">
             <label className="sim-label" htmlFor="sim-job-type">
               Job Type
             </label>
@@ -286,11 +350,14 @@ export default function SimulatorPanel({
               value={draft.jobType}
               onChange={(e) => handleJobChange(e.target.value as SimulatedJobType)}
             >
-              {SIMULATED_JOBS.map((job) => (
-                <option key={job.id} value={job.id}>
-                  {job.label}
-                </option>
-              ))}
+              {SIMULATED_JOBS.map((job) => {
+                const langHint = getJobLanguageHint(job, draft.language);
+                return (
+                  <option key={job.id} value={job.id}>
+                    {langHint ? `${job.label} ${langHint}` : job.label}
+                  </option>
+                );
+              })}
             </select>
             <code className="sim-action-preview" title={jobMeta.actionSink}>
               {jobMeta.actionSink}
@@ -319,33 +386,6 @@ export default function SimulatorPanel({
             </select>
             <p className="sim-field-hint">{dataProfileMeta.description}</p>
           </div>
-
-          {draft.jobType === 'python-udf' && (
-            <div className="sim-field">
-              <span className="sim-label">UDF Mode</span>
-              <div className="sim-segmented" role="group" aria-label="Python UDF mode">
-                {(
-                  [
-                    ['pickled', 'Pickled (BatchEval)'],
-                    ['arrow', 'Arrow (ArrowEval)'],
-                  ] as Array<[PythonUdfMode, string]>
-                ).map(([modeId, modeLabel]) => {
-                  const isActive = draft.pythonUdfMode === modeId;
-                  return (
-                    <button
-                      key={modeId}
-                      type="button"
-                      className={isActive ? 'active' : ''}
-                      aria-pressed={isActive}
-                      onClick={() => updateDraft({ pythonUdfMode: modeId })}
-                    >
-                      {modeLabel}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
         </div>
 
         {/* Column 2: Cluster & Runtime */}
@@ -499,6 +539,44 @@ export default function SimulatorPanel({
               <span>AQE</span>
             </label>
           </div>
+
+          {draft.language === 'pyspark' && draft.jobType === 'python-udf' && (
+            <div className="sim-field">
+              <span className="sim-label">Python UDF Bridge</span>
+              <div
+                className="sim-segmented"
+                role="group"
+                aria-label="Python UDF bridge mode"
+              >
+                {(
+                  [
+                    ['pickled', 'Pickled (BatchEval)'],
+                    ['arrow', 'Arrow (ArrowEval)'],
+                  ] as Array<[PythonUdfMode, string]>
+                ).map(([modeId, modeLabel]) => {
+                  const isActive = draft.pythonUdfMode === modeId;
+                  return (
+                    <button
+                      key={modeId}
+                      type="button"
+                      className={isActive ? 'active' : ''}
+                      aria-pressed={isActive}
+                      onClick={() => updateDraft({ pythonUdfMode: modeId })}
+                    >
+                      {modeLabel}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {draft.language !== 'pyspark' && (
+            <div className="sim-jvm-note" role="note">
+              <Info size={12} aria-hidden="true" />
+              <span>Pure-JVM Execution: 0 Python workers, 0 Py4J sockets</span>
+            </div>
+          )}
         </div>
 
         {/* Column 3: Categorized Fault Injection, Diagnostic Reference Card & Telemetry */}
@@ -759,7 +837,7 @@ export default function SimulatorPanel({
               ? 'Draft updated -- run simulation to project new trace'
               : activeConfig !== null
                 ? 'Draft matches currently active simulation'
-                : `${jobMeta.short} | ${draft.deployMode.toUpperCase()} | ${containers} containers`}
+                : `${draftLanguageLabel} | ${jobMeta.short} | ${draft.deployMode.toUpperCase()} | ${containers} containers`}
         </span>
         <div className="sim-footer-actions">
           <button

@@ -7,6 +7,8 @@ import {
   type ExecutionRun,
 } from '../src/data/runModel.ts';
 import { isLocalPort } from '../src/engine/adaptTrace.ts';
+import { validateEventLocality } from '../src/engine/hostPlacement.ts';
+import { resolveMapRouteEndpoints } from '../src/engine/mapGeometry.ts';
 import { getExpandableStepIds, projectRun } from '../src/engine/projection.ts';
 import {
   buildSimulatedRun,
@@ -14,6 +16,7 @@ import {
   SimRunBuilder,
 } from '../src/engine/simulator.ts';
 import {
+  adaptSimConfigForLanguage,
   DEFAULT_SIMULATION_CONFIG,
   FAULT_CATEGORIES,
   FAULT_MAP,
@@ -21,9 +24,37 @@ import {
   SIMULATED_FAULTS,
   SIMULATED_JOBS,
   SIMULATION_PRESETS,
+  SPARK_LANGUAGES,
   validateSimulationConfig,
   type SimulationConfig,
 } from '../src/engine/simulatorTypes.ts';
+
+const PYTHON_ONLY_COMPONENT_IDS = new Set([
+  'python-driver',
+  'py4j-gateway',
+  'python-udf-operator',
+  'python-worker-factory',
+  'python-worker',
+  'python-runner',
+]);
+
+function assertZeroPythonInRun(run: ExecutionRun, label: string) {
+  for (const inst of Object.values(run.instances)) {
+    assert.equal(
+      PYTHON_ONLY_COMPONENT_IDS.has(inst.componentId),
+      false,
+      `${label}: forbidden Python-only runtime instance ${inst.id} (${inst.componentId})`,
+    );
+  }
+  for (const ev of run.events) {
+    assert.equal(
+      PYTHON_ONLY_COMPONENT_IDS.has(ev.fromComponent) ||
+        PYTHON_ONLY_COMPONENT_IDS.has(ev.toComponent),
+      false,
+      `${label}: forbidden Python-only event ${ev.id} (${ev.fromComponent} -> ${ev.toComponent})`,
+    );
+  }
+}
 
 function assertValidSimulatedRun(run: ExecutionRun, label: string) {
   assert.equal(run.sourceKind, 'simulation', label);
@@ -65,6 +96,16 @@ function assertValidSimulatedRun(run: ExecutionRun, label: string) {
         `${label}/${ev.id}: cross-host local event ${ev.fromInstance}(${fromInst.hostZone}) -> ${ev.toInstance}(${toInst.hostZone}) port="${ev.port}"`,
       );
     }
+    const localityErr = validateEventLocality(ev, run.instances);
+    assert.equal(localityErr, null, `${label}/${ev.id}: ${localityErr}`);
+    const resolved = resolveMapRouteEndpoints(ev, run.instances);
+    if (fromInst.hostZone === toInst.hostZone) {
+      assert.equal(
+        COMPONENTS[resolved.from].hostZone,
+        COMPONENTS[resolved.to].hostZone,
+        `${label}/${ev.id}: cross-host same-runtime arrow ${resolved.from} -> ${resolved.to}`,
+      );
+    }
   }
 
   // Projection works collapsed, fully expanded, and under every preset
@@ -81,13 +122,16 @@ function assertValidSimulatedRun(run: ExecutionRun, label: string) {
   }
 }
 
-test('all 12 simulation presets build valid hierarchical runs', () => {
-  assert.equal(SIMULATION_PRESETS.length, 12);
+test('all 16 simulation presets build valid hierarchical runs passing locality & map-route checks', () => {
+  assert.equal(SIMULATION_PRESETS.length, 16);
   for (const preset of SIMULATION_PRESETS) {
     const check = validateSimulationConfig(preset.config);
     assert.equal(check.valid, true, `Preset ${preset.id} should be valid: ${check.blockers.map(b => b.reason)}`);
     const run = buildSimulatedRun(preset.config);
     assertValidSimulatedRun(run, preset.id);
+    if (preset.config.language !== 'pyspark') {
+      assertZeroPythonInRun(run, preset.id);
+    }
   }
 });
 
@@ -196,17 +240,24 @@ test('dynamic executor count (1..6), client placement, TorrentBroadcast P2P, ESS
   assert.equal(skewOff.steps.some(s => s.title.includes('PartialReducerPartitionSpec')), false);
 });
 
-test('all 7 job types and all 53 fault modes produce valid runs matching severity and invariants', () => {
-  assert.equal(SIMULATED_FAULTS.length, 53);
+test('all 8 job types and all 59 fault modes produce valid runs matching severity and invariants', () => {
+  assert.equal(SIMULATED_JOBS.length, 8);
+  assert.equal(SIMULATED_FAULTS.length, 59);
 
   for (const job of SIMULATED_JOBS) {
+    const lang = job.languages[0];
     const cfg: SimulationConfig = {
       ...DEFAULT_SIMULATION_CONFIG,
+      language: lang,
       jobType: job.id,
       dataProfile: job.defaultDataProfile,
       dynamicAllocation: job.id === 'wide-shuffle',
     };
-    assertValidSimulatedRun(buildSimulatedRun(cfg), `job-${job.id}`);
+    const run = buildSimulatedRun(cfg);
+    assertValidSimulatedRun(run, `job-${lang}-${job.id}`);
+    if (lang !== 'pyspark') {
+      assertZeroPythonInRun(run, `job-${lang}-${job.id}`);
+    }
   }
 
   for (const fault of SIMULATED_FAULTS) {
@@ -242,8 +293,8 @@ test('all 7 job types and all 53 fault modes produce valid runs matching severit
   }
 });
 
-test('all 9 fault categories are non-empty and partition all 53 simulated faults', () => {
-  assert.equal(FAULT_CATEGORIES.length, 9);
+test('all 10 fault categories are non-empty and partition all 59 simulated faults', () => {
+  assert.equal(FAULT_CATEGORIES.length, 10);
   const seen = new Set<string>();
   for (const cat of FAULT_CATEGORIES) {
     const list = FAULTS_BY_CATEGORY[cat.id];
@@ -255,7 +306,7 @@ test('all 9 fault categories are non-empty and partition all 53 simulated faults
     }
   }
   assert.equal(seen.size, SIMULATED_FAULTS.length);
-  assert.equal(seen.size, 53);
+  assert.equal(seen.size, 59);
 });
 
 test('SIGKILL-137 and key non-137 distinction faults carry exact diagnostic semantics', () => {
@@ -889,75 +940,88 @@ function assertUniqueExecutorContainerIds(run: ExecutionRun, label: string) {
   }
 }
 
-test('Astra regression: AM registration invariant & unique container IDs hold across all 53 faults in cluster & client modes', () => {
-  for (const fault of SIMULATED_FAULTS) {
-    for (const deployMode of ['cluster', 'client'] as const) {
-      if (deployMode === 'cluster' && fault.requires?.clientMode) continue;
-      if (deployMode === 'client' && fault.requires?.clusterMode) continue;
-      const cfg = resolveValidSimulationConfig({
-        ...DEFAULT_SIMULATION_CONFIG,
-        deployMode,
-        fault: fault.id,
-      });
-      assert.equal(cfg.deployMode, deployMode, `${fault.id} must stay in ${deployMode} mode`);
-      const run = buildSimulatedRun(cfg);
-      assertValidSimulatedRun(run, `am-inv-${deployMode}-${fault.id}`);
-      assertAmRegistrationInvariant(run, `am-inv-${deployMode}-${fault.id}`);
-      assertUniqueExecutorContainerIds(run, `cid-inv-${deployMode}-${fault.id}`);
+test('Astra regression: AM registration invariant & unique container IDs hold across all 59 faults x 3 languages x 2 deploy modes', () => {
+  const amOrPreAmClientFaults = new Set([
+    'oversized-request',
+    'am-invalid-java-opts',
+    'port-bind-exhausted',
+    'class-not-found-jar',
+    'client-disconnect',
+    'yarn-app-kill',
+    'max-executor-failures',
+    'all-nodes-excluded',
+  ]);
 
-      // Client-mode Spark Netty RPC must never target a fabricated driver-1:dynamic listening AM port
-      if (deployMode === 'client') {
-        assert.equal(
-          run.events.some(e => e.protocol.includes('Spark Netty RPC') && e.port === 'driver-1:dynamic'),
-          false,
-          `client-${fault.id}: Spark Netty RPC must use AM outbound channel, never driver-1:dynamic`,
-        );
-      }
+  for (const { id: language } of SPARK_LANGUAGES) {
+    for (const fault of SIMULATED_FAULTS) {
+      if (language === 'pyspark' && fault.requires?.jvmApp) continue;
+      if (language !== 'pyspark' && (fault.requires?.pysparkOnly || fault.requires?.pythonUdf)) continue;
+      for (const deployMode of ['cluster', 'client'] as const) {
+        if (deployMode === 'cluster' && fault.requires?.clientMode) continue;
+        if (deployMode === 'client' && fault.requires?.clusterMode) continue;
+        const cfg = resolveValidSimulationConfig({
+          ...DEFAULT_SIMULATION_CONFIG,
+          language,
+          deployMode,
+          fault: fault.id,
+        });
+        assert.equal(cfg.language, language, `${language}/${deployMode}/${fault.id} must preserve language`);
+        assert.equal(cfg.fault, fault.id, `${language}/${deployMode}/${fault.id} must preserve fault`);
+        assert.equal(cfg.deployMode, deployMode, `${language}/${deployMode}/${fault.id} must stay in ${deployMode} mode`);
+        const run = buildSimulatedRun(cfg);
+        const tag = `am-inv-${language}-${deployMode}-${fault.id}`;
+        assertValidSimulatedRun(run, tag);
+        assertAmRegistrationInvariant(run, tag);
+        assertUniqueExecutorContainerIds(run, tag);
+        if (language !== 'pyspark') {
+          assertZeroPythonInRun(run, tag);
+        }
 
-      // Terminal fault AM disposition invariant by deploy mode:
-      // - Cluster mode terminal faults NEVER emit unregisterAM(SUCCEEDED)
-      // - Client mode AM/RM-terminated & pre-AM faults NEVER emit unregisterAM(SUCCEEDED)
-      // - Client mode SparkContext.stop() teardown on Python/init exceptions emits orders.py exits 1
-      //   AND Shutdown(exit=0) -> AM -> unregisterAM(SUCCEEDED)
-      if (fault.severity === 'terminal') {
-        const hasSucceededUnreg = run.events.some(e => e.label === 'unregisterAM(SUCCEEDED)');
-        if (deployMode === 'cluster') {
+        // Client-mode Spark Netty RPC must never target a fabricated driver-1:dynamic listening AM port
+        if (deployMode === 'client') {
           assert.equal(
-            hasSucceededUnreg,
+            run.events.some(e => e.protocol.includes('Spark Netty RPC') && e.port === 'driver-1:dynamic'),
             false,
-            `cluster-${fault.id}: cluster terminal fault must NEVER emit unregisterAM(SUCCEEDED)`,
+            `${tag}: Spark Netty RPC must use AM outbound channel, never driver-1:dynamic`,
           );
-        } else {
-          const amOrPreAmClientFaults = new Set([
-            'oversized-request',
-            'am-invalid-java-opts',
-            'port-bind-exhausted',
-            'client-disconnect',
-            'yarn-app-kill',
-            'max-executor-failures',
-            'all-nodes-excluded',
-          ]);
-          if (amOrPreAmClientFaults.has(fault.id)) {
+        }
+
+        // Terminal fault AM disposition invariant by language & deploy mode
+        if (fault.severity === 'terminal') {
+          const hasSucceededUnreg = run.events.some(e => e.label === 'unregisterAM(SUCCEEDED)');
+          if (deployMode === 'cluster') {
             assert.equal(
               hasSucceededUnreg,
               false,
-              `client-${fault.id}: AM/RM/pre-AM terminal fault must NEVER emit unregisterAM(SUCCEEDED)`,
+              `${tag}: cluster terminal fault must NEVER emit unregisterAM(SUCCEEDED)`,
+            );
+          } else if (amOrPreAmClientFaults.has(fault.id)) {
+            assert.equal(
+              hasSucceededUnreg,
+              false,
+              `${tag}: AM/RM/pre-AM terminal fault must NEVER emit unregisterAM(SUCCEEDED)`,
             );
           } else {
+            const expectedExitLabel =
+              language === 'pyspark'
+                ? 'orders.py exits 1'
+                : language === 'scala'
+                  ? 'OrdersJob exits 1'
+                  : 'OrdersJavaJob exits 1';
             assert.equal(
-              run.events.some(e => e.label === 'orders.py exits 1' && e.isError === true),
+              run.events.some(e => e.label === expectedExitLabel && e.isError === true),
               true,
-              `client-${fault.id}: client SparkContext.stop() teardown must record orders.py exits 1`,
+              `${tag}: client teardown must record "${expectedExitLabel}"`,
             );
             assert.equal(
               run.events.some(e => e.label === 'Shutdown(exit=0) -> AM'),
               true,
-              `client-${fault.id}: default SparkContext.stop() must send Shutdown(exit=0) -> AM`,
+              `${tag}: client teardown must send Shutdown(exit=0) -> AM`,
             );
             assert.equal(
               hasSucceededUnreg,
               true,
-              `client-${fault.id}: client AM must finish SUCCEEDED on default SparkContext.stop() -> Shutdown(0)`,
+              `${tag}: client AM must finish SUCCEEDED on Shutdown(0)`,
             );
           }
         }
@@ -1786,5 +1850,757 @@ test('Astra regression: remaining YARN/Broadcast/DAG/RPC/Observability/PySpark p
   assert.equal(heapText.includes('if hook hangs'), false);
   const closText = collectRunText(buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, fault: 'closure-not-serializable' }));
   assert.equal(closText.includes('spark.closure.serializer') || closText.includes('Kryo'), false);
+});
+
+test('Phase C2a multi-language: pure Scala & Java jobs (all 7 compatible jobs x cluster/client) emit ZERO Python/Py4J instances or events', () => {
+  const jvmJobs = [
+    'narrow-filter',
+    'wide-shuffle',
+    'broadcast-join',
+    'sort-merge-skew',
+    'jvm-udf-dataset',
+    'cached-rdd',
+    'collect-action',
+  ] as const;
+
+  for (const language of ['scala', 'java'] as const) {
+    for (const deployMode of ['cluster', 'client'] as const) {
+      for (const jobType of jvmJobs) {
+        const cfg: SimulationConfig = {
+          ...DEFAULT_SIMULATION_CONFIG,
+          language,
+          deployMode,
+          jobType,
+          dataProfile:
+            jobType === 'broadcast-join'
+              ? 'small-dim'
+              : jobType === 'sort-merge-skew'
+                ? 'skewed'
+                : jobType === 'collect-action'
+                  ? 'large-result'
+                  : 'uniform',
+          fault: 'none',
+        };
+        const run = buildSimulatedRun(cfg);
+        const tag = `pure-${language}-${deployMode}-${jobType}`;
+        assertValidSimulatedRun(run, tag);
+        assertAmRegistrationInvariant(run, tag);
+        assertUniqueExecutorContainerIds(run, tag);
+        assertZeroPythonInRun(run, tag);
+
+        assert.ok(run.id.startsWith(`sim-${language}-${jobType}-`), `${tag}: runId must include language`);
+        assert.ok(run.instances['jvm-user-app'], `${tag}: must use jvm-user-app`);
+        assert.equal(
+          run.instances['jvm-user-app'].hostZone,
+          deployMode === 'client' ? 'submit-host' : 'driver-jvm',
+          `${tag}: jvm-user-app hostZone mismatch`,
+        );
+
+        const text = collectRunText(run);
+        if (deployMode === 'cluster') {
+          const expectedJar = language === 'scala' ? 'orders-assembly.jar' : 'orders-java.jar';
+          assert.ok(
+            text.includes(expectedJar) && text.includes('__app__.jar'),
+            `${tag}: cluster submission must reference submitted artifact ${expectedJar} and localized symlink __app__.jar`,
+          );
+          assert.equal(text.includes('--jar __app__.jar'), false, `${tag}: must NOT pass --jar __app__.jar`);
+        } else {
+          assert.ok(text.includes('JavaMainApplication'), `${tag}: client mode must use JavaMainApplication`);
+        }
+
+        // Java specifically wraps JavaSparkContext.fromSparkContext STRICTLY AFTER AM registration
+        if (language === 'java') {
+          const regIdx = run.events.findIndex(
+            e =>
+              e.fromComponent === 'application-master' &&
+              e.toComponent === 'resource-manager' &&
+              e.port === 'rm01:8030' &&
+              e.label.includes('registerAM'),
+          );
+          const jscIdx = run.events.findIndex(e => e.label === 'JavaSparkContext.fromSC');
+          assert.ok(regIdx >= 0 && jscIdx > regIdx, `${tag}: JavaSparkContext.fromSC (${jscIdx}) must occur AFTER registerAM (${regIdx})`);
+        }
+      }
+    }
+  }
+
+  // Distinct runIds across PySpark, Scala, Java for same job
+  const pyId = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, language: 'pyspark', jobType: 'wide-shuffle' }).id;
+  const scId = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, language: 'scala', jobType: 'wide-shuffle' }).id;
+  const jvId = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, language: 'java', jobType: 'wide-shuffle' }).id;
+  assert.equal(new Set([pyId, scId, jvId]).size, 3, 'runIds must be distinct across PySpark, Scala, and Java');
+
+  // jvm-udf-dataset specifics: driver-encoder + exec-X/dataset-encoder-udf, WholeStageCodegen, 0 Python workers
+  for (const language of ['scala', 'java'] as const) {
+    const run = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      jobType: 'jvm-udf-dataset',
+      numExecutors: 3,
+    });
+    assertValidSimulatedRun(run, `jvm-udf-${language}`);
+    assertZeroPythonInRun(run, `jvm-udf-${language}`);
+    assert.ok(run.instances['driver-encoder'], `${language}: expected driver-encoder instance`);
+    assert.equal(run.instances['driver-encoder'].componentId, 'dataset-encoder-udf');
+    assert.ok(
+      Object.values(run.instances).some(
+        i => i.id.endsWith('/dataset-encoder-udf') && i.componentId === 'dataset-encoder-udf' && i.executorNumber !== undefined,
+      ),
+      `${language}: expected exec-X/dataset-encoder-udf instance with executorNumber`,
+    );
+    const text = collectRunText(run);
+    assert.ok(text.includes('WholeStageCodegen'), `${language}: expected WholeStageCodegen`);
+    if (language === 'scala') {
+      assert.ok(text.includes('Encoders.product[Order]') && text.includes('ScalaUDF'));
+    } else {
+      assert.ok(text.includes('JavaTypeInference.encoderFor(Order.class)') && text.includes('JavaBeanEncoder') && text.includes('UDF1<Double, Double>'));
+    }
+  }
+
+  // Language-specific cached-rdd & collect-action: PySpark uses Python worker / collectAndServe; Scala/Java stay in-JVM
+  const pyCache = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, language: 'pyspark', jobType: 'cached-rdd' });
+  assertValidSimulatedRun(pyCache, 'pyspark-cached-rdd');
+  assert.ok(Object.values(pyCache.instances).some(i => i.componentId === 'python-worker'));
+  const scCache = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, language: 'scala', jobType: 'cached-rdd' });
+  assertValidSimulatedRun(scCache, 'scala-cached-rdd');
+  assertZeroPythonInRun(scCache, 'scala-cached-rdd');
+
+  const pyCollect = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, language: 'pyspark', jobType: 'collect-action', dataProfile: 'large-result' });
+  assertValidSimulatedRun(pyCollect, 'pyspark-collect');
+  assert.ok(collectRunText(pyCollect).includes('PythonRDD.collectAndServe'));
+  const jvCollect = buildSimulatedRun({ ...DEFAULT_SIMULATION_CONFIG, language: 'java', jobType: 'collect-action', dataProfile: 'large-result' });
+  assertValidSimulatedRun(jvCollect, 'java-collect');
+  assertZeroPythonInRun(jvCollect, 'java-collect');
+  assert.equal(collectRunText(jvCollect).includes('PythonRDD.collectAndServe'), false);
+});
+
+test('Phase C2a multi-language: unified finalizer outcomes & all 6 new jvm-classpath-serde faults', () => {
+  // 1. Cluster user-app failure exit codes: PySpark -> 1 (SparkUserAppException(1)), Scala & Java -> 15 (EXIT_EXCEPTION_USER_CLASS)
+  for (const [faultId, jobType, dataProfile] of [
+    ['task-exception', 'narrow-filter', 'corrupt-record'],
+    ['max-result-size', 'collect-action', 'large-result'],
+    ['commit-job-failure', 'wide-shuffle', 'uniform'],
+    ['scala-java-udf-exception', 'wide-shuffle', 'uniform'],
+  ] as const) {
+    for (const { id: language } of SPARK_LANGUAGES) {
+      const run = buildSimulatedRun({
+        ...DEFAULT_SIMULATION_CONFIG,
+        language,
+        jobType,
+        dataProfile,
+        deployMode: 'cluster',
+        fault: faultId,
+      });
+      const tag = `finalizer-cluster-${language}-${faultId}`;
+      assertValidSimulatedRun(run, tag);
+      assertAmRegistrationInvariant(run, tag);
+      if (language !== 'pyspark') assertZeroPythonInRun(run, tag);
+
+      const unregFail = run.events.find(e => e.label === 'unregisterAM(FAILED)');
+      assert.ok(unregFail, `${tag}: must emit unregisterAM(FAILED)`);
+      const text = collectRunText(run);
+      if (language === 'pyspark') {
+        assert.ok((unregFail.command ?? '').includes('exitCode=1'), `${tag}: PySpark cluster must exit 1`);
+        assert.ok(text.includes('SparkUserAppException(exitCode=1)'), `${tag}: PySpark must cite SparkUserAppException(1)`);
+        assert.equal((unregFail.command ?? '').includes('exitCode=15'), false, `${tag}: PySpark must NOT exit 15`);
+      } else {
+        assert.ok((unregFail.command ?? '').includes('exitCode=15'), `${tag}: ${language} cluster must exit 15`);
+        assert.ok(text.includes('EXIT_EXCEPTION_USER_CLASS'), `${tag}: ${language} must cite EXIT_EXCEPTION_USER_CLASS`);
+        assert.ok(text.includes('InvocationTargetException'), `${tag}: ${language} must cite InvocationTargetException`);
+      }
+      if (faultId === 'scala-java-udf-exception') {
+        assert.ok(text.includes('FAILED_EXECUTE_UDF') && text.includes('ScalaUDF.scala:1171'));
+        assert.equal(Object.values(run.instances).some(i => i.componentId === 'python-worker'), false, `${tag}: ScalaUDF/registerJavaFunction must use ZERO python-worker`);
+      }
+    }
+  }
+
+  // 2. class-not-found-jar: Client -> exit 101 (0 AM/RM events); Cluster -> unregistered exit 13 (0 unregisterAM) + contrast exit 15
+  for (const language of ['scala', 'java'] as const) {
+    const cnfClient = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      deployMode: 'client',
+      fault: 'class-not-found-jar',
+    });
+    assertValidSimulatedRun(cnfClient, `cnf-client-${language}`);
+    assertZeroPythonInRun(cnfClient, `cnf-client-${language}`);
+    assert.equal(
+      cnfClient.events.some(e => e.fromComponent === 'resource-manager' || e.toComponent === 'resource-manager' || e.fromComponent === 'application-master' || e.toComponent === 'application-master'),
+      false,
+      `cnf-client-${language}: must have ZERO RM/AM events`,
+    );
+    const cnfClientText = collectRunText(cnfClient);
+    assert.ok(cnfClientText.includes('SparkExitCode.CLASS_NOT_FOUND') && cnfClientText.includes('101'));
+
+    const cnfCluster = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      deployMode: 'cluster',
+      fault: 'class-not-found-jar',
+    });
+    assertValidSimulatedRun(cnfCluster, `cnf-cluster-${language}`);
+    assertAmRegistrationInvariant(cnfCluster, `cnf-cluster-${language}`);
+    assertZeroPythonInRun(cnfCluster, `cnf-cluster-${language}`);
+    assert.equal(
+      cnfCluster.events.some(e => e.label.toLowerCase().includes('unregister') || (e.command ?? '').toLowerCase().includes('unregister(')),
+      false,
+      `cnf-cluster-${language}: unregistered AM must emit ZERO unregisterApplicationMaster`,
+    );
+    assert.equal(
+      cnfCluster.events.some(e => e.fromInstance === 'am-nm' && e.toInstance === 'resource-manager' && (e.command ?? '').includes('exitStatus=13')),
+      true,
+      `cnf-cluster-${language}: AM container must exit 13 (EXIT_SC_NOT_INITED)`,
+    );
+    const cnfClusterText = collectRunText(cnfCluster);
+    assert.ok(cnfClusterText.includes('EXIT_SC_NOT_INITED') && cnfClusterText.includes('EXIT_EXCEPTION_USER_CLASS = 15'));
+  }
+
+  // 3. Client Scala/Java uncaught main() failure (task-exception, java-bean-encoder-error):
+  //    JavaMainApplication fails without AM exit 15 and without bogus automatic sc.stop(1); SC shutdown hook sends Shutdown(0) -> AM SUCCEEDED/0
+  for (const language of ['scala', 'java'] as const) {
+    for (const faultId of ['task-exception', 'java-bean-encoder-error'] as const) {
+      const run = buildSimulatedRun({
+        ...DEFAULT_SIMULATION_CONFIG,
+        language,
+        deployMode: 'client',
+        fault: faultId,
+      });
+      const tag = `client-jvm-${language}-${faultId}`;
+      assertValidSimulatedRun(run, tag);
+      assertAmRegistrationInvariant(run, tag);
+      assertZeroPythonInRun(run, tag);
+      const text = collectRunText(run);
+      assert.ok(text.includes('JavaMainApplication'), `${tag}: must reference JavaMainApplication`);
+      assert.ok(text.includes('SparkContext.scala:757-769'), `${tag}: must reference SparkContext shutdown hook`);
+      assert.ok(run.events.some(e => e.label === 'Shutdown(exit=0) -> AM'), `${tag}: must send Shutdown(0)`);
+      assert.ok(run.events.some(e => e.label === 'unregisterAM(SUCCEEDED)'), `${tag}: AM unregisters SUCCEEDED on Shutdown(0)`);
+      assert.equal(
+        run.events.some(e => (e.command ?? '').includes('exitCode=15') || (e.command ?? '').includes('Shutdown(exitCode=1)')),
+        false,
+        `${tag}: client Scala/Java must NOT select exit 15 or emit bogus automatic Shutdown(1)`,
+      );
+    }
+  }
+
+  // 4. kryo-unregistered-class, kryo-buffer-overflow, java-bean-encoder-error, delegation-token-expired semantics
+  for (const { id: language } of SPARK_LANGUAGES) {
+    const kryoUnreg = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      fault: 'kryo-unregistered-class',
+    });
+    assertValidSimulatedRun(kryoUnreg, `kryo-unreg-${language}`);
+    if (language !== 'pyspark') assertZeroPythonInRun(kryoUnreg, `kryo-unreg-${language}`);
+    const kuText = collectRunText(kryoUnreg);
+    assert.ok(
+      kuText.includes('Kryo 4.0.3') &&
+        kuText.includes('IllegalArgumentException') &&
+        kuText.includes('Class is not registered') &&
+        kuText.includes('JavaSerializer'),
+      `kryo-unreg-${language}: must cite Kryo 4.0.3 IllegalArgumentException on data and JavaSerializer closures`,
+    );
+
+    const kryoBuf = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      fault: 'kryo-buffer-overflow',
+    });
+    assertValidSimulatedRun(kryoBuf, `kryo-buf-${language}`);
+    if (language !== 'pyspark') assertZeroPythonInRun(kryoBuf, `kryo-buf-${language}`);
+    const kbText = collectRunText(kryoBuf);
+    assert.ok(
+      kbText.includes('PairRDDFunctions.aggregateByKey') &&
+        kbText.includes('64m') &&
+        kbText.includes('KRYO_BUFFER_OVERFLOW') &&
+        kbText.includes('KryoSerializer.scala:448-461'),
+      `kryo-buf-${language}: must cite PairRDDFunctions.aggregateByKey > 64m -> KRYO_BUFFER_OVERFLOW`,
+    );
+
+    const tokExp = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      fault: 'delegation-token-expired',
+    });
+    assertValidSimulatedRun(tokExp, `tok-exp-${language}`);
+    if (language !== 'pyspark') assertZeroPythonInRun(tokExp, `tok-exp-${language}`);
+    const tokText = collectRunText(tokExp);
+    assert.ok(
+      tokText.includes('nn01:8020') &&
+        tokText.includes('SecretManager$InvalidToken') &&
+        tokText.includes('0.75 * (earliestProviderRenewalTime - now)') &&
+        tokText.includes('spark.security.credentials.retryWait') &&
+        tokText.includes('per-block access tokens'),
+      `tok-exp-${language}: must cite NameNode :8020 SecretManager$InvalidToken & distinguish DataNode block tokens`,
+    );
+  }
+
+  for (const language of ['scala', 'java'] as const) {
+    const beanErr = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      fault: 'java-bean-encoder-error',
+    });
+    assertValidSimulatedRun(beanErr, `bean-err-${language}`);
+    assertZeroPythonInRun(beanErr, `bean-err-${language}`);
+    const beText = collectRunText(beanErr);
+    assert.ok(
+      beText.includes('Encoders.bean(OrderNode.class)') &&
+        beText.includes('JavaTypeInference.encoderFor') &&
+        beText.includes('CIRCULAR_CLASS_REFERENCE') &&
+        beText.includes('ENCODER_NOT_FOUND') &&
+        beText.includes('BEAN_ENCODER_INTERFACE_NOT_SUPPORTED'),
+      `bean-err-${language}: must cite Encoders.bean -> CIRCULAR_CLASS_REFERENCE and sibling errors`,
+    );
+    assert.equal(
+      beanErr.events.some(e => e.label.startsWith('LaunchTask')),
+      false,
+      `bean-err-${language}: must fail on driver BEFORE launching any stage`,
+    );
+  }
+
+  // 5. multiple-spark-contexts & am-crash-retry in Scala & Java (0 Python instances!)
+  for (const language of ['scala', 'java'] as const) {
+    const expectedEntry = language === 'scala' ? 'OrdersJob.main' : 'OrdersJavaJob.main';
+
+    const msc = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      fault: 'multiple-spark-contexts',
+    });
+    assertValidSimulatedRun(msc, `msc-${language}`);
+    assertZeroPythonInRun(msc, `msc-${language}`);
+    const mscText = collectRunText(msc);
+    assert.ok(mscText.includes('assertNoOtherContextIsRunning') && mscText.includes('Only one SparkContext should be running in this JVM'));
+    assert.equal(mscText.includes('allowMultipleContexts'), false);
+
+    const amRetry = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      jobType: 'jvm-udf-dataset',
+      deployMode: 'cluster',
+      numExecutors: 2,
+      fault: 'am-crash-retry',
+    });
+    assertValidSimulatedRun(amRetry, `am-retry-${language}`);
+    assertAmRegistrationInvariant(amRetry, `am-retry-${language}`);
+    assertZeroPythonInRun(amRetry, `am-retry-${language}`);
+    const retryText = collectRunText(amRetry);
+    assert.ok(retryText.includes(expectedEntry), `am-retry-${language}: must re-enter ${expectedEntry}`);
+    assert.equal(retryText.includes('orders.py'), false, `am-retry-${language}: must NOT mention orders.py`);
+
+    // dynalloc-no-shuffle-service in Scala/Java (cluster exit 13 / 0 unreg; client SC catch stop() -> Shutdown(0) -> AM SUCCEEDED)
+    const daClusterJvm = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      deployMode: 'cluster',
+      dynamicAllocation: true,
+      externalShuffleService: false,
+      fault: 'dynalloc-no-shuffle-service',
+    });
+    assertValidSimulatedRun(daClusterJvm, `da-cluster-${language}`);
+    assertAmRegistrationInvariant(daClusterJvm, `da-cluster-${language}`);
+    assertZeroPythonInRun(daClusterJvm, `da-cluster-${language}`);
+    assert.equal(daClusterJvm.events.some(e => e.label.toLowerCase().includes('unregister')), false);
+    assert.ok(collectRunText(daClusterJvm).includes('EXIT_SC_NOT_INITED=13'));
+
+    const daClientJvm = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      deployMode: 'client',
+      dynamicAllocation: true,
+      externalShuffleService: false,
+      fault: 'dynalloc-no-shuffle-service',
+    });
+    assertValidSimulatedRun(daClientJvm, `da-client-${language}`);
+    assertAmRegistrationInvariant(daClientJvm, `da-client-${language}`);
+    assertZeroPythonInRun(daClientJvm, `da-client-${language}`);
+    const daClientJvmText = collectRunText(daClientJvm);
+    assert.ok(
+      daClientJvmText.includes('SparkContext.scala:789') &&
+        daClientJvmText.includes('Shutdown(exitCode=0)') &&
+        daClientJvmText.includes('IllegalArgumentException') &&
+        daClientJvmText.includes('JavaMainApplication'),
+    );
+    assert.ok(daClientJvm.events.some(e => e.label === 'unregisterAM(SUCCEEDED)'));
+  }
+});
+
+test('Astra Phase C fixes: UDF/Kryo/client-order/class-name/SparkSession-order/SASL/validator/Encoders.bean/RDD.collect', () => {
+  // 1. HIGH #1: Scala vs Java jvm-udf-dataset encoder/null semantics AND operator order
+  const scalaUdfRun = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    language: 'scala',
+    jobType: 'jvm-udf-dataset',
+    fault: 'none',
+  });
+  const scalaUdfText = collectRunText(scalaUdfRun);
+  assertValidSimulatedRun(scalaUdfRun, 'astra-c-scala-udf');
+  assertZeroPythonInRun(scalaUdfRun, 'astra-c-scala-udf');
+  assert.ok(
+    scalaUdfText.includes('TypeTag') &&
+      scalaUdfText.includes('UserDefinedFunction.scala:132-173') &&
+      scalaUdfText.includes('Analyzer.scala:3926-3948') &&
+      scalaUdfText.includes('nullable column amount') &&
+      scalaUdfText.includes('If(IsNull(amount), Literal(null), ScalaUDF(...))'),
+    'Scala jvm-udf-dataset must derive encoder from Double TypeTag and note nullable column amount guard via Analyzer.scala:3926-3948',
+  );
+  assert.equal(
+    scalaUdfText.includes('inputEncoders=Seq(None)') || scalaUdfText.includes('inputEncoders=Seq(None'),
+    false,
+    'Scala typed udf(...) must NEVER report inputEncoders=Seq(None)',
+  );
+  assert.equal(
+    scalaUdfText.includes('boxed, nullable java.lang.Double') || scalaUdfText.includes('boxed nullable java.lang.Double'),
+    false,
+    'Scala typed udf((d: Double) => ...) must NOT report boxed nullable java.lang.Double',
+  );
+  assert.ok(
+    scalaUdfText.includes('DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF)'),
+    'Scala jvm-udf-dataset must show DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF)',
+  );
+  assert.equal(
+    scalaUdfText.includes('ScalaUDF -> SerializeFromObject'),
+    false,
+    'Scala jvm-udf-dataset must NOT run ScalaUDF before SerializeFromObject',
+  );
+
+  const javaUdfRun = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    language: 'java',
+    jobType: 'jvm-udf-dataset',
+    fault: 'none',
+  });
+  const javaUdfText = collectRunText(javaUdfRun);
+  assertValidSimulatedRun(javaUdfRun, 'astra-c-java-udf');
+  assertZeroPythonInRun(javaUdfRun, 'astra-c-java-udf');
+  assert.ok(
+    javaUdfText.includes('inputEncoders=Seq(None)') &&
+      javaUdfText.includes('UserDefinedFunction.scala:165-173') &&
+      javaUdfText.includes('java.lang.Double') &&
+      javaUdfText.includes('ScalaUDF.scala:1125-1145'),
+    'Java jvm-udf-dataset must show inputEncoders=Seq(None) and boxed nullable java.lang.Double',
+  );
+  assert.ok(
+    javaUdfText.includes('DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF)'),
+    'Java jvm-udf-dataset must show DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF)',
+  );
+  assert.equal(
+    javaUdfText.includes('UDF1.call(Double) -> SerializeFromObject'),
+    false,
+    'Java jvm-udf-dataset must NOT run UDF1 before SerializeFromObject',
+  );
+
+  // 2. HIGH #2: Real Kryo serialization paths (Pair-RDD shuffle, NOT SQL ShuffleExchangeExec; Python deepcopy note)
+  for (const { id: language } of SPARK_LANGUAGES) {
+    const kuRun = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      jobType: 'wide-shuffle',
+      fault: 'kryo-unregistered-class',
+    });
+    assertValidSimulatedRun(kuRun, `astra-c-kryo-unreg-${language}`);
+    const kuText = collectRunText(kuRun);
+    assert.ok(
+      kuText.includes('rdd.reduceByKey') &&
+        kuText.includes('ShuffledRDD[K, OrderEvent]') &&
+        kuText.includes('SortShuffleWriter.write(dep.serializer)') &&
+        kuText.includes('ShufflePartitionPairsWriter.writeKey/writeValue') &&
+        kuText.includes('UnsafeRowSerializer') &&
+        kuText.includes('ShuffleExchangeExec.scala:219-265'),
+      `kryo-unregistered-class (${language}) must use SortShuffleWriter(dep.serializer) -> ShufflePartitionPairsWriter.writeKey/writeValue`,
+    );
+    assert.equal(
+      kuText.includes('serializerManager.dataSerializeStream'),
+      false,
+      `kryo-unregistered-class (${language}) must NOT call serializerManager.dataSerializeStream on SortShuffleWriter`,
+    );
+    assert.equal(
+      kuText.includes('Catalyst inserts ShuffleExchangeExec'),
+      false,
+      `kryo-unregistered-class (${language}) must NEVER run SQL ShuffleExchangeExec as the Kryo-failing shuffle`,
+    );
+    if (language === 'pyspark') {
+      assert.ok(
+        kuText.includes('auxiliary JVM'),
+        'kryo-unregistered-class in PySpark must note auxiliary JVM Pair-RDD helper path',
+      );
+    }
+
+    const kbRun = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      fault: 'kryo-buffer-overflow',
+    });
+    assertValidSimulatedRun(kbRun, `astra-c-kryo-buf-${language}`);
+    const kbText = collectRunText(kbRun);
+    assert.ok(
+      kbText.includes('PairRDDFunctions.aggregateByKey') &&
+        kbText.includes('PairRDDFunctions.scala:155-165') &&
+        kbText.includes('KRYO_BUFFER_OVERFLOW'),
+      `kryo-buffer-overflow (${language}) must cite PairRDDFunctions.aggregateByKey`,
+    );
+    if (language === 'pyspark') {
+      assert.ok(
+        kbText.includes('copy.deepcopy') && kbText.includes('python/pyspark/core/rdd.py:3909-3919'),
+        'kryo-buffer-overflow in PySpark must clarify Python RDD.aggregateByKey uses copy.deepcopy',
+      );
+    }
+  }
+  assert.ok(
+    FAULT_MAP['kryo-unregistered-class'].evidence.includes('UnsafeRowSerializer') &&
+      FAULT_MAP['kryo-unregistered-class'].evidence.includes('ShuffledRDD[K, OrderEvent]'),
+  );
+  assert.ok(FAULT_MAP['kryo-buffer-overflow'].evidence.includes('copy.deepcopy'));
+
+  // 3. HIGH #3: Client scala-java-udf-exception NEVER contains "Cluster exit 15", and client shutdown order is
+  //    exception unwind -> Shutdown(0) -> StopExecutor -> AM unregister(SUCCEEDED)
+  for (const { id: language } of SPARK_LANGUAGES) {
+    const udfClient = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      deployMode: 'client',
+      jobType: 'wide-shuffle',
+      fault: 'scala-java-udf-exception',
+    });
+    const tag = `astra-c-client-udf-${language}`;
+    assertValidSimulatedRun(udfClient, tag);
+    const text = collectRunText(udfClient);
+    assert.equal(text.includes('Cluster exit 15'), false, `${tag}: must NEVER contain "Cluster exit 15"`);
+    assert.equal(text.includes('Cluster exit 1'), false, `${tag}: must NEVER contain "Cluster exit 1"`);
+    assert.ok(
+      text.includes('Stage aborted (4 counted failures of same task)'),
+      `${tag}: UDF step must end at Stage aborted (4 counted failures of same task)`,
+    );
+
+    const expectedUnwind =
+      language === 'pyspark'
+        ? 'orders.py exits 1'
+        : language === 'scala'
+          ? 'OrdersJob exits 1'
+          : 'OrdersJavaJob exits 1';
+    const unwindIdx = udfClient.events.findIndex(e => e.label === expectedUnwind && e.isError === true);
+    const shut0Idx = udfClient.events.findIndex(e => e.label === 'Shutdown(exit=0) -> AM');
+    const stopIndices = udfClient.events
+      .map((e, i) => (e.label.startsWith('StopExecutor(') ? i : -1))
+      .filter(i => i >= 0);
+    const unregIdx = udfClient.events.findIndex(e => e.label === 'unregisterAM(SUCCEEDED)');
+    assert.ok(unwindIdx >= 0 && shut0Idx > unwindIdx, `${tag}: expected unwind (${unwindIdx}) < Shutdown(0) (${shut0Idx})`);
+    assert.ok(stopIndices.length > 0, `${tag}: expected live StopExecutor events`);
+    for (const stopIdx of stopIndices) {
+      assert.ok(
+        stopIdx > shut0Idx && stopIdx < unregIdx,
+        `${tag}: StopExecutor (${stopIdx}) must occur AFTER Shutdown(0) (${shut0Idx}) and BEFORE unregisterAM(SUCCEEDED) (${unregIdx})`,
+      );
+    }
+  }
+
+  // 4. HIGH #4: class-not-found-jar uses exact same MissingOrdersJob / MissingOrdersJavaJob across CLI, launch context, and AM loadClass
+  for (const language of ['scala', 'java'] as const) {
+    const expectedMissing = language === 'scala' ? 'com.acme.MissingOrdersJob' : 'com.acme.MissingOrdersJavaJob';
+    const forbiddenNormal = language === 'scala' ? 'com.acme.OrdersJob' : 'com.acme.OrdersJavaJob';
+    for (const deployMode of ['cluster', 'client'] as const) {
+      const cnfRun = buildSimulatedRun({
+        ...DEFAULT_SIMULATION_CONFIG,
+        language,
+        deployMode,
+        fault: 'class-not-found-jar',
+      });
+      const tag = `astra-c-cnf-${language}-${deployMode}`;
+      assertValidSimulatedRun(cnfRun, tag);
+      const text = collectRunText(cnfRun);
+      assert.ok(text.includes(`--class ${expectedMissing}`), `${tag}: CLI must pass --class ${expectedMissing}`);
+      assert.equal(text.includes(forbiddenNormal), false, `${tag}: must NEVER reference ${forbiddenNormal}`);
+      if (deployMode === 'cluster') {
+        const submitStep = cnfRun.steps.find(s => s.id === 'sim-step-submit');
+        const cnfStep = cnfRun.steps.find(s => s.id === 'sim-step-cnf-cluster');
+        assert.ok(submitStep?.command?.includes(`--class ${expectedMissing}`), `${tag}: submit command mismatch`);
+        assert.ok(
+          cnfRun.events.some(
+            e => e.label === 'submitApplication(AM)' && (e.command ?? '').includes(`--class ${expectedMissing}`),
+          ),
+          `${tag}: ContainerLaunchContext must carry --class ${expectedMissing}`,
+        );
+        assert.ok(
+          cnfStep?.command?.includes(`loadClass("${expectedMissing}")`),
+          `${tag}: AM loadClass must load exact ${expectedMissing}`,
+        );
+      }
+    }
+  }
+
+  // 5. MEDIUM #5: BOTH Scala & Java cluster runs emit registerAM -> resumeDriver BEFORE new SparkSession(sc)
+  //    (and Java emits JavaSparkContext.fromSparkContext after new SparkSession(sc))
+  for (const language of ['scala', 'java'] as const) {
+    const run = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      deployMode: 'cluster',
+      jobType: 'wide-shuffle',
+      fault: 'none',
+    });
+    const tag = `astra-c-session-order-${language}`;
+    assertValidSimulatedRun(run, tag);
+    const pauseIdx = run.events.findIndex(e => e.label === 'postStartHook (pause)');
+    const regIdx = run.events.findIndex(
+      e =>
+        e.stepId === 'sim-step-alloc-a' &&
+        e.fromComponent === 'application-master' &&
+        e.toComponent === 'resource-manager' &&
+        e.label.includes('registerAM'),
+    );
+    const resumeIdx = run.events.findIndex(e => e.label === 'resumeDriver() unblocks');
+    const sessionIdx = run.events.findIndex(e => e.label === 'new SparkSession(sc)');
+    assert.ok(
+      pauseIdx >= 0 && regIdx > pauseIdx && resumeIdx > regIdx && sessionIdx > resumeIdx,
+      `${tag}: expected postStartHook(${pauseIdx}) < registerAM(${regIdx}) < resumeDriver(${resumeIdx}) < new SparkSession(sc)(${sessionIdx})`,
+    );
+    if (language === 'java') {
+      const jscIdx = run.events.findIndex(e => e.label === 'JavaSparkContext.fromSC');
+      assert.ok(
+        jscIdx > sessionIdx,
+        `${tag}: JavaSparkContext.fromSC (${jscIdx}) must occur AFTER new SparkSession(sc) (${sessionIdx})`,
+      );
+    }
+  }
+
+  // 6. MEDIUM #6: delegation-token-expired models fresh NameNode :8020 IPC SASL auth BEFORE pending metadata RPC
+  const dteRun = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    language: 'scala',
+    fault: 'delegation-token-expired',
+  });
+  assertValidSimulatedRun(dteRun, 'astra-c-dte');
+  const dteText = collectRunText(dteRun);
+  assert.ok(
+    dteText.includes('SASL') &&
+      dteText.includes('Client.java:764-800') &&
+      dteText.includes('AbstractDelegationTokenSecretManager.retrievePassword') &&
+      dteText.includes('AbstractDelegationTokenSecretManager.java:528-551') &&
+      dteText.includes('BEFORE'),
+    'delegation-token-expired must model fresh IPC SASL auth (AbstractDelegationTokenSecretManager.java:528-551) BEFORE pending metadata RPC executes',
+  );
+  assert.ok(
+    FAULT_MAP['delegation-token-expired'].sourceRef.includes('AbstractDelegationTokenSecretManager.java:528-551') &&
+      FAULT_MAP['delegation-token-expired'].sourceRef.includes('Client.java:764-800'),
+  );
+
+  // 7. LOW: Validator hardening, adaptSimConfigForLanguage substitution policy, Encoders.bean direct handoff & RDD.collect()
+  const badConfigs: Array<{ label: string; cfg: unknown; expectedField: keyof SimulationConfig }> = [
+    { label: 'unknown-language', cfg: { ...DEFAULT_SIMULATION_CONFIG, language: 'rust' }, expectedField: 'language' },
+    { label: 'unknown-jobType', cfg: { ...DEFAULT_SIMULATION_CONFIG, jobType: 'bogus-job' }, expectedField: 'jobType' },
+    { label: 'unknown-fault', cfg: { ...DEFAULT_SIMULATION_CONFIG, fault: 'nonexistent-fault' }, expectedField: 'fault' },
+    { label: 'proto-fault', cfg: { ...DEFAULT_SIMULATION_CONFIG, fault: 'constructor' }, expectedField: 'fault' },
+    { label: 'invalid-deployMode', cfg: { ...DEFAULT_SIMULATION_CONFIG, deployMode: 'standalone' }, expectedField: 'deployMode' },
+    { label: 'zero-cores', cfg: { ...DEFAULT_SIMULATION_CONFIG, executorCores: 0 }, expectedField: 'executorCores' },
+    { label: 'invalid-partitions', cfg: { ...DEFAULT_SIMULATION_CONFIG, numPartitions: 7 }, expectedField: 'numPartitions' },
+    { label: 'unknown-dataProfile', cfg: { ...DEFAULT_SIMULATION_CONFIG, dataProfile: 'bogus-profile' }, expectedField: 'dataProfile' },
+    { label: 'unknown-pythonUdfMode', cfg: { ...DEFAULT_SIMULATION_CONFIG, pythonUdfMode: 'cbor' }, expectedField: 'pythonUdfMode' },
+    { label: 'string-aqeEnabled', cfg: { ...DEFAULT_SIMULATION_CONFIG, aqeEnabled: 'false' }, expectedField: 'aqeEnabled' },
+    { label: 'string-ess', cfg: { ...DEFAULT_SIMULATION_CONFIG, externalShuffleService: 'true' }, expectedField: 'externalShuffleService' },
+    { label: 'number-da', cfg: { ...DEFAULT_SIMULATION_CONFIG, dynamicAllocation: 1 }, expectedField: 'dynamicAllocation' },
+    { label: 'zero-executors', cfg: { ...DEFAULT_SIMULATION_CONFIG, numExecutors: 0 }, expectedField: 'numExecutors' },
+  ];
+  for (const { label, cfg, expectedField } of badConfigs) {
+    const v = validateSimulationConfig(cfg as SimulationConfig);
+    assert.equal(v.valid, false, `${label}: must fail validation cleanly without throwing`);
+    const blocker = v.blockers.find(b => b.field === expectedField);
+    assert.ok(blocker && blocker.suggestedPatch, `${label}: expected blocker + suggestedPatch for ${expectedField}`);
+    const repaired = resolveValidSimulationConfig(cfg as SimulationConfig);
+    assert.equal(validateSimulationConfig(repaired).valid, true, `${label}: repaired config must be valid`);
+    if (label === 'string-aqeEnabled') {
+      assert.strictEqual(repaired.aqeEnabled, false, 'aqeEnabled: "false" must repair to boolean false');
+    }
+  }
+
+  // adaptSimConfigForLanguage clears pysparkOnly faults (including python-worker-crash) to 'none', NOT silent escalation
+  const adaptedCrash = adaptSimConfigForLanguage(
+    { ...DEFAULT_SIMULATION_CONFIG, language: 'pyspark', jobType: 'python-udf', fault: 'python-worker-crash' },
+    'scala',
+  );
+  assert.equal(adaptedCrash.language, 'scala');
+  assert.equal(adaptedCrash.jobType, 'jvm-udf-dataset');
+  assert.equal(
+    adaptedCrash.fault,
+    'none',
+    'adaptSimConfigForLanguage must clear python-worker-crash to none instead of escalating to terminal scala-java-udf-exception',
+  );
+
+  // Encoders.bean(OrderNode.class) routes directly jvm-user-app -> driver-encoder (NEVER through spark-session)
+  const beanRun = buildSimulatedRun({
+    ...DEFAULT_SIMULATION_CONFIG,
+    language: 'java',
+    fault: 'java-bean-encoder-error',
+  });
+  assertValidSimulatedRun(beanRun, 'astra-c-bean-direct');
+  const beanStepEvents = beanRun.events.filter(e => e.stepId === 'sim-step-bean-encoder-error');
+  assert.equal(
+    beanStepEvents.some(e => e.fromInstance === 'jvm-user-app' && e.toInstance === 'driver-encoder'),
+    true,
+    'Encoders.bean(OrderNode.class) must route directly jvm-user-app -> driver-encoder',
+  );
+  assert.equal(
+    beanStepEvents.some(e => e.fromComponent === 'spark-session' || e.toComponent === 'spark-session'),
+    false,
+    'Encoders.bean(OrderNode.class) must NOT route through spark-session before createDataset() is entered',
+  );
+
+  // collect-action hands individual partition results from task-result-getter -> dag-scheduler then RDD.collect() concat
+  for (const { id: language } of SPARK_LANGUAGES) {
+    const colRun = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      jobType: 'collect-action',
+      dataProfile: 'large-result',
+      fault: 'none',
+    });
+    assertValidSimulatedRun(colRun, `astra-c-collect-${language}`);
+    const colEvents = colRun.events.filter(e => e.stepId === 'sim-step-collect');
+    const trgToDagIdx = colEvents.findIndex(
+      e => e.fromComponent === 'task-result-getter' && e.toComponent === 'dag-scheduler',
+    );
+    const concatIdx = colEvents.findIndex(
+      e =>
+        e.fromComponent === 'dag-scheduler' &&
+        (language === 'pyspark' ? e.toComponent === 'python-driver' : e.toComponent === 'jvm-user-app'),
+    );
+    assert.ok(
+      trgToDagIdx >= 0 && concatIdx > trgToDagIdx,
+      `collect-action (${language}): expected task-result-getter -> dag-scheduler (${trgToDagIdx}) before RDD.collect() delivery (${concatIdx})`,
+    );
+    const colText = collectRunText(colRun);
+    assert.ok(colText.includes('RDD.scala:1122-1125'), `collect-action (${language}) must cite RDD.scala:1122-1125`);
+    if (language === 'scala') assert.ok(colText.includes('Array[Row]'));
+    if (language === 'java') assert.ok(colText.includes('List<Row>'));
+    if (language === 'pyspark') assert.ok(colText.includes('PythonRDD.collectAndServe'));
+
+    // Also verify collect-action + task-result-lost reuses normal TaskScheduler handoff + RDD.collect() concat AFTER retry fetch
+    const trlColRun = buildSimulatedRun({
+      ...DEFAULT_SIMULATION_CONFIG,
+      language,
+      jobType: 'collect-action',
+      dataProfile: 'large-result',
+      fault: 'task-result-lost',
+    });
+    assertValidSimulatedRun(trlColRun, `astra-c-collect-trl-${language}`);
+    const fetchIdx = trlColRun.events.findIndex(e => e.label === 'getRemoteBytes(taskres)');
+    const handoffIdx = trlColRun.events.findIndex(
+      e => e.fromComponent === 'task-result-getter' && e.toComponent === 'dag-scheduler' && e.label === 'Deliver part results',
+    );
+    const deliverIdx = trlColRun.events.findIndex(
+      e =>
+        e.fromComponent === 'dag-scheduler' &&
+        (language === 'pyspark' ? e.toComponent === 'python-driver' : e.toComponent === 'jvm-user-app'),
+    );
+    assert.ok(
+      fetchIdx >= 0 && handoffIdx > fetchIdx && deliverIdx > handoffIdx,
+      `collect-action + task-result-lost (${language}): expected getRemoteBytes(${fetchIdx}) < Deliver part results(${handoffIdx}) < collect delivery(${deliverIdx})`,
+    );
+    assert.equal(
+      (trlColRun.events[fetchIdx].senderState ?? '').includes('Result delivered'),
+      false,
+      `collect-action + task-result-lost (${language}): getRemoteBytes must NOT claim final user delivery before RDD.collect()`,
+    );
+  }
 });
 

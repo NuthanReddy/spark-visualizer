@@ -9,25 +9,55 @@ import {
   SCENARIO_TRACES,
   TRACE_BY_ID,
 } from '../src/data/traces.ts';
-import { HOST_ZONES, MASTER_CANVAS } from '../src/data/types.ts';
+import { DRIVER_SUB_ZONES, HOST_ZONES, MASTER_CANVAS } from '../src/data/types.ts';
 import { adaptTraceToRun, inferStepCategory } from '../src/engine/adaptTrace.ts';
+import { computeClusterCardSize } from '../src/engine/mapGeometry.ts';
 import { computePeerInteractions } from '../src/engine/peerInteractions.ts';
 import { advanceTimeline, buildEdgeCurve, MESSAGE_DURATION_MS } from '../src/playback.ts';
 
-test('catalog defines all 56 components with non-overlapping Master Canvas coordinates', () => {
-  assert.equal(COMPONENT_LIST.length, 56);
+test('catalog defines all 71 components with non-overlapping Master Canvas coordinates and valid language tags', () => {
+  assert.equal(COMPONENT_LIST.length, 71);
   const ids = new Set(COMPONENT_LIST.map(c => c.id));
-  assert.equal(ids.size, 56);
+  assert.equal(ids.size, 71);
+
+  const subZoneByLabel = new Map(DRIVER_SUB_ZONES.map(s => [s.label, s.rect]));
+  const { cardW, cardH } = computeClusterCardSize(COMPONENT_LIST);
+  assert.equal(cardW, 166);
+  assert.equal(cardH, 44);
+  const halfW = cardW / 2;
+  const halfH = cardH / 2;
+  const HOST_HEADER_DIVIDER_OFFSET = 34;
+  const SUB_ZONE_HEADER_CLEAR_Y = 22;
 
   for (const comp of COMPONENT_LIST) {
     const [x, y] = comp.clusterPos;
+    const left = x - halfW;
+    const right = x + halfW;
+    const top = y - halfH;
+    const bottom = y + halfH;
     const zone = HOST_ZONES[comp.hostZone].rect;
-    assert.ok(x >= 0 && x <= MASTER_CANVAS.width, `${comp.id}: x=${x} out of canvas`);
-    assert.ok(y >= 0 && y <= MASTER_CANVAS.height, `${comp.id}: y=${y} out of canvas`);
+    assert.ok(left >= 0 && right <= MASTER_CANVAS.width, `${comp.id}: card x=[${left},${right}] out of canvas`);
+    assert.ok(top >= 0 && bottom <= MASTER_CANVAS.height, `${comp.id}: card y=[${top},${bottom}] out of canvas`);
     assert.ok(
-      x >= zone.x + 60 && x <= zone.x + zone.w - 60 && y >= zone.y + 40 && y <= zone.y + zone.h - 20,
-      `${comp.id}: (${x}, ${y}) outside host zone ${comp.hostZone}`,
+      left >= zone.x + 8 &&
+        right <= zone.x + zone.w - 8 &&
+        top > zone.y + HOST_HEADER_DIVIDER_OFFSET &&
+        bottom <= zone.y + zone.h - 8,
+      `${comp.id}: rendered card [${left},${top},${right},${bottom}] violates host zone ${comp.hostZone} bounds/header`,
     );
+    if (comp.hostZone === 'driver-jvm') {
+      assert.ok(comp.subZone, `${comp.id}: missing driver-jvm subZone`);
+      const subRect = subZoneByLabel.get(comp.subZone);
+      assert.ok(subRect, `${comp.id}: unknown driver-jvm subZone "${comp.subZone}"`);
+      assert.ok(
+        left >= subRect.x + 8 &&
+          right <= subRect.x + subRect.w - 8 &&
+          top > subRect.y + SUB_ZONE_HEADER_CLEAR_Y &&
+          bottom <= subRect.y + subRect.h - 8,
+        `${comp.id}: rendered card [${left},${top},${right},${bottom}] violates driver sub-zone ${comp.subZone} bounds/header`,
+      );
+    }
+    assert.ok(comp.languages && comp.languages.length >= 1, `${comp.id}: missing languages`);
     assert.ok(comp.role.length > 10, `${comp.id}: missing role`);
     assert.ok(comp.keyDistinction.length > 10, `${comp.id}: missing keyDistinction`);
     assert.ok(comp.inputs.length >= 2, `${comp.id}: expected >=2 inputs`);
@@ -41,31 +71,46 @@ test('catalog defines all 56 components with non-overlapping Master Canvas coord
     assert.equal(comp.docFile, `${comp.id}.md`);
   }
 
-  // Pairwise non-overlap check for 156x48 node pills
+  // Submission-language vs execution-capability boundaries (Plan v2.1)
+  assert.deepEqual([...(COMPONENTS['jvm-user-app'].languages ?? [])], ['scala', 'java']);
+  assert.deepEqual([...(COMPONENTS['dataset-encoder-udf'].languages ?? [])], ['pyspark', 'scala', 'java']);
+  assert.deepEqual([...(COMPONENTS['python-driver'].languages ?? [])], ['pyspark']);
+  assert.deepEqual([...(COMPONENTS['py4j-gateway'].languages ?? [])], ['pyspark']);
+
+  // Pairwise non-overlap check using the actual rendered cardW x cardH (166 x 44) rectangles
   for (let i = 0; i < COMPONENT_LIST.length; i++) {
     for (let j = i + 1; j < COMPONENT_LIST.length; j++) {
       const a = COMPONENT_LIST[i];
       const b = COMPONENT_LIST[j];
-      const dx = Math.abs(a.clusterPos[0] - b.clusterPos[0]);
-      const dy = Math.abs(a.clusterPos[1] - b.clusterPos[1]);
-      assert.ok(
-        dx >= 150 || dy >= 56,
-        `Overlap on Master Canvas between ${a.id} (${a.clusterPos}) and ${b.id} (${b.clusterPos})`,
+      const leftA = a.clusterPos[0] - halfW;
+      const rightA = a.clusterPos[0] + halfW;
+      const topA = a.clusterPos[1] - halfH;
+      const bottomA = a.clusterPos[1] + halfH;
+      const leftB = b.clusterPos[0] - halfW;
+      const rightB = b.clusterPos[0] + halfW;
+      const topB = b.clusterPos[1] - halfH;
+      const bottomB = b.clusterPos[1] + halfH;
+      const intersects =
+        leftA < rightB && rightA > leftB && topA < bottomB && bottomA > topB;
+      assert.equal(
+        intersects,
+        false,
+        `Rendered ${cardW}x${cardH} card overlap on Master Canvas between ${a.id} (${a.clusterPos}) and ${b.id} (${b.clusterPos})`,
       );
     }
   }
 });
 
-test('traces cover 7 lifecycle flows, 20 scenarios, and all 56 components', () => {
-  assert.equal(LIFECYCLE_TRACES.length, 7);
-  assert.equal(SCENARIO_TRACES.length, 20);
-  assert.equal(COMPONENT_TRACES.length, 56);
-  assert.equal(ALL_TRACES.length, 83);
+test('traces cover 12 lifecycle flows, 26 scenarios, and all 71 components', () => {
+  assert.equal(LIFECYCLE_TRACES.length, 12);
+  assert.equal(SCENARIO_TRACES.length, 26);
+  assert.equal(COMPONENT_TRACES.length, 71);
+  assert.equal(ALL_TRACES.length, 109);
 
   const scenarioNums = SCENARIO_TRACES.map(t => t.scenarioNumber).sort((a, b) => (a ?? 0) - (b ?? 0));
   assert.deepEqual(
     scenarioNums,
-    Array.from({ length: 20 }, (_, i) => i + 1),
+    Array.from({ length: 26 }, (_, i) => i + 1),
   );
 
   for (const comp of COMPONENT_LIST) {
@@ -125,11 +170,12 @@ test('playback clock and curve sampler behave deterministically', () => {
 });
 
 test('observability components, traces, categories, and peer interactions are wired cleanly', () => {
-  assert.deepEqual(COMPONENTS['listener-bus'].clusterPos, [1554, 298]);
-  assert.deepEqual(COMPONENTS['event-log'].clusterPos, [1554, 382]);
-  assert.deepEqual(COMPONENTS['spark-ui'].clusterPos, [1554, 466]);
-  assert.deepEqual(COMPONENTS['metrics-system'].clusterPos, [1554, 550]);
-  assert.deepEqual(COMPONENTS['executor-metrics-poller'].clusterPos, [1652, 950]);
+  assert.deepEqual(COMPONENTS['listener-bus'].clusterPos, [1554, 304]);
+  assert.deepEqual(COMPONENTS['app-status-store'].clusterPos, [1554, 396]);
+  assert.deepEqual(COMPONENTS['spark-ui'].clusterPos, [1554, 488]);
+  assert.deepEqual(COMPONENTS['event-log'].clusterPos, [1554, 580]);
+  assert.deepEqual(COMPONENTS['metrics-system'].clusterPos, [1554, 672]);
+  assert.deepEqual(COMPONENTS['executor-metrics-poller'].clusterPos, [1652, 1030]);
 
   const msTrace = TRACE_BY_ID['comp-metrics-system'];
   const empTrace = TRACE_BY_ID['comp-executor-metrics-poller'];

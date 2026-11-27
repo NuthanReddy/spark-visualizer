@@ -7,8 +7,13 @@ import type {
   RunStep,
   RuntimeInstance,
   StepCategory,
-} from '../data/runModel';
-import type { ComponentId, HostZoneId, TraceLesson, TraceMessage } from '../data/types';
+} from '../data/runModel.ts';
+import type { ComponentId, TraceLesson, TraceMessage } from '../data/types.ts';
+import {
+  CLIENT_HOST_DRIVER_COMPONENTS,
+  resolveDefaultHostLabel,
+  resolveDefaultHostZone,
+} from './hostPlacement.ts';
 
 const LOCAL_PORT_PATTERN =
   /(?:^|\s)(?:in-jvm|in-process|memory|local|local-dir|local-disk|os)(?:\s|$)/i;
@@ -43,6 +48,8 @@ export function inferStepCategory(
     to === 'file-commit-protocol' ||
     from === 'file-format-writer' ||
     to === 'file-format-writer' ||
+    from === 'datasource-v2' ||
+    to === 'datasource-v2' ||
     hay.includes('commitjob') ||
     hay.includes('committask') ||
     hay.includes('cancommit') ||
@@ -81,6 +88,8 @@ export function inferStepCategory(
     to === 'shuffle-block-resolver' ||
     from === 'external-shuffle-service' ||
     to === 'external-shuffle-service' ||
+    from === 'push-based-shuffle' ||
+    to === 'push-based-shuffle' ||
     from === 'map-output-tracker-master' ||
     to === 'map-output-tracker-master' ||
     from === 'map-output-tracker-worker' ||
@@ -90,10 +99,38 @@ export function inferStepCategory(
     return 'shuffle-internals';
   }
   if (
+    from === 'block-manager-decommissioner' ||
+    to === 'block-manager-decommissioner'
+  ) {
+    return hay.includes('decommission') &&
+      (hay.includes('yarn') || hay.includes('nodemanager') || hay.includes('resourcemanager') || hay.includes('allocator'))
+      ? 'yarn-lifecycle'
+      : 'shuffle-internals';
+  }
+  if (
+    from === 'memory-manager' ||
+    to === 'memory-manager'
+  ) {
+    return hay.includes('spill') ||
+      hay.includes('shuffle') ||
+      hay.includes('storage') ||
+      hay.includes('execution') ||
+      hay.includes('evict') ||
+      hay.includes('oom')
+      ? 'shuffle-internals'
+      : 'yarn-lifecycle';
+  }
+  if (
     from === 'executor-allocation-manager' ||
     to === 'executor-allocation-manager' ||
     from === 'executor-monitor' ||
-    to === 'executor-monitor'
+    to === 'executor-monitor' ||
+    from === 'health-tracker' ||
+    to === 'health-tracker' ||
+    from === 'delegation-token-manager' ||
+    to === 'delegation-token-manager' ||
+    from === 'jvm-user-app' ||
+    to === 'jvm-user-app'
   ) {
     return 'yarn-lifecycle';
   }
@@ -102,6 +139,8 @@ export function inferStepCategory(
     to === 'heartbeat-receiver' ||
     from === 'listener-bus' ||
     to === 'listener-bus' ||
+    from === 'app-status-store' ||
+    to === 'app-status-store' ||
     from === 'event-log' ||
     to === 'event-log' ||
     from === 'spark-ui' ||
@@ -117,6 +156,8 @@ export function inferStepCategory(
     return 'heartbeats-metrics';
   }
   if (
+    from === 'rpc-file-server' ||
+    to === 'rpc-file-server' ||
     hay.includes('staging') ||
     hay.includes('localiz') ||
     hay.includes('.sparkstaging') ||
@@ -125,10 +166,16 @@ export function inferStepCategory(
     return 'staging-localization';
   }
   if (
+    from === 'session-catalog' ||
+    to === 'session-catalog' ||
     from === 'sql-planner' ||
     to === 'sql-planner' ||
     from === 'adaptive-query-execution' ||
     to === 'adaptive-query-execution' ||
+    from === 'whole-stage-codegen' ||
+    to === 'whole-stage-codegen' ||
+    from === 'dataset-encoder-udf' ||
+    to === 'dataset-encoder-udf' ||
     from === 'dag-scheduler' ||
     to === 'dag-scheduler' ||
     from === 'task-scheduler' ||
@@ -138,74 +185,38 @@ export function inferStepCategory(
   ) {
     return 'sql-planning-aqe';
   }
+  if (
+    from === 'serializer-manager' ||
+    to === 'serializer-manager' ||
+    from === 'context-cleaner' ||
+    to === 'context-cleaner' ||
+    from === 'transport-context' ||
+    to === 'transport-context'
+  ) {
+    if (hay.includes('shuffle') || hay.includes('block') || hay.includes('fetch') || hay.includes('chunk')) {
+      return 'shuffle-internals';
+    }
+    if (hay.includes('closure') || hay.includes('kryo') || hay.includes('task')) {
+      return 'sql-planning-aqe';
+    }
+    return 'yarn-lifecycle';
+  }
   if (hay.includes('shuffle')) {
     return 'shuffle-internals';
   }
   return 'yarn-lifecycle';
 }
 
-const CLIENT_HOST_DRIVER_COMPONENTS = new Set<ComponentId>([
-  'spark-driver',
-  'python-driver',
-  'py4j-gateway',
-  'spark-session',
-  'spark-context',
-  'spark-env',
-  'dag-scheduler',
-  'task-scheduler',
-  'task-set-manager',
-  'driver-scheduler-backend',
-  'yarn-scheduler-backend',
-  'task-result-getter',
-  'sql-planner',
-  'adaptive-query-execution',
-  'broadcast-exchange',
-  'executor-allocation-manager',
-  'executor-monitor',
-  'heartbeat-receiver',
-  'block-manager-master',
-  'map-output-tracker-master',
-  'broadcast-manager',
-  'output-commit-coordinator',
-  'listener-bus',
-  'event-log',
-  'spark-ui',
-  'metrics-system',
-]);
-
-function hostLabelForZone(zone: HostZoneId): string {
-  switch (zone) {
-    case 'submit-host':
-      return 'edge-01';
-    case 'yarn-control':
-      return 'rm01';
-    case 'storage-history':
-      return 'hdfs / history';
-    case 'driver-jvm':
-      return 'driver-1 (AM)';
-    case 'worker-node-a':
-      return 'worker-a';
-    case 'worker-node-b':
-      return 'worker-b';
-  }
-}
-
 function createDefaultInstance(compId: ComponentId, isClientMode: boolean): RuntimeInstance {
   const spec = COMPONENTS[compId];
-  const hostZone: HostZoneId =
-    isClientMode && CLIENT_HOST_DRIVER_COMPONENTS.has(compId)
-      ? 'submit-host'
-      : spec.hostZone;
+  const hostZone = resolveDefaultHostZone(compId, isClientMode);
   return {
     id: compId,
     componentId: compId,
     label: spec.name,
     shortLabel: spec.shortName,
     hostZone,
-    hostLabel:
-      isClientMode && hostZone === 'submit-host'
-        ? 'edge-01 (client driver)'
-        : hostLabelForZone(hostZone),
+    hostLabel: resolveDefaultHostLabel(compId, hostZone, isClientMode),
     processId: spec.process,
   };
 }
@@ -215,8 +226,11 @@ function normalizeExtraInstance(
   isClientMode: boolean,
 ): RuntimeInstance {
   const defaultSpec = COMPONENTS[extra.componentId];
+  // Only relocate auto-generated default-ID driver instances in client mode; never
+  // overwrite an extra instance explicitly pinned to a non-default host or distinct role ID.
   if (
     isClientMode &&
+    extra.id === extra.componentId &&
     extra.hostZone === 'driver-jvm' &&
     defaultSpec?.hostZone === 'driver-jvm' &&
     CLIENT_HOST_DRIVER_COMPONENTS.has(extra.componentId)
@@ -224,7 +238,7 @@ function normalizeExtraInstance(
     return {
       ...extra,
       hostZone: 'submit-host',
-      hostLabel: 'edge-01 (client driver)',
+      hostLabel: resolveDefaultHostLabel(extra.componentId, 'submit-host', true),
     };
   }
   return { ...extra };

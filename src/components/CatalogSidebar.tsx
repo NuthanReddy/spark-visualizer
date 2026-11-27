@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ChevronDown,
   ChevronRight,
@@ -13,8 +13,14 @@ import type {
   ProjectedTimeline,
   RunStep,
 } from '../data/runModel';
-import { SUBSYSTEM_META } from '../data/types';
-import type { SubsystemId, TraceKind, TraceLesson } from '../data/types';
+import { SPARK_LANGUAGES, SUBSYSTEM_META } from '../data/types';
+import type {
+  SparkLanguage,
+  SubsystemId,
+  TraceKind,
+  TraceLesson,
+} from '../data/types';
+import { getEffectiveTraceLanguages } from '../engine/urlRoute';
 
 export interface CatalogSidebarProps {
   mode: TraceKind;
@@ -26,6 +32,7 @@ export interface CatalogSidebarProps {
   componentTraces: TraceLesson[];
   activeRun: ExecutionRun;
   activeRunId: string;
+  activeLanguage?: SparkLanguage;
   projection: ProjectedTimeline;
   expandedStepIds: ReadonlySet<string>;
   activeEventId: string | null;
@@ -36,6 +43,28 @@ export interface CatalogSidebarProps {
   onToggleExpandStep: (stepId: string) => void;
   onResetFilters: () => void;
   onCloseMobile: () => void;
+}
+
+function getLanguageBadge(
+  langs: readonly SparkLanguage[],
+): { text: string; className: string } | null {
+  if (langs.length === 0 || langs.length >= 3) return null;
+  if (langs.length === 1) {
+    if (langs[0] === 'pyspark') {
+      return { text: 'PYSPARK', className: 'lang-badge lang-badge-py' };
+    }
+    if (langs[0] === 'scala') {
+      return { text: 'SCALA', className: 'lang-badge lang-badge-scala' };
+    }
+    return { text: 'JAVA', className: 'lang-badge lang-badge-java' };
+  }
+  if (langs.includes('scala') && langs.includes('java')) {
+    return { text: 'SCALA / JAVA', className: 'lang-badge lang-badge-jvm' };
+  }
+  return {
+    text: langs.map((l) => l.toUpperCase()).join(' / '),
+    className: 'lang-badge',
+  };
 }
 
 type SidebarTreeRow =
@@ -76,6 +105,7 @@ export default function CatalogSidebar({
   componentTraces,
   activeRun,
   activeRunId,
+  activeLanguage = 'pyspark',
   projection,
   expandedStepIds,
   activeEventId,
@@ -88,6 +118,7 @@ export default function CatalogSidebar({
   onCloseMobile,
 }: CatalogSidebarProps) {
   const selectedEntryRef = useRef<HTMLDivElement>(null);
+  const [langFocusOnly, setLangFocusOnly] = useState(false);
 
   const activeFrameIndex = activeEventId
     ? (projection.frameIndexByEventId.get(activeEventId) ?? -1)
@@ -177,12 +208,29 @@ export default function CatalogSidebar({
     return counts;
   }, [componentTraces]);
 
-  const visibleTraces = useMemo(() => {
+  const baseTraces = useMemo(() => {
     if (mode === 'lifecycle') return lifecycleTraces;
     if (mode === 'scenario') return scenarioTraces;
     if (subsystemFilter === 'all') return componentTraces;
     return componentTraces.filter((t) => t.subsystem === subsystemFilter);
   }, [mode, subsystemFilter, lifecycleTraces, scenarioTraces, componentTraces]);
+
+  const langMatchedTraces = useMemo(() => {
+    return baseTraces.filter((trace) =>
+      getEffectiveTraceLanguages(trace).includes(activeLanguage),
+    );
+  }, [baseTraces, activeLanguage]);
+
+  const visibleTraces = langFocusOnly ? langMatchedTraces : baseTraces;
+
+  const pinnedHiddenActiveTrace = useMemo(() => {
+    if (!langFocusOnly) return null;
+    if (visibleTraces.some((t) => t.id === activeRunId)) return null;
+    return baseTraces.find((t) => t.id === activeRunId) ?? null;
+  }, [langFocusOnly, visibleTraces, baseTraces, activeRunId]);
+
+  const activeLanguageLabel =
+    SPARK_LANGUAGES.find((l) => l.id === activeLanguage)?.label ?? 'PySpark';
 
   const totalCount =
     lifecycleTraces.length + scenarioTraces.length + componentTraces.length;
@@ -205,7 +253,141 @@ export default function CatalogSidebar({
     } else if (rowRect.top < parentRect.top) {
       container.scrollTop -= parentRect.top - rowRect.top + 8;
     }
-  }, [activeRunId, mode, subsystemFilter, activeStepId]);
+  }, [activeRunId, mode, subsystemFilter, activeStepId, langFocusOnly]);
+
+  function renderProjectedSteps() {
+    return (
+      <div className="lesson-steps" role="list" aria-label="Projected run steps">
+        {sidebarTreeRows.length === 0 ? (
+          projection.skippedSpans.length === 0 ? (
+            <p className="sidebar-steps-empty">No steps available in this run.</p>
+          ) : null
+        ) : (
+          sidebarTreeRows.map((row) => {
+            if (row.kind === 'macro-header') {
+              return (
+                <div
+                  key={`macro-${row.step.id}`}
+                  role="listitem"
+                  className="sidebar-macro-header-wrap"
+                  style={
+                    row.depth > 0
+                      ? { paddingLeft: `${row.depth * 12}px` }
+                      : undefined
+                  }
+                >
+                  <button
+                    type="button"
+                    className={[
+                      'sidebar-macro-header',
+                      row.hasActiveDescendant ? 'has-active-child' : '',
+                      row.isFilteredEmpty ? 'is-filtered-empty' : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' ')}
+                    aria-expanded={true}
+                    title={
+                      row.isFilteredEmpty
+                        ? `Expanded sub-steps hidden by filter -- click to collapse ${row.step.title}`
+                        : `Collapse ${row.step.title} (${row.childCount} sub-steps)`
+                    }
+                    onClick={() => onToggleExpandStep(row.step.id)}
+                  >
+                    <ChevronDown
+                      size={12}
+                      className="sidebar-macro-chevron"
+                      aria-hidden="true"
+                    />
+                    <span className="sidebar-macro-title">{row.step.title}</span>
+                    <span className="sidebar-macro-meta">
+                      {row.isFilteredEmpty ? 'filtered' : `${row.childCount}`}
+                    </span>
+                  </button>
+                </div>
+              );
+            }
+
+            const { projStep, depth } = row;
+            const isCurrent = projStep.step.id === activeStepId;
+            const firstEventId =
+              projection.visibleFrames[projStep.firstFrameIndex]?.event.id;
+            const showExpandBtn = projStep.hasChildren && !projStep.isExpanded;
+
+            return (
+              <div
+                key={projStep.step.id}
+                role="listitem"
+                className={[
+                  'sidebar-step-row',
+                  isCurrent ? 'is-current-row' : '',
+                  depth > 0 ? 'is-substep' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ')}
+                style={
+                  depth > 0 ? { paddingLeft: `${depth * 12}px` } : undefined
+                }
+              >
+                <button
+                  type="button"
+                  className={[
+                    'sidebar-step-select-btn',
+                    isCurrent ? 'current-step' : '',
+                    depth > 0 ? 'is-substep' : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ')}
+                  aria-current={isCurrent ? 'step' : undefined}
+                  onClick={() => {
+                    if (firstEventId) onSelectEvent(firstEventId);
+                  }}
+                >
+                  <span className="step-num">{projStep.displayNumber}</span>
+                  <span className="step-title-text">{projStep.step.title}</span>
+                  {isCurrent && (
+                    <span className="step-active-dot" aria-hidden="true" />
+                  )}
+                </button>
+
+                {showExpandBtn && (
+                  <button
+                    type="button"
+                    className="sidebar-expand-btn"
+                    aria-expanded={false}
+                    aria-label={`Expand ${projStep.step.title} (${projStep.childCount} sub-steps)`}
+                    title={`Go deeper: expand ${projStep.childCount} sub-steps`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onToggleExpandStep(projStep.step.id);
+                    }}
+                  >
+                    <ChevronRight size={11} aria-hidden="true" />
+                    <span>+{projStep.childCount}</span>
+                  </button>
+                )}
+              </div>
+            );
+          })
+        )}
+        {projection.skippedSpans.length > 0 && (
+          <div className="sidebar-skipped-notice" role="status">
+            <span className="sidebar-skipped-text">
+              {totalSkippedEvents}{' '}
+              {totalSkippedEvents === 1 ? 'event' : 'events'} hidden by category
+              filters --
+            </span>
+            <button
+              type="button"
+              className="sidebar-skipped-reset-btn"
+              onClick={onResetFilters}
+            >
+              Include all
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <aside className="catalog-panel panel" aria-label="Spark trace and component catalog">
@@ -287,10 +469,113 @@ export default function CatalogSidebar({
         </div>
       )}
 
+      <div
+        className="sidebar-lang-filter"
+        role="group"
+        aria-label="Filter traces by active language"
+      >
+        <span className="sidebar-lang-filter-label">FOCUS</span>
+        <div className="sidebar-lang-filter-pills">
+          <button
+            type="button"
+            className={`sidebar-lang-chip ${!langFocusOnly ? 'active' : ''}`}
+            aria-pressed={!langFocusOnly}
+            onClick={() => setLangFocusOnly(false)}
+          >
+            All <span>{baseTraces.length}</span>
+          </button>
+          <button
+            type="button"
+            className={`sidebar-lang-chip ${langFocusOnly ? 'active' : ''}`}
+            aria-pressed={langFocusOnly}
+            title={`Show only traces supporting ${activeLanguageLabel}`}
+            onClick={() => setLangFocusOnly(true)}
+          >
+            {activeLanguageLabel} <span>{langMatchedTraces.length}</span>
+          </button>
+        </div>
+      </div>
+
       <div className="catalog-list">
+        {pinnedHiddenActiveTrace && (() => {
+          const pinnedLangBadge = getLanguageBadge(
+            getEffectiveTraceLanguages(pinnedHiddenActiveTrace),
+          );
+          const showPinnedSteps =
+            projection.runId === pinnedHiddenActiveTrace.id;
+          return (
+            <div
+              ref={selectedEntryRef}
+              className="catalog-entry selected pinned-active-entry"
+              aria-label="Active lesson pinned outside language focus"
+            >
+              <div className="pinned-active-header">
+                <span className="pinned-active-label">
+                  ACTIVE (OUTSIDE {activeLanguageLabel.toUpperCase()} FOCUS)
+                </span>
+                <button
+                  type="button"
+                  className="pinned-active-show-all-btn"
+                  onClick={() => setLangFocusOnly(false)}
+                >
+                  Show All
+                </button>
+              </div>
+              <button
+                type="button"
+                className="catalog-entry-button"
+                aria-expanded={true}
+                onClick={() => onSelectTrace(pinnedHiddenActiveTrace.id)}
+              >
+                <span className="catalog-symbol" aria-hidden="true">
+                  {pinnedHiddenActiveTrace.kind === 'lifecycle' ? (
+                    <Layers size={14} />
+                  ) : pinnedHiddenActiveTrace.kind === 'scenario' ? (
+                    <span className="scenario-num">
+                      {String(
+                        pinnedHiddenActiveTrace.scenarioNumber ?? 0,
+                      ).padStart(2, '0')}
+                    </span>
+                  ) : (
+                    <Cpu size={14} />
+                  )}
+                </span>
+                <span className="catalog-entry-copy">
+                  <span className="catalog-entry-title-row">
+                    <strong>{pinnedHiddenActiveTrace.name}</strong>
+                    <span className="catalog-entry-tags">
+                      {pinnedLangBadge && (
+                        <span className={pinnedLangBadge.className}>
+                          {pinnedLangBadge.text}
+                        </span>
+                      )}
+                      {pinnedHiddenActiveTrace.kind === 'component' &&
+                      pinnedHiddenActiveTrace.subsystem ? (
+                        <span className="entry-mini-tag">
+                          {SUBSYSTEM_META[pinnedHiddenActiveTrace.subsystem].short}
+                        </span>
+                      ) : (
+                        <span
+                          className={`entry-mode-tag mode-${pinnedHiddenActiveTrace.deployMode}`}
+                        >
+                          {pinnedHiddenActiveTrace.deployMode.toUpperCase()}
+                        </span>
+                      )}
+                    </span>
+                  </span>
+                  <small>{pinnedHiddenActiveTrace.subtitle}</small>
+                </span>
+                <ChevronDown size={14} />
+              </button>
+              {showPinnedSteps && renderProjectedSteps()}
+            </div>
+          );
+        })()}
+
         {visibleTraces.map((trace, idx) => {
           const isSelected = trace.id === activeRunId;
           const showProjectedSteps = isSelected && projection.runId === trace.id;
+          const langBadge = getLanguageBadge(getEffectiveTraceLanguages(trace));
           return (
             <div
               key={trace.id}
@@ -319,160 +604,27 @@ export default function CatalogSidebar({
                 <span className="catalog-entry-copy">
                   <span className="catalog-entry-title-row">
                     <strong>{trace.name}</strong>
-                    {trace.kind === 'component' && trace.subsystem ? (
-                      <span className="entry-mini-tag">
-                        {SUBSYSTEM_META[trace.subsystem].short}
-                      </span>
-                    ) : (
-                      <span className={`entry-mode-tag mode-${trace.deployMode}`}>
-                        {trace.deployMode.toUpperCase()}
-                      </span>
-                    )}
+                    <span className="catalog-entry-tags">
+                      {langBadge && (
+                        <span className={langBadge.className}>{langBadge.text}</span>
+                      )}
+                      {trace.kind === 'component' && trace.subsystem ? (
+                        <span className="entry-mini-tag">
+                          {SUBSYSTEM_META[trace.subsystem].short}
+                        </span>
+                      ) : (
+                        <span className={`entry-mode-tag mode-${trace.deployMode}`}>
+                          {trace.deployMode.toUpperCase()}
+                        </span>
+                      )}
+                    </span>
                   </span>
                   <small>{trace.subtitle}</small>
                 </span>
                 {isSelected ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
               </button>
 
-              {showProjectedSteps && (
-                <div className="lesson-steps" role="list" aria-label="Projected run steps">
-                  {sidebarTreeRows.length === 0 ? (
-                    projection.skippedSpans.length === 0 ? (
-                      <p className="sidebar-steps-empty">
-                        No steps available in this run.
-                      </p>
-                    ) : null
-                  ) : (
-                    sidebarTreeRows.map((row) => {
-                      if (row.kind === 'macro-header') {
-                        return (
-                          <div
-                            key={`macro-${row.step.id}`}
-                            role="listitem"
-                            className="sidebar-macro-header-wrap"
-                            style={
-                              row.depth > 0
-                                ? { paddingLeft: `${row.depth * 12}px` }
-                                : undefined
-                            }
-                          >
-                            <button
-                              type="button"
-                              className={[
-                                'sidebar-macro-header',
-                                row.hasActiveDescendant ? 'has-active-child' : '',
-                                row.isFilteredEmpty ? 'is-filtered-empty' : '',
-                              ]
-                                .filter(Boolean)
-                                .join(' ')}
-                              aria-expanded={true}
-                              title={
-                                row.isFilteredEmpty
-                                  ? `Expanded sub-steps hidden by filter — click to collapse ${row.step.title}`
-                                  : `Collapse ${row.step.title} (${row.childCount} sub-steps)`
-                              }
-                              onClick={() => onToggleExpandStep(row.step.id)}
-                            >
-                              <ChevronDown
-                                size={12}
-                                className="sidebar-macro-chevron"
-                                aria-hidden="true"
-                              />
-                              <span className="sidebar-macro-title">
-                                {row.step.title}
-                              </span>
-                              <span className="sidebar-macro-meta">
-                                {row.isFilteredEmpty ? 'filtered' : `${row.childCount}`}
-                              </span>
-                            </button>
-                          </div>
-                        );
-                      }
-
-                      const { projStep, depth } = row;
-                      const isCurrent = projStep.step.id === activeStepId;
-                      const firstEventId =
-                        projection.visibleFrames[projStep.firstFrameIndex]?.event.id;
-                      const showExpandBtn = projStep.hasChildren && !projStep.isExpanded;
-
-                      return (
-                        <div
-                          key={projStep.step.id}
-                          role="listitem"
-                          className={[
-                            'sidebar-step-row',
-                            isCurrent ? 'is-current-row' : '',
-                            depth > 0 ? 'is-substep' : '',
-                          ]
-                            .filter(Boolean)
-                            .join(' ')}
-                          style={
-                            depth > 0
-                              ? { paddingLeft: `${depth * 12}px` }
-                              : undefined
-                          }
-                        >
-                          <button
-                            type="button"
-                            className={[
-                              'sidebar-step-select-btn',
-                              isCurrent ? 'current-step' : '',
-                              depth > 0 ? 'is-substep' : '',
-                            ]
-                              .filter(Boolean)
-                              .join(' ')}
-                            aria-current={isCurrent ? 'step' : undefined}
-                            onClick={() => {
-                              if (firstEventId) onSelectEvent(firstEventId);
-                            }}
-                          >
-                            <span className="step-num">{projStep.displayNumber}</span>
-                            <span className="step-title-text">
-                              {projStep.step.title}
-                            </span>
-                            {isCurrent && (
-                              <span className="step-active-dot" aria-hidden="true" />
-                            )}
-                          </button>
-
-                          {showExpandBtn && (
-                            <button
-                              type="button"
-                              className="sidebar-expand-btn"
-                              aria-expanded={false}
-                              aria-label={`Expand ${projStep.step.title} (${projStep.childCount} sub-steps)`}
-                              title={`Go deeper: expand ${projStep.childCount} sub-steps`}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                onToggleExpandStep(projStep.step.id);
-                              }}
-                            >
-                              <ChevronRight size={11} aria-hidden="true" />
-                              <span>+{projStep.childCount}</span>
-                            </button>
-                          )}
-                        </div>
-                      );
-                    })
-                  )}
-                  {projection.skippedSpans.length > 0 && (
-                    <div className="sidebar-skipped-notice" role="status">
-                      <span className="sidebar-skipped-text">
-                        {totalSkippedEvents}{' '}
-                        {totalSkippedEvents === 1 ? 'event' : 'events'} hidden by
-                        category filters —
-                      </span>
-                      <button
-                        type="button"
-                        className="sidebar-skipped-reset-btn"
-                        onClick={onResetFilters}
-                      >
-                        Include all
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
+              {showProjectedSteps && renderProjectedSteps()}
             </div>
           );
         })}
@@ -481,6 +633,15 @@ export default function CatalogSidebar({
           <div className="catalog-empty">
             <GitBranch size={18} />
             <p>No traces match this filter.</p>
+            {langFocusOnly && (
+              <button
+                type="button"
+                className="sidebar-lang-chip active"
+                onClick={() => setLangFocusOnly(false)}
+              >
+                Show all languages
+              </button>
+            )}
           </div>
         )}
       </div>

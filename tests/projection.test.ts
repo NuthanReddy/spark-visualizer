@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { COMPONENTS } from '../src/data/components.ts';
 import { DEEP_STEP_ENRICHMENTS } from '../src/data/deepSteps.ts';
 import {
   ALL_STEP_CATEGORIES,
@@ -11,10 +12,18 @@ import {
   detectCategoryPreset,
   type ExecutionRun,
   type RunEvent,
+  type RuntimeInstance,
   type StepCategory,
 } from '../src/data/runModel.ts';
 import { ALL_TRACES, SCENARIO_TRACES } from '../src/data/traces.ts';
 import { adaptTraceToRun, isLocalPort } from '../src/engine/adaptTrace.ts';
+import {
+  isDriverRuntimeInstance,
+  isInJvmEvent,
+  resolveProcessKey,
+  validateEventLocality,
+} from '../src/engine/hostPlacement.ts';
+import { resolveMapRouteEndpoints } from '../src/engine/mapGeometry.ts';
 import {
   collectStepIdsToExpandForStep,
   computeDeepOnlyCategoryCounts,
@@ -817,7 +826,7 @@ test('all enriched catalog traces adapt cleanly with valid trees, instances, and
   }
 });
 
-test('local port normalization classifies all qualified in-JVM/OS/local-dir events as local across all 83 traces and 7 enriched runs', () => {
+test('local port normalization classifies all qualified in-JVM/OS/local-dir events as local across all 109 traces and 9 enriched runs', () => {
   // Direct unit checks for qualified local ports vs real network/socket endpoints
   for (const localPort of [
     'in-JVM',
@@ -846,8 +855,30 @@ test('local port normalization classifies all qualified in-JVM/OS/local-dir even
     assert.equal(isLocalPort(wirePort), false, `Expected ${JSON.stringify(wirePort)} to stay wire`);
   }
 
-  assert.equal(ALL_TRACES.length, 83);
-  assert.equal(Object.keys(DEEP_STEP_ENRICHMENTS).length, 7);
+  assert.equal(ALL_TRACES.length, 109);
+  assert.equal(Object.keys(DEEP_STEP_ENRICHMENTS).length, 9);
+
+  // Expanding Scala & Java cluster lifecycles must NEVER restore Python/Py4J components
+  const pythonComps = new Set([
+    'python-driver',
+    'py4j-gateway',
+    'python-udf-operator',
+    'python-worker-factory',
+    'python-worker',
+    'python-runner',
+  ]);
+  for (const jvmFlowId of ['flow-scala-cluster-lifecycle', 'flow-java-cluster-lifecycle']) {
+    const jvmRun = adaptTraceToRun(ALL_TRACES.find(t => t.id === jvmFlowId)!);
+    const jvmExp = projectRun(jvmRun, new Set(getExpandableStepIds(jvmRun)), ALL_STEP_CATEGORIES);
+    assert.ok(jvmExp.visibleFrames.length > 20, `${jvmFlowId}: expected expanded frames`);
+    for (const frame of jvmExp.visibleFrames) {
+      assert.equal(
+        pythonComps.has(frame.event.fromComponent) || pythonComps.has(frame.event.toComponent),
+        false,
+        `${jvmFlowId}/${frame.event.id}: pure JVM flow must never emit Python/Py4J event`,
+      );
+    }
+  }
 
   const qualifiedLocalRe =
     /(?:^|\s)(?:in-jvm|in-process|memory|local|local-dir|local-disk|os)(?:\s|$)/i;
@@ -1651,13 +1682,8 @@ test('computeHiddenCategoriesForStep is depth-aware and excludes collapsed grand
   );
 });
 
-test('all 83 curated traces enforce same-hostZone invariant for local/in-JVM/loopback hops and validate observability + scenario-03 + locality fixes', () => {
-  assert.equal(ALL_TRACES.length, 83);
-
-  const sameHostPortRe =
-    /127\.0\.0\.1|\blocalhost\b|loopback|in-?jvm|\bjvm\b|os proc|unix socket|\blocal\b/i;
-  const sameHostProtocolRe =
-    /127\.0\.0\.1|\blocalhost\b|loopback|in-?jvm|\bjvm\b|os proc|unix socket|\blocal\b|in-?memory|local[- ]disk|\bpipe\b/i;
+test('all 109 curated traces enforce same-hostZone invariant for local/in-JVM/loopback hops and validate observability + scenario-03 + locality fixes', () => {
+  assert.equal(ALL_TRACES.length, 109);
 
   const violations: string[] = [];
   const checkEvent = (traceId: string, mode: string, run: ExecutionRun, ev: RunEvent) => {
@@ -1665,18 +1691,9 @@ test('all 83 curated traces enforce same-hostZone invariant for local/in-JVM/loo
     const toInst = run.instances[ev.toInstance];
     assert.ok(fromInst, `${traceId} (${mode})/${ev.id}: missing fromInstance ${ev.fromInstance}`);
     assert.ok(toInst, `${traceId} (${mode})/${ev.id}: missing toInstance ${ev.toInstance}`);
-    const sameHostShortCircuitRe = /short-circuit|BlockReaderLocal/i;
-    const requiresSameHost =
-      ev.kind === 'local' ||
-      isLocalPort(ev.port) ||
-      sameHostPortRe.test(ev.port) ||
-      sameHostProtocolRe.test(ev.protocol) ||
-      sameHostShortCircuitRe.test(`${ev.protocol} ${ev.command ?? ''}`) ||
-      ev.channel === 'internal';
-    if (requiresSameHost && fromInst.hostZone !== toInst.hostZone) {
-      violations.push(
-        `${mode}:${ev.id} (${ev.fromInstance}@${fromInst.hostZone} -> ${ev.toInstance}@${toInst.hostZone}, port=${ev.port}, protocol=${ev.protocol})`,
-      );
+    const localityErr = validateEventLocality(ev, run.instances);
+    if (localityErr) {
+      violations.push(`${mode}:${localityErr}`);
     }
   };
 
@@ -1808,5 +1825,300 @@ test('all 83 curated traces enforce same-hostZone invariant for local/in-JVM/loo
   const s03Fail = s03Run.events.find(e => e.id === 'scenario-03:s03-5')!;
   assert.equal(s03Fail.kind, 'wire');
   assert.equal(s03Fail.port, 'edge-01.dmz:41000');
+
+  // flow-client-discovery cd-7b: AM NodeManager, ApplicationMaster, and YarnAllocator share consistent worker-a hostLabel
+  const fcdRun = adaptTraceToRun(ALL_TRACES.find(t => t.id === 'flow-client-discovery')!);
+  assert.equal(fcdRun.instances['am-nm']?.hostZone, 'driver-jvm');
+  assert.equal(fcdRun.instances['application-master']?.hostZone, 'driver-jvm');
+  assert.equal(fcdRun.instances['yarn-allocator']?.hostZone, 'driver-jvm');
+  assert.match(fcdRun.instances['am-nm']?.hostLabel ?? '', /worker-a/);
+  assert.match(fcdRun.instances['application-master']?.hostLabel ?? '', /worker-a/);
+  assert.match(fcdRun.instances['yarn-allocator']?.hostLabel ?? '', /worker-a/);
+  const cd7b = fcdRun.events.find(e => e.id === 'flow-client-discovery:cd-7b')!;
+  assert.equal(validateEventLocality(cd7b, fcdRun.instances), null);
+});
+
+test('process-level locality invariant rejects cross-process in-JVM hops and resolveMapRouteEndpoints eliminates cross-host local arrows', () => {
+  const instances: Record<string, RuntimeInstance> = {
+    'exec-1': {
+      id: 'exec-1',
+      componentId: 'executor',
+      label: 'Executor 1',
+      shortLabel: 'Exec-1',
+      hostZone: 'worker-node-a',
+      hostLabel: 'worker-a',
+      processId: 'Executor 1 JVM',
+      executorNumber: 1,
+    },
+    'exec-3': {
+      id: 'exec-3',
+      componentId: 'executor',
+      label: 'Executor 3',
+      shortLabel: 'Exec-3',
+      hostZone: 'worker-node-a',
+      hostLabel: 'worker-a',
+      processId: 'Executor 3 JVM',
+      executorNumber: 3,
+    },
+    'nm-a': {
+      id: 'nm-a',
+      componentId: 'node-manager',
+      label: 'NodeManager A',
+      shortLabel: 'NM A',
+      hostZone: 'worker-node-a',
+      hostLabel: 'worker-a',
+      processId: 'NodeManager JVM',
+    },
+    'ess-a': {
+      id: 'ess-a',
+      componentId: 'external-shuffle-service',
+      label: 'External Shuffle Service A',
+      shortLabel: 'ESS A',
+      hostZone: 'worker-node-a',
+      hostLabel: 'worker-a:7337',
+      processId: 'NodeManager Aux Service',
+    },
+    'client-sc': {
+      id: 'client-sc',
+      componentId: 'spark-context',
+      label: 'SparkContext (edge-01)',
+      shortLabel: 'SparkContext',
+      hostZone: 'submit-host',
+      hostLabel: 'edge-01',
+      processId: 'Client Driver JVM',
+    },
+    'client-py': {
+      id: 'client-py',
+      componentId: 'python-driver',
+      label: 'Python Driver (edge-01)',
+      shortLabel: 'PythonDriver',
+      hostZone: 'submit-host',
+      hostLabel: 'edge-01',
+      processId: 'python3 orders.py',
+    },
+    'cluster-py': {
+      id: 'cluster-py',
+      componentId: 'python-driver',
+      label: 'Python Driver (driver-1)',
+      shortLabel: 'PythonDriver',
+      hostZone: 'driver-jvm',
+      hostLabel: 'driver-1',
+      processId: 'python3 orders.py',
+      attemptNumber: 1,
+    },
+    'cluster-am': {
+      id: 'cluster-am',
+      componentId: 'application-master',
+      label: 'ApplicationMaster',
+      shortLabel: 'AM',
+      hostZone: 'driver-jvm',
+      hostLabel: 'driver-1',
+      processId: 'AM JVM',
+      attemptNumber: 1,
+    },
+  };
+
+  // Process keys distinguish OS processes on the same host while grouping NM + ESS inside nm-jvm
+  assert.equal(resolveProcessKey(instances['nm-a']), 'worker-node-a:nm-jvm');
+  assert.equal(resolveProcessKey(instances['ess-a']), 'worker-node-a:nm-jvm');
+  assert.equal(resolveProcessKey(instances['exec-1']), 'worker-node-a:exec-jvm-1-a1');
+  assert.equal(resolveProcessKey(instances['exec-3']), 'worker-node-a:exec-jvm-3-a1');
+  assert.equal(resolveProcessKey(instances['client-sc']), 'submit-host:driver-jvm');
+  assert.equal(resolveProcessKey(instances['client-py']), 'submit-host:python-driver');
+  assert.equal(resolveProcessKey(instances['cluster-py']), 'driver-jvm:python-driver-a1');
+  assert.equal(resolveProcessKey(instances['cluster-am']), 'driver-jvm:am-jvm-a1');
+
+  // Negative fixture 1: executor (worker-node-a) -> external-shuffle-service (worker-node-a) in-JVM is REJECTED
+  const execToEssErr = validateEventLocality(
+    {
+      id: 'neg-exec-ess',
+      kind: 'local',
+      channel: 'internal',
+      port: 'worker-a in-JVM',
+      protocol: 'In-JVM Direct',
+      fromInstance: 'exec-1',
+      toInstance: 'ess-a',
+    },
+    instances,
+  );
+  assert.ok(execToEssErr !== null, 'Expected Executor -> ESS in-JVM to be rejected');
+  assert.match(execToEssErr, /Cross-process in-JVM/);
+
+  // Negative fixture 2: spark-context -> python-driver in-JVM is REJECTED
+  const scToPyErr = validateEventLocality(
+    {
+      id: 'neg-sc-py',
+      kind: 'local',
+      channel: 'error',
+      port: 'edge-01 in-JVM',
+      protocol: 'In-JVM Exception Propagate',
+      fromInstance: 'client-sc',
+      toInstance: 'client-py',
+    },
+    instances,
+  );
+  assert.ok(scToPyErr !== null, 'Expected SparkContext -> PythonDriver in-JVM to be rejected');
+  assert.match(scToPyErr, /Cross-process in-JVM/);
+
+  // Negative fixture 3: python-driver -> application-master in-JVM is REJECTED
+  const pyToAmErr = validateEventLocality(
+    {
+      id: 'neg-py-am',
+      kind: 'local',
+      channel: 'error',
+      port: 'driver-1 in-JVM',
+      protocol: 'In-JVM SparkUserAppException',
+      fromInstance: 'cluster-py',
+      toInstance: 'cluster-am',
+    },
+    instances,
+  );
+  assert.ok(pyToAmErr !== null, 'Expected PythonDriver -> ApplicationMaster in-JVM to be rejected');
+  assert.match(pyToAmErr, /Cross-process in-JVM/);
+
+  // Negative fixture 4: two distinct executor JVMs on the same worker host cannot call in-JVM
+  const exec1ToExec3Err = validateEventLocality(
+    {
+      id: 'neg-exec1-exec3',
+      kind: 'local',
+      channel: 'internal',
+      port: 'worker-a in-JVM',
+      protocol: 'In-JVM Direct',
+      fromInstance: 'exec-1',
+      toInstance: 'exec-3',
+    },
+    instances,
+  );
+  assert.ok(exec1ToExec3Err !== null, 'Expected Exec-1 -> Exec-3 in-JVM to be rejected');
+
+  // Positive counterparts: Py4J loopback TCP and ProcessBuilder OS child exit are NOT in-JVM and pass
+  assert.equal(
+    isInJvmEvent({ port: '127.0.0.1:43122', protocol: 'Py4J Loopback Exception' }),
+    false,
+  );
+  assert.equal(
+    validateEventLocality(
+      {
+        id: 'pos-py4j-loopback',
+        kind: 'wire',
+        channel: 'error',
+        port: '127.0.0.1:43122',
+        protocol: 'Py4J Loopback Exception',
+        fromInstance: 'client-sc',
+        toInstance: 'client-py',
+      },
+      instances,
+    ),
+    null,
+  );
+  assert.equal(
+    isInJvmEvent({ port: 'driver-1 OS exit', protocol: 'ProcessBuilder Child Exit' }),
+    false,
+  );
+  assert.equal(
+    validateEventLocality(
+      {
+        id: 'pos-os-child-exit',
+        kind: 'local',
+        channel: 'error',
+        port: 'driver-1 OS exit',
+        protocol: 'ProcessBuilder Child Exit',
+        fromInstance: 'cluster-py',
+        toInstance: 'cluster-am',
+      },
+      instances,
+    ),
+    null,
+  );
+
+  // resolveMapRouteEndpoints on comp-memory-manager:mm-1 anchors cleanly inside worker-node-a (ZERO cross-host arrow)
+  const mmRun = adaptTraceToRun(ALL_TRACES.find(t => t.id === 'comp-memory-manager')!);
+  const mm1 = mmRun.events.find(e => e.id === 'comp-memory-manager:mm-1')!;
+  const mm1Resolved = resolveMapRouteEndpoints(mm1, mmRun.instances);
+  assert.equal(mm1Resolved.from, 'memory-manager');
+  assert.equal(mm1Resolved.to, 'memory-manager');
+  assert.equal(mm1Resolved.isLocalOnly, true);
+  assert.equal(mm1Resolved.isCrossCatalogLocal, true);
+  assert.equal(mm1Resolved.runtimeHostZone, 'worker-node-a');
+  assert.equal(COMPONENTS[mm1Resolved.from].hostZone, 'worker-node-a');
+  assert.equal(COMPONENTS[mm1Resolved.to].hostZone, 'worker-node-a');
+
+  // resolveMapRouteEndpoints on comp-transport-context:tc-1 anchors cleanly inside driver-jvm (ZERO cross-host arrow)
+  const tcRun = adaptTraceToRun(ALL_TRACES.find(t => t.id === 'comp-transport-context')!);
+  const tc1 = tcRun.events.find(e => e.id === 'comp-transport-context:tc-1')!;
+  const tc1Resolved = resolveMapRouteEndpoints(tc1, tcRun.instances);
+  assert.equal(tc1Resolved.from, 'rpc-env');
+  assert.equal(tc1Resolved.to, 'rpc-env');
+  assert.equal(tc1Resolved.isLocalOnly, true);
+  assert.equal(tc1Resolved.isCrossCatalogLocal, true);
+  assert.equal(tc1Resolved.runtimeHostZone, 'driver-jvm');
+  assert.equal(COMPONENTS[tc1Resolved.from].hostZone, 'driver-jvm');
+  assert.equal(COMPONENTS[tc1Resolved.to].hostZone, 'driver-jvm');
+
+  // Global invariant: NO same-runtime-hostZone event (whether local OR wire!) ever draws across two catalog hostZones
+  for (const trace of ALL_TRACES) {
+    const run = adaptTraceToRun(trace);
+    for (const ev of run.events) {
+      const fromInst = run.instances[ev.fromInstance];
+      const toInst = run.instances[ev.toInstance];
+      if (!fromInst || !toInst || fromInst.hostZone !== toInst.hostZone) continue;
+      const resolved = resolveMapRouteEndpoints(ev, run.instances);
+      assert.equal(
+        COMPONENTS[resolved.from].hostZone,
+        COMPONENTS[resolved.to].hostZone,
+        `${trace.id}/${ev.id} (kind=${ev.kind}): same-host runtime event must never span two catalog hostZones (${resolved.from} -> ${resolved.to})`,
+      );
+    }
+  }
+
+  // Negative fixture: two distinct containers on the same worker host MUST NOT match in-JVM even when one omits executorNumber
+  const diffContainerInstances: Record<string, RuntimeInstance> = {
+    'exec-1-c': {
+      id: 'exec-1-c',
+      componentId: 'executor',
+      label: 'Executor 1',
+      shortLabel: 'Exec-1',
+      hostZone: 'worker-node-a',
+      hostLabel: 'worker-a',
+      processId: 'Executor 1 JVM',
+      containerId: 'container_e01_000002',
+      executorNumber: 1,
+    },
+    'exec-3-helper': {
+      id: 'exec-3-helper',
+      componentId: 'block-manager',
+      label: 'Exec-3 BlockManager',
+      shortLabel: 'Exec-3 BM',
+      hostZone: 'worker-node-a',
+      hostLabel: 'worker-a',
+      processId: 'Executor 3 JVM',
+      containerId: 'container_e01_000004',
+    },
+  };
+  assert.ok(
+    validateEventLocality(
+      {
+        id: 'neg-diff-container-in-jvm',
+        kind: 'local',
+        channel: 'internal',
+        port: 'worker-a in-JVM',
+        protocol: 'In-JVM Call',
+        fromInstance: 'exec-1-c',
+        toInstance: 'exec-3-helper',
+      },
+      diffContainerInstances,
+    )?.includes('Cross-process in-JVM'),
+    'Expected different known containerIds on same worker host to be rejected for in-JVM calls even when executorNumber is omitted',
+  );
+
+  // Client-mode driver role: SparkSession -> SparkContext on submit-host MUST still belong to the Driver plane!
+  const clientDiscoveryRun = adaptTraceToRun(
+    ALL_TRACES.find(t => t.id === 'flow-client-discovery')!,
+  );
+  const fcdSessionToSc = clientDiscoveryRun.events.find(e => e.id === 'fcd-1-2a')!;
+  assert.ok(fcdSessionToSc, 'Expected fcd-1-2a SparkSession -> SparkContext event');
+  assert.equal(clientDiscoveryRun.instances[fcdSessionToSc.fromInstance]?.hostZone, 'submit-host');
+  assert.equal(isDriverRuntimeInstance(clientDiscoveryRun.instances[fcdSessionToSc.fromInstance]), true);
+  assert.equal(isDriverRuntimeInstance(clientDiscoveryRun.instances[fcdSessionToSc.toInstance]), true);
 });
 

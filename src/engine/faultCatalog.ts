@@ -7,7 +7,8 @@ export type FaultCategoryId =
   | 'rpc-result-storage'
   | 'shuffle-plane'
   | 'sql-broadcast-aqe'
-  | 'python-commit-obs';
+  | 'python-commit-obs'
+  | 'jvm-classpath-serde';
 
 export interface FaultCategoryMeta {
   id: FaultCategoryId;
@@ -79,6 +80,13 @@ export const FAULT_CATEGORIES: FaultCategoryMeta[] = [
     description:
       'Python worker crashes, daemon stdout corruption, version mismatch, idle worker kills, speculative commit races, V1 commitJob failures, listener bus drops, and dynamic allocation startup guards.',
   },
+  {
+    id: 'jvm-classpath-serde',
+    label: 'JVM Classpath, Kryo & Security',
+    short: 'JVM / Kryo / Sec',
+    description:
+      'Scala/Java entry-class & dependency ClassNotFoundException (101/13/15), Kryo registration & buffer overflow, Scala/Java UDF exceptions, Encoders.bean errors, and Kerberos NameNode delegation token expiry.',
+  },
 ];
 
 export const FAULT_CATEGORY_MAP: Record<FaultCategoryId, FaultCategoryMeta> =
@@ -149,7 +157,14 @@ export type SimulatedFault =
   | 'speculation-race'
   | 'commit-job-failure'
   | 'listener-bus-overflow'
-  | 'dynalloc-no-shuffle-service';
+  | 'dynalloc-no-shuffle-service'
+  // Category: jvm-classpath-serde (6)
+  | 'class-not-found-jar'
+  | 'kryo-unregistered-class'
+  | 'kryo-buffer-overflow'
+  | 'scala-java-udf-exception'
+  | 'java-bean-encoder-error'
+  | 'delegation-token-expired';
 
 export interface FaultRequirements {
   shuffle?: boolean;
@@ -163,6 +178,8 @@ export interface FaultRequirements {
   minExecutors?: number;
   essEnabled?: boolean;
   dynamicAllocation?: boolean;
+  jvmApp?: boolean;
+  pysparkOnly?: boolean;
 }
 
 export interface FaultMeta {
@@ -944,7 +961,7 @@ export const SIMULATED_FAULTS: FaultMeta[] = [
     triggerSummary:
       'Python worker dies mid-batch (segfault/crash); PythonRunner hits EOFException ("Python worker exited unexpectedly (crashed)") and retries the task.',
     sourceRef: 'PythonRunner.scala ("Python worker exited unexpectedly (crashed)")',
-    requires: { pythonUdf: true },
+    requires: { pythonUdf: true, pysparkOnly: true },
   },
   {
     id: 'python-daemon-stdout-corrupt',
@@ -960,7 +977,7 @@ export const SIMULATED_FAULTS: FaultMeta[] = [
     triggerSummary:
       'Stray stdout from pyspark.daemon startup corrupts the daemon handshake BEFORE any worker process is spawned; PythonWorkerFactory.startDaemon throws "Bad data in ... standard output".',
     sourceRef: 'PythonWorkerFactory.scala:338-405 (startDaemon -> "Bad data in $daemonModule\'s standard output")',
-    requires: { pythonUdf: true },
+    requires: { pythonUdf: true, pysparkOnly: true },
   },
   {
     id: 'python-version-mismatch',
@@ -976,7 +993,7 @@ export const SIMULATED_FAULTS: FaultMeta[] = [
     triggerSummary:
       'Worker reads partition index and then checks driver Python version inside the length-framed init handshake, returning PYTHON_VERSION_MISMATCH via the init response before processing rows.',
     sourceRef: 'python/pyspark/worker.py:100-146 (report_init_response, invoke_udf); worker_message.py:230-235; worker_util.py (PYTHON_VERSION_MISMATCH)',
-    requires: { pythonUdf: true },
+    requires: { pythonUdf: true, pysparkOnly: true },
   },
   {
     id: 'python-idle-timeout',
@@ -992,7 +1009,7 @@ export const SIMULATED_FAULTS: FaultMeta[] = [
     triggerSummary:
       'Stuck Python worker exceeds spark.python.worker.idleTimeoutSeconds with killOnIdleTimeout=true; PythonRunner/PythonWorkerFactory invokes ProcessHandle.destroy() (graceful terminate, not destroyForcibly()/SIGKILL) and retries the task.',
     sourceRef: 'PythonRunner.scala:885-905,1465-1475; PythonWorkerHandle.scala:62 (ProcessHandle.destroy()); PythonWorkerFactory.scala:501-532',
-    requires: { pythonUdf: true },
+    requires: { pythonUdf: true, pysparkOnly: true },
   },
   {
     id: 'speculation-race',
@@ -1060,6 +1077,121 @@ export const SIMULATED_FAULTS: FaultMeta[] = [
       'With dynamic allocation on and all 4 shuffle-preservation options off, ExecutorAllocationManager.validateSettings throws SparkException (in client mode after AM reaches RUNNING, sc.stop() sends Shutdown(0) -> YARN AM SUCCEEDED while orders.py exits 1).',
     sourceRef: 'SparkContext.scala:678,722-736,785-795,2607; ApplicationMaster.scala:834-886; ExecutorAllocationManager.scala:234-255',
     requires: { dynamicAllocation: true, essEnabled: false },
+  },
+
+  // ---------------------------------------------------------------------------
+  // 10. JVM Classpath, Kryo & Security (6)
+  // ---------------------------------------------------------------------------
+  {
+    id: 'class-not-found-jar',
+    category: 'jvm-classpath-serde',
+    label: 'Main Class / Dependency ClassNotFoundException (101 / 13 / 15)',
+    short: 'ClassNotFound (101/13/15)',
+    severity: 'terminal',
+    whoKillsOrDetects:
+      'Client SparkSubmit lookup (exit 101) vs Cluster AM loadClass/getMethod pre-init (exit 13) vs post-init main() (exit 15)',
+    exitCodeOrException:
+      'Client: SparkUserAppException(SparkExitCode.CLASS_NOT_FOUND=101); Cluster AM pre-reg loadClass: EXIT_SC_NOT_INITED=13 (0 unregister); Cluster post-reg dependency in main(): EXIT_EXCEPTION_USER_CLASS=15',
+    configOrLimit:
+      '--class, --jar / --jars, spark.driver.userClassPathFirst (AM ChildFirstURLClassLoader; changes lookup order, cannot supply missing class)',
+    evidence:
+      'Per SparkSubmit.scala:992-1025 client lookup throws SparkUserAppException(101) before any AM exists. Per ApplicationMaster.scala:741-793 & 377-392, cluster AM loadClass().getMethod() runs BEFORE the user thread handler so a missing main class hits outer AM catch -> unregistered EXIT_SC_NOT_INITED=13 (no unregisterAM). A missing dependency first loaded inside invoked main() AFTER AM registration exits EXIT_EXCEPTION_USER_CLASS=15.',
+    triggerSummary:
+      'Missing --class fails in client SparkSubmit with exit 101 (before AM) or in cluster AM loadClass() with unregistered EXIT_SC_NOT_INITED=13; a missing dependency first loaded inside main() after AM registration exits EXIT_EXCEPTION_USER_CLASS=15.',
+    sourceRef: 'SparkSubmit.scala:992-1025; ApplicationMaster.scala:84-95,377-392,741-793; SparkExitCode.scala:44',
+    requires: { jvmApp: true },
+  },
+  {
+    id: 'kryo-unregistered-class',
+    category: 'jvm-classpath-serde',
+    label: 'Kryo Unregistered Data Class (registrationRequired=true)',
+    short: 'Kryo Unregistered',
+    severity: 'terminal',
+    whoKillsOrDetects:
+      'Executor SerializerManager -> KryoSerializer (Kryo 4.0.3) on JVM Pair-RDD shuffle (rdd.reduceByKey / ShuffledRDD[K, OrderEvent]; SQL ShuffleExchangeExec uses UnsafeRowSerializer; closures use JavaSerializer)',
+    exitCodeOrException:
+      'IllegalArgumentException: Class is not registered (Kryo 4.0.3; wrapped in SparkException on task/serializer boundary)',
+    configOrLimit:
+      'spark.serializer=org.apache.spark.serializer.KryoSerializer; spark.kryo.registrationRequired=true (default false); spark.kryo.classesToRegister',
+    evidence:
+      'With spark.serializer=KryoSerializer and spark.kryo.registrationRequired=true, serializing an unregistered JVM DTO (com.acme.OrderEvent) during a JVM Pair-RDD shuffle (rdd.reduceByKey / ShuffledRDD[K, OrderEvent]) causes Kryo 4.0.3 to throw IllegalArgumentException("Class is not registered"). Explicitly distinct from SQL ShuffleExchangeExec (ShuffleExchangeExec.scala:219-265), which always uses UnsafeRowSerializer regardless of spark.serializer, and from task closures, which always use SparkEnv.closureSerializer (JavaSerializer). In PySpark mode, this executes on an auxiliary JVM-side Pair-RDD helper path.',
+    triggerSummary:
+      'JVM Pair-RDD shuffle (rdd.reduceByKey / ShuffledRDD[K, OrderEvent]) with spark.kryo.registrationRequired=true throws Kryo 4.0.3 IllegalArgumentException("Class is not registered") (SQL ShuffleExchangeExec uses UnsafeRowSerializer; closures use JavaSerializer).',
+    sourceRef: 'KryoSerializer.scala:90,143; Kryo.scala:24-27; SerializerManager.scala:85-107; ShuffleExchangeExec.scala:219-265',
+  },
+  {
+    id: 'kryo-buffer-overflow',
+    category: 'jvm-classpath-serde',
+    label: 'Kryo Buffer Overflow (> spark.kryoserializer.buffer.max)',
+    short: 'Kryo Buffer Overflow',
+    severity: 'terminal',
+    whoKillsOrDetects:
+      'Driver JVM PairRDDFunctions.aggregateByKey -> bounded KryoSerializerInstance.serialize() (in PySpark via JVM helper; Python RDD.aggregateByKey uses copy.deepcopy)',
+    exitCodeOrException:
+      'SparkException (errorClass="KRYO_BUFFER_OVERFLOW", wrapping KryoException: Buffer overflow)',
+    configOrLimit:
+      'spark.kryoserializer.buffer.max (default 64m, max < 2048m); applies to bounded KryoSerializerInstance.serialize(), NOT streamed shuffle partitions or SQL ShuffleExchangeExec (UnsafeRowSerializer)',
+    evidence:
+      'Per KryoSerializer.scala:448-461, bounded KryoSerializerInstance.serialize() catches KryoException("Buffer overflow") and wraps it into SparkException(KRYO_BUFFER_OVERFLOW) -- e.g. JVM PairRDDFunctions.aggregateByKey (PairRDDFunctions.scala:155-165) serializing an oversized zeroValue (> 64m) on the driver. In PySpark mode, this invokes a JVM helper because Python RDD.aggregateByKey (python/pyspark/core/rdd.py:3909-3919) clones zeroValue via copy.deepcopy rather than KryoSerializerInstance.serialize().',
+    triggerSummary:
+      'Driver JVM PairRDDFunctions.aggregateByKey exceeds spark.kryoserializer.buffer.max (64 MiB default) in bounded KryoSerializerInstance.serialize() -> SparkException(KRYO_BUFFER_OVERFLOW) (in PySpark via JVM helper; Python RDD.aggregateByKey uses copy.deepcopy).',
+    sourceRef: 'KryoSerializer.scala:448-461; PairRDDFunctions.scala:155-165; python/pyspark/core/rdd.py:3909-3919; Kryo.scala:61-64',
+  },
+  {
+    id: 'scala-java-udf-exception',
+    category: 'jvm-classpath-serde',
+    label: 'Scala / Java UDF Exception (FAILED_EXECUTE_UDF)',
+    short: 'Scala/Java UDF Fail',
+    severity: 'terminal',
+    whoKillsOrDetects:
+      'Executor JVM ScalaUDF / Java UDF1<Double, Double> (also PySpark registerJavaFunction)',
+    exitCodeOrException:
+      'SparkException (errorClass="FAILED_EXECUTE_UDF") -> Stage aborted (4 counted failures of same task); cluster AM exits 15 (Scala/Java) or 1 (PySpark); client launcher exits 1 while SC stop() sends Shutdown(0)',
+    configOrLimit:
+      'spark.task.maxFailures=4 (4 counted failures of same task); deterministic user exception inside ScalaUDF / Java UDF1.call(Double)',
+    evidence:
+      'Both generated and interpreted ScalaUDF paths (ScalaUDF.scala:1171) wrap ordinary exceptions from user Scala/Java UDF code (including PySpark spark.udf.registerJavaFunction) as SparkException(FAILED_EXECUTE_UDF). After 4 counted failures of the same task, TaskSetManager aborts the stage; uncaught exit in cluster mode selects AM exit 15 (Scala/Java) or 1 (PySpark), while client mode unwinds the launcher with exit 1 and YarnClientSchedulerBackend.stop() sends Shutdown(0) before super.stop().',
+    triggerSummary:
+      'Deterministic user exception inside ScalaUDF / Java UDF1 (including PySpark registerJavaFunction) wraps as SparkException(FAILED_EXECUTE_UDF), exhausts 4 task attempts, and aborts the stage.',
+    sourceRef: 'ScalaUDF.scala:1125-1175; ApplicationMaster.scala:775-785,911; YarnClientSchedulerBackend.scala:174-190',
+    requires: { sqlCodegen: true },
+  },
+  {
+    id: 'java-bean-encoder-error',
+    category: 'jvm-classpath-serde',
+    label: 'Encoders.bean() Derivation Error (Circular / Interface / Unsupported)',
+    short: 'JavaBean Encoder Err',
+    severity: 'terminal',
+    whoKillsOrDetects: 'Driver Encoders.bean() -> JavaTypeInference.encoderFor (before SparkSession.createDataset)',
+    exitCodeOrException:
+      'SparkUnsupportedOperationException (errorClass="CIRCULAR_CLASS_REFERENCE"; siblings: ENCODER_NOT_FOUND, BEAN_ENCODER_INTERFACE_NOT_SUPPORTED)',
+    configOrLimit:
+      'Encoders.bean(OrderNode.class) requires acyclic public JavaBean with no-arg constructor and getter/setter pairs',
+    evidence:
+      'Per Encoders.scala:211, JavaTypeInference.scala:153-186, and ExecutionErrors.scala:181-192, static Encoders.bean() fails directly on the driver during JavaBeanEncoder derivation (before spark.createDataset() is ever entered) when a readable bean property introduces a circular reference (CIRCULAR_CLASS_REFERENCE), an interface type (BEAN_ENCODER_INTERFACE_NOT_SUPPORTED), or an unsupported field type (ENCODER_NOT_FOUND) -- before any stage launches.',
+    triggerSummary:
+      'Driver Encoders.bean() -> JavaTypeInference.encoderFor rejects circular references (CIRCULAR_CLASS_REFERENCE), interface fields, or unsupported types before spark.createDataset() or any stage runs.',
+    sourceRef: 'Encoders.scala:211; JavaTypeInference.scala:153-190; ExecutionErrors.scala:181-192',
+    requires: { jvmApp: true },
+  },
+  {
+    id: 'delegation-token-expired',
+    category: 'jvm-classpath-serde',
+    label: 'HDFS NameNode Delegation Token Expired (InvalidToken)',
+    short: 'Delegation Token Exp',
+    severity: 'terminal',
+    whoKillsOrDetects:
+      'HDFS NameNode (:8020) SASL IPC connection setup (AbstractDelegationTokenSecretManager.retrievePassword) rejecting expired HDFS delegation token (NOT DataNode block access token)',
+    exitCodeOrException:
+      'RemoteException(org.apache.hadoop.security.token.SecretManager$InvalidToken: token can not be found in cache / is expired)',
+    configOrLimit:
+      'Hadoop 3.4.1 defaults: 24h renewal interval, 7-day max lifetime (hdfs-default.xml:1458-1471); Spark HadoopDelegationTokenManager renews at 0.75 * (earliestProviderRenewalTime - now) when keytab/ticket-cache renewal is enabled; retry via spark.security.credentials.retryWait',
+    evidence:
+      'Per Hadoop Client.java:764-800 and AbstractDelegationTokenSecretManager.java:528-551, Hadoop authenticates HDFS delegation tokens during SASL IPC connection setup (an existing authenticated connection is reused without re-checking the token on every call). When a long-running job exceeds delegation token lifetime without Spark HadoopDelegationTokenManager acquiring fresh tokens, a fresh NameNode (:8020) IPC connection / reconnect fails during SASL token auth (retrievePassword -> SecretManager$InvalidToken) BEFORE the pending getBlockLocations/create metadata RPC executes (distinct from DataNode :9866 per-block access tokens and OIDC UserCredentialManager).',
+    triggerSummary:
+      'Expired HDFS delegation token (past 24h renewal / 7d max lifetime without HadoopDelegationTokenManager 0.75x refresh) causes a fresh NameNode (:8020) IPC connection / reconnect to fail during SASL token auth (AbstractDelegationTokenSecretManager.retrievePassword -> SecretManager$InvalidToken) before the pending metadata RPC executes.',
+    sourceRef:
+      'HadoopDelegationTokenManager.scala:274-313; SupportsDelegationToken.scala:75-93; Hadoop Client.java:764-800; AbstractDelegationTokenSecretManager.java:528-551',
   },
 ];
 

@@ -1,4 +1,4 @@
-import type { ComponentId, ComponentSpec } from './types';
+import type { ComponentId, ComponentSpec } from './types.ts';
 
 export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
   // 1. Submission & Allocation (4)
@@ -9,6 +9,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'submission',
     hostZone: 'submit-host',
     clusterPos: [144, 106],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Submit JVM (org.apache.spark.deploy.SparkSubmit) on submit host',
     role: 'Parses CLI arguments and properties, resolves deploy mode and primary resources, and invokes YarnClusterApplication (cluster) or deploy.PythonRunner (client) inside the submit JVM.',
     keyDistinction:
@@ -60,6 +61,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'submission',
     hostZone: 'submit-host',
     clusterPos: [324, 106],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Submit JVM (cluster) or client-mode Driver JVM (org.apache.spark.deploy.yarn.Client)',
     role: 'Obtains a YARN ApplicationId, validates per-container memory caps, stages local resources and __spark_conf__ to HDFS, submits the AM ApplicationSubmissionContext, and polls ApplicationReport.',
     keyDistinction:
@@ -111,7 +113,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'submission',
     hostZone: 'driver-jvm',
     subZone: 'AM BRIDGE & DRIVER CORE',
-    clusterPos: [148, 290],
+    clusterPos: [148, 294],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'YARN AM Container JVM (ApplicationMaster in cluster mode / ExecutorLauncher in client mode)',
     role: 'Represents one YARN application attempt: starts the user Driver thread (cluster) or connects to the external driver (client), registers the attempt with the RM, hosts YarnAllocator and the Reporter loop, and unregisters final attempt status.',
     keyDistinction:
@@ -163,7 +166,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'submission',
     hostZone: 'driver-jvm',
     subZone: 'AM BRIDGE & DRIVER CORE',
-    clusterPos: [148, 362],
+    clusterPos: [148, 360],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'AM JVM (org.apache.spark.deploy.yarn.YarnAllocator)',
     role: 'Reconciles desired executor targets per ResourceProfile with YARN AMRMClient container requests, matches RM grants by host/rack/any, launches executor JVMs on NodeManagers via ExecutorRunnable, and classifies completed container losses.',
     keyDistinction:
@@ -216,6 +220,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'cluster-hdfs',
     hostZone: 'yarn-control',
     clusterPos: [658, 106],
+    languages: ['pyspark', 'scala', 'java'],
     port: ':8032 / :8030 / :8031',
     process: 'Long-lived Hadoop RM daemon JVM (shared cluster service, HA active/standby)',
     role: 'Arbitrates cluster queue capacity, tracks live NodeManagers and application attempts, directs AMLauncher to start the AM container, and grants executor containers in response to AM allocate heartbeats.',
@@ -267,7 +272,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'NodeManager',
     subsystem: 'cluster-hdfs',
     hostZone: 'worker-node-a',
-    clusterPos: [156, 758],
+    clusterPos: [156, 858],
+    languages: ['pyspark', 'scala', 'java'],
     port: 'dynamic (:0)',
     process: 'Long-lived Hadoop NM daemon JVM (one per YARN worker node)',
     role: 'Validates container grants, localizes staged files into container working directories, spawns and monitors AM/executor OS process trees, enforces memory/disk health, hosts optional YarnShuffleService, and reports container exits to the RM.',
@@ -319,7 +325,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'YARN Container',
     subsystem: 'cluster-hdfs',
     hostZone: 'worker-node-a',
-    clusterPos: [408, 758],
+    clusterPos: [408, 858],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'YARN resource allocation & OS process-tree budget on a granted worker node (not a daemon)',
     role: 'Represents a resource grant (ContainerId, NodeId, memory/vcores capability, and container token) that bounds one AM or executor JVM plus any child Python worker processes on that node.',
     keyDistinction:
@@ -369,6 +376,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'cluster-hdfs',
     hostZone: 'storage-history',
     clusterPos: [1032, 106],
+    languages: ['pyspark', 'scala', 'java'],
     port: ':8020',
     process: 'Long-lived Hadoop NameNode daemon JVM (HA active/standby with JournalNodes)',
     role: 'Owns the HDFS directory tree, file inodes, writer leases, block ID allocations, and live block-to-DataNode location map without ever proxying Parquet or staging file bytes.',
@@ -420,6 +428,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'cluster-hdfs',
     hostZone: 'storage-history',
     clusterPos: [1324, 106],
+    languages: ['pyspark', 'scala', 'java'],
     port: ':9866',
     process: 'Long-lived Hadoop DataNode storage daemon JVM on storage/worker nodes',
     role: 'Stores and serves replicated HDFS block files and checksum metadata on disk, streams read packets to Spark tasks, forwards write packets down replication pipelines, and reports block inventory to the NameNode.',
@@ -465,7 +474,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     docFile: 'hdfs-datanode.md',
   },
 
-  // 3. Driver Runtime (6)
+  // 3. Driver Runtime (9)
   'spark-driver': {
     id: 'spark-driver',
     name: 'Spark Driver JVM',
@@ -473,7 +482,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'driver-runtime',
     hostZone: 'driver-jvm',
     subZone: 'AM BRIDGE & DRIVER CORE',
-    clusterPos: [344, 290],
+    clusterPos: [344, 294],
+    languages: ['pyspark', 'scala', 'java'],
     port: ':41000',
     process: 'AM JVM (cluster mode) or Submit-host JVM (client mode)',
     role: 'Process role hosting SparkContext, SparkSession, SparkEnv, SQL planner, DAG/task schedulers, executor registry, storage/shuffle masters, and SparkUI for one application lifetime.',
@@ -526,7 +536,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'driver-runtime',
     hostZone: 'driver-jvm',
     subZone: 'AM BRIDGE & DRIVER CORE',
-    clusterPos: [148, 506],
+    clusterPos: [148, 492],
+    languages: ['pyspark'],
     process: 'Python interpreter child process spawned by org.apache.spark.deploy.PythonRunner',
     role: 'Executes the submitted top-level .py script once per driver attempt, constructs DataFrames/RDDs and serialized Python closures, invokes driver JVM APIs via Py4J, and receives action results or exceptions.',
     keyDistinction:
@@ -577,7 +588,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'driver-runtime',
     hostZone: 'driver-jvm',
     subZone: 'AM BRIDGE & DRIVER CORE',
-    clusterPos: [148, 578],
+    clusterPos: [148, 558],
+    languages: ['pyspark'],
     port: '127.0.0.1:ephemeral',
     process: 'Py4JServer (ClientServer/GatewayServer) listening on driver-local loopback',
     role: 'Provides the authenticated loopback IPC bridge allowing the Python driver to invoke methods on live driver JVM objects, while large collectToPython row batches stream over a separate SocketAuthServer socket.',
@@ -629,7 +641,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'driver-runtime',
     hostZone: 'driver-jvm',
     subZone: 'AM BRIDGE & DRIVER CORE',
-    clusterPos: [344, 362],
+    clusterPos: [344, 360],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM (org.apache.spark.sql.classic.SparkSession) + Python wrapper',
     role: 'Provides the SQL and DataFrame entry point, isolating per-session SQLConf, local temp views, and registered UDFs in SessionState while sharing CacheManager, ExternalCatalog, and SparkContext via SharedState.',
     keyDistinction:
@@ -679,7 +692,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'driver-runtime',
     hostZone: 'driver-jvm',
     subZone: 'AM BRIDGE & DRIVER CORE',
-    clusterPos: [344, 434],
+    clusterPos: [344, 426],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM singleton (org.apache.spark.SparkContext / JavaSparkContext) + Python wrapper',
     role: 'Owns the Spark application lifecycle, initializes driver SparkEnv, LiveListenerBus, HeartbeatReceiver, schedulers, and optional dynamic allocation/event log, and serves as the runJob boundary into DAGScheduler.',
     keyDistinction:
@@ -730,7 +744,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'driver-runtime',
     hostZone: 'driver-jvm',
     subZone: 'AM BRIDGE & DRIVER CORE',
-    clusterPos: [344, 506],
+    clusterPos: [344, 492],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'One SparkEnv per Spark JVM (driver JVM and each executor JVM; never in Python processes)',
     role: 'Assembles and exposes per-JVM runtime services (RpcEnv, serializers, SecurityManager, MemoryManager, ShuffleManager, BlockManager, BroadcastManager, MapOutputTracker, OutputCommitCoordinator, PythonWorkerFactory cache).',
     keyDistinction:
@@ -774,7 +789,177 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     docFile: 'spark-env.md',
   },
 
-  // 4. Scheduling (5)
+  'jvm-user-app': {
+    id: 'jvm-user-app',
+    name: 'JVM User Application (--class)',
+    shortName: 'JVM User App',
+    subsystem: 'driver-runtime',
+    hostZone: 'driver-jvm',
+    subZone: 'AM BRIDGE & DRIVER CORE',
+    clusterPos: [148, 624],
+    languages: ['scala', 'java'],
+    process:
+      'AM Driver thread (cluster: ApplicationMaster.startUserApplication) or Submit JVM (client: JavaMainApplication)',
+    role: 'Reflects and invokes the user Scala/Java --class static main(String[]) directly inside the JVM with zero Python subprocess or Py4J gateway. In cluster mode the AM loads __app__.jar via userClassLoader; in client mode SparkSubmit invokes JavaMainApplication on the submit classpath while ExecutorLauncher runs the AM, and JavaSparkContext.fromSparkContext wraps the same SparkContext.',
+    keyDistinction:
+      'In cluster mode, uncaught user main exceptions trigger AM EXIT_EXCEPTION_USER_CLASS (15) while pre-registration class lookup failure exits with EXIT_SC_NOT_INITED (13) and zero unregisterApplicationMaster; in client mode, SparkSubmit unwraps and rethrows main exceptions without AM exit 15.',
+    startedBy:
+      'ApplicationMaster.startUserApplication() on the Driver thread (cluster) or SparkSubmit -> JavaMainApplication.start() (client)',
+    monitoredBy:
+      'ApplicationMaster uncaught-exception handler & userClassThread.join() (cluster) or SparkSubmit launcher exit code (client)',
+    stoppedBy:
+      'Returns from main() or throws uncaught exception; SparkContext.stop() or JVM shutdown hook tears down the Spark session',
+    inputs: [
+      'User --class FQCN, localized __app__.jar (cluster) or submit classpath JARs (client), and application arguments',
+      'MutableURLClassLoader or ChildFirstURLClassLoader (spark.driver.userClassPathFirst) plus SparkConf system properties',
+    ],
+    outputs: [
+      'Direct in-JVM SparkSession / SparkContext / JavaSparkContext calls (no Py4J loopback serialization)',
+      'Typed Scala/Java Dataset[T] queries, RDD closures, and process exit status / AM attempt status',
+    ],
+    internalState: [
+      'Loaded userClass Class[_] and reflected public static main(String[]) Method handle',
+      'Thread context classLoader bound to userClassLoader (cluster) or SparkSubmit loader (client)',
+      'In Java apps, JavaSparkContext thin facade delegating every call to the underlying Scala SparkContext',
+    ],
+    failureClues: [
+      'ClassNotFoundException in client SparkSubmit throws SparkUserAppException(101); in cluster AM loadClass() fails before registration with EXIT_SC_NOT_INITED (13)',
+      'Missing or non-static main(String[]) on --class fails before user code runs; check Scala object vs class and jar manifest',
+      'In client mode, an uncaught main exception without sc.stop() lets SparkContext shutdown hook send Shutdown(0), so YARN may show SUCCEEDED/0 even while spark-submit exits non-zero',
+    ],
+    sourceLinks: [
+      {
+        label: 'ApplicationMaster.startUserApplication & EXIT_EXCEPTION_USER_CLASS',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/ApplicationMaster.scala#L741-L790',
+      },
+      {
+        label: 'JavaMainApplication.start (client JVM main entry)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/deploy/SparkApplication.scala#L39-L54',
+      },
+      {
+        label: 'Client.APP_JAR_NAME (__app__.jar localization alias)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/Client.scala#L740-L746',
+      },
+      {
+        label: 'JavaSparkContext wrapper & fromSparkContext',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/api/java/JavaSparkContext.scala#L48-L65',
+      },
+    ],
+    docFile: 'jvm-user-app.md',
+  },
+
+  'delegation-token-manager': {
+    id: 'delegation-token-manager',
+    name: 'HadoopDelegationTokenManager',
+    shortName: 'Delegation Tokens',
+    subsystem: 'driver-runtime',
+    hostZone: 'driver-jvm',
+    subZone: 'AM BRIDGE & DRIVER CORE',
+    clusterPos: [148, 690],
+    languages: ['pyspark', 'scala', 'java'],
+    port: 'Kerberos / RPC',
+    process: 'Driver JVM (org.apache.spark.deploy.security.HadoopDelegationTokenManager)',
+    role: 'Obtains initial Hadoop/Hive/HBase delegation tokens at submission and periodically acquires fresh tokens from the KDC (via keytab or ticket cache) at 0.75 * (earliestProviderRenewalTime - now), broadcasting serialized credentials via UpdateDelegationTokens RPCs to live executors and client-mode AM.',
+    keyDistinction:
+      'NameNode RPCs authenticate Hadoop delegation tokens renewed here, whereas DataNode block streams validate short-lived block access tokens issued by the NameNode; OIDC cloud credentials use the separate sibling UserCredentialManager.',
+    startedBy:
+      'YarnSchedulerBackend.start() starts HadoopDelegationTokenManager on the driver after initial submit credentials are seeded by yarn.Client',
+    monitoredBy:
+      'Renewal scheduler log lines (delay, nextRenewal, ratio) and KDC / NameNode authentication failure exceptions',
+    stoppedBy:
+      'HadoopDelegationTokenManager.stop() cancels the ScheduledExecutorService renewal thread during scheduler backend shutdown',
+    inputs: [
+      'spark.kerberos.principal / spark.kerberos.keytab (or KRB5CCNAME ticket cache) and spark.kerberos.renewal.credentials',
+      'ServiceLoader HadoopDelegationTokenProvider plugins (hadoopfs, hive, hbase) returning earliest provider renewal timestamp',
+    ],
+    outputs: [
+      'Initial UGI Credentials attached to YARN ContainerLaunchContext at submit time',
+      'Periodic UpdateDelegationTokens(tokens: Array[Byte]) RPC fanout to all registered executors and client-mode AM',
+    ],
+    internalState: [
+      'Loaded delegationTokenProviders map and spark.security.credentials.renewalRatio (default 0.75)',
+      'Single-threaded ScheduledExecutorService timer armed for delay = 0.75 * (earliestProviderRenewalTime - now)',
+      'Driver UserGroupInformation updated via SparkHadoopUtil.addDelegationTokens before pushing to executors',
+    ],
+    failureClues: [
+      'InvalidToken ("token is expired") on a new NameNode RPC after 24h indicates missing keytab/principal or expired ccache preventing scheduled renewal',
+      'Token expiry breaks new NameNode metadata RPCs (open/create/rename/complete) rather than DataNode block access token validation',
+      'If spark.security.oidc.enabled=true for cloud object stores, inspect UserCredentialManager separately from HadoopDelegationTokenManager',
+    ],
+    sourceLinks: [
+      {
+        label: 'HadoopDelegationTokenManager.obtainTokensAndScheduleRenewal (0.75 ratio)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/deploy/security/HadoopDelegationTokenManager.scala#L274-L314',
+      },
+      {
+        label: 'HadoopDelegationTokenManager.updateTokensTask -> UpdateDelegationTokens',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/deploy/security/HadoopDelegationTokenManager.scala#L230-L260',
+      },
+      {
+        label: 'UserCredentialManager (distinct OIDC credential propagation path)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/deploy/security/UserCredentialManager.scala#L40-L72',
+      },
+    ],
+    docFile: 'delegation-token-manager.md',
+  },
+
+  'serializer-manager': {
+    id: 'serializer-manager',
+    name: 'SerializerManager (Kryo / Java)',
+    shortName: 'SerializerManager',
+    subsystem: 'driver-runtime',
+    hostZone: 'driver-jvm',
+    subZone: 'AM BRIDGE & DRIVER CORE',
+    clusterPos: [344, 690],
+    languages: ['pyspark', 'scala', 'java'],
+    port: 'in-JVM codec',
+    process: 'Per-JVM SparkEnv SerializerManager (Driver & Executor JVMs)',
+    role: 'Serializes shuffle records, RDD cache partitions, and broadcast values using the configured data serializer (JavaSerializer or KryoSerializer, auto-picking Kryo via canUseKryo for primitive types, primitive arrays, and String -- NOT UnsafeRow) and wraps byte streams with LZ4/zstd compression and optional AES-CTR I/O encryption.',
+    keyDistinction:
+      'Governs data serialization in driver and executors; completely separate from SparkEnv.closureSerializer (which is always JavaSerializer) and driver-side SparkClosureCleaner.',
+    startedBy: 'SparkEnv.create() constructs SerializerManager alongside defaultSerializer and closureSerializer in every Spark JVM',
+    monitoredBy: 'Task serialization/deserialization timing metrics, KryoException diagnostics, and SerializationDebugger traces',
+    stoppedBy: 'Released on SparkEnv.stop(); thread-local Kryo pools are reclaimed when executor threads exit',
+    inputs: [
+      'spark.serializer (JavaSerializer vs KryoSerializer), spark.kryo.registrationRequired, spark.kryoserializer.buffer.max',
+      'BlockId stream flags plus spark.rdd.compress / spark.shuffle.compress / spark.broadcast.compress and ioEncryptionKey',
+    ],
+    outputs: [
+      'Serialized, optionally compressed and encrypted byte streams for ShuffleWriter, MemoryStore/DiskStore, and TorrentBroadcast',
+      'Deserialized JVM objects/records on ShuffleReader and BlockManager read paths (Catalyst SQL shuffles use dedicated UnsafeRowSerializer)',
+    ],
+    internalState: [
+      'defaultSerializer, internal kryoSerializer (canUseKryo fast path for primitives, primitive arrays, and String only), and lazy CompressionCodec instance',
+      'Optional encryptionKey Option[Array[Byte]] from SecurityManager for CryptoStreamUtils stream wrapping',
+      'KryoSerializerInstance pooled Kryo/Output buffers bounded by spark.kryoserializer.buffer.max (default 64m)',
+    ],
+    failureClues: [
+      'IllegalArgumentException("Class is not registered") from Kryo 4.0.3 means spark.kryo.registrationRequired=true hit an unregistered class on the Kryo data path',
+      'SparkException wrapping KryoException("Buffer overflow") in KryoSerializerInstance.serialize means a single object exceeded spark.kryoserializer.buffer.max',
+      'TaskNotSerializableException on driver lambdas comes from SparkClosureCleaner and SparkEnv.closureSerializer (always JavaSerializer), not KryoSerializer',
+    ],
+    sourceLinks: [
+      {
+        label: 'SerializerManager codec selection & stream wrapping',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/serializer/SerializerManager.scala#L37-L145',
+      },
+      {
+        label: 'KryoSerializer registrationRequired & Kryo setup',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/serializer/KryoSerializer.scala#L63-L148',
+      },
+      {
+        label: 'KryoSerializerInstance.serialize Buffer overflow catch',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/serializer/KryoSerializer.scala#L448-L465',
+      },
+      {
+        label: 'SparkEnv.closureSerializer always JavaSerializer',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/SparkEnv.scala#L730-L738',
+      },
+    ],
+    docFile: 'serializer-manager.md',
+  },
+
+  // 4. Scheduling (6)
   'dag-scheduler': {
     id: 'dag-scheduler',
     name: 'DAGScheduler',
@@ -782,7 +967,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'scheduling',
     hostZone: 'driver-jvm',
     subZone: 'SQL PLANNING & SCHEDULERS',
-    clusterPos: [780, 306],
+    clusterPos: [780, 304],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM single-threaded dag-scheduler-event-loop',
     role: 'Splits RDD job lineages at shuffle boundaries into ShuffleMapStages and ResultStages, submits missing partitions as TaskSets once parent shuffle outputs are available, and handles FetchFailed stage resubmission.',
     keyDistinction:
@@ -834,7 +1020,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'scheduling',
     hostZone: 'driver-jvm',
     subZone: 'SQL PLANNING & SCHEDULERS',
-    clusterPos: [780, 390],
+    clusterPos: [780, 396],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM (YarnScheduler / YarnClusterScheduler extending TaskSchedulerImpl)',
     role: 'Orders active TaskSetManagers through FIFO or FAIR scheduling pools, matches DriverEndpoint WorkerOffers to eligible task sets across locality levels and resource profiles, allocates unique TIDs, and routes StatusUpdates to TaskResultGetter.',
     keyDistinction:
@@ -886,7 +1073,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'scheduling',
     hostZone: 'driver-jvm',
     subZone: 'SQL PLANNING & SCHEDULERS',
-    clusterPos: [780, 474],
+    clusterPos: [780, 488],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM Schedulable leaf (one per submitted stage attempt, guarded by TaskSchedulerImpl lock)',
     role: 'Schedules individual partition attempts for one stage attempt using delay-scheduling locality queues, serializes Tasks into TaskDescriptions, manages retries up to spark.task.maxFailures, arbitrates speculation winners, and checks driver result size quotas.',
     keyDistinction:
@@ -938,7 +1126,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'scheduling',
     hostZone: 'driver-jvm',
     subZone: 'SQL PLANNING & SCHEDULERS',
-    clusterPos: [780, 558],
+    clusterPos: [780, 580],
+    languages: ['pyspark', 'scala', 'java'],
     port: 'CoarseGrainedScheduler',
     process: 'Driver JVM IsolatedThreadSafeRpcEndpoint (DriverEndpoint / YarnDriverEndpoint)',
     role: 'Maintains the driver ledger of registered executors and their free cores/custom resources, generates WorkerOffers for TaskSchedulerImpl, encodes and sends LaunchTask/KillTask RPCs, and credits resources back on terminal StatusUpdates.',
@@ -990,7 +1179,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'scheduling',
     hostZone: 'driver-jvm',
     subZone: 'AM BRIDGE & DRIVER CORE',
-    clusterPos: [148, 434],
+    clusterPos: [148, 426],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM YarnSchedulerEndpoint (RPC name: YarnScheduler) + YarnDriverEndpoint override',
     role: 'Adapts cluster-neutral Spark executor allocation and loss queries to YARN by proxying absolute per-profile RequestExecutors, KillExecutors, GetExecutorLossReason, and Shutdown RPCs between the driver and the registered ApplicationMaster.',
     keyDistinction:
@@ -1035,14 +1225,70 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     docFile: 'yarn-scheduler-backend.md',
   },
 
-  // 5. Executor & RPC (5)
+  'health-tracker': {
+    id: 'health-tracker',
+    name: 'HealthTracker (ExcludeOnFailure)',
+    shortName: 'HealthTracker',
+    subsystem: 'scheduling',
+    hostZone: 'driver-jvm',
+    subZone: 'CAPACITY, LIVENESS & MASTERS',
+    clusterPos: [1020, 580],
+    languages: ['pyspark', 'scala', 'java'],
+    process:
+      'Driver JVM HealthTracker + TaskSetExcludeList; AM JVM YarnAllocatorNodeHealthTracker',
+    role: 'Tracks failing executors and nodes when spark.excludeOnFailure.enabled=true, excludes unhealthy executors/nodes from TaskSetManager resource offers with expiry timeouts, optionally kills excluded executors, and sends excluded hosts to AM-side YarnAllocatorNodeHealthTracker for YARN RM placement avoidance.',
+    keyDistinction:
+      'Driver-side HealthTracker filters task scheduling inside the Driver JVM, whereas AM-side YarnAllocatorNodeHealthTracker tracks container launch failures and updates RM exclusions inside the AM JVM (separate hosts in client mode).',
+    startedBy:
+      'TaskSchedulerImpl instantiates HealthTracker when spark.excludeOnFailure.enabled=true; YarnAllocator instantiates YarnAllocatorNodeHealthTracker in the AM',
+    monitoredBy:
+      'SparkListenerExecutorExcluded / NodeExcluded events on LiveListenerBus and Spark UI Executors tab',
+    stoppedBy:
+      'Entries expire via applyExcludeOnFailureTimeout(); tracker shuts down with TaskSchedulerImpl / YarnAllocator',
+    inputs: [
+      'TaskSetManager task failure reports (executorId, host, taskIndex) and successful TaskSet completion updates',
+      'spark.excludeOnFailure.application.maxFailedTasksPerExecutor, maxFailedExecutorsPerNode, and timeout configs',
+    ],
+    outputs: [
+      'isExecutorExcluded(execId) / isNodeExcluded(host) predicates checked during TaskSchedulerImpl.resourceOffers',
+      'Excluded node set forwarded via YarnSchedulerBackend -> YarnAM -> YarnAllocatorNodeHealthTracker -> RM updateBlacklist',
+    ],
+    internalState: [
+      'executorIdToFailureList and nodeIdToExcludedExecs failure ledger with expiry timestamps',
+      'Lock-free AtomicReference nodeBlacklist snapshot read by YarnSchedulerBackend',
+      'Per-stage TaskSetExcludeList plus AM-side YarnAllocatorNodeHealthTracker container-launch failure counts',
+    ],
+    failureClues: [
+      '"Aborting TaskSet because task cannot run anywhere due to node and executor excludeOnFailure" means every live executor/node hit the exclusion threshold',
+      'Application-level exclusion triggers only after a TaskSet succeeds elsewhere or hits max failures across distinct tasks, avoiding false exclusion from deterministic bad user code',
+      'In client mode, driver HealthTracker lives on edge-01 while YarnAllocatorNodeHealthTracker runs inside the AM container on the cluster',
+    ],
+    sourceLinks: [
+      {
+        label: 'HealthTracker executor & node exclusion ledger',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/scheduler/HealthTracker.scala#L52-L130',
+      },
+      {
+        label: 'HealthTracker.isExecutorExcluded & isNodeExcluded',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/scheduler/HealthTracker.scala#L318-L345',
+      },
+      {
+        label: 'YarnAllocatorNodeHealthTracker (AM-side RM node exclusion)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnAllocatorNodeHealthTracker.scala#L47-L115',
+      },
+    ],
+    docFile: 'health-tracker.md',
+  },
+
+  // 5. Executor & RPC (7)
   'executor-backend': {
     id: 'executor-backend',
     name: 'CoarseGrainedExecutorBackend',
     shortName: 'ExecutorBackend',
     subsystem: 'executor-rpc',
     hostZone: 'worker-node-a',
-    clusterPos: [660, 758],
+    clusterPos: [660, 858],
+    languages: ['pyspark', 'scala', 'java'],
     port: 'client-mode RPC',
     process: 'Executor JVM IsolatedThreadSafeRpcEndpoint (YarnCoarseGrainedExecutorBackend, RPC name: Executor)',
     role: 'Bootstraps an executor JVM by fetching SparkAppConfig from the driver URL, creates the executor SparkEnv, registers with the driver, constructs the Executor runtime, signals LaunchedExecutor, and relays LaunchTask/KillTask/StatusUpdate RPCs.',
@@ -1093,7 +1339,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'Executor',
     subsystem: 'executor-rpc',
     hostZone: 'worker-node-a',
-    clusterPos: [156, 854],
+    clusterPos: [156, 944],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Long-lived Scala object inside the executor JVM (org.apache.spark.executor.Executor)',
     role: 'Initializes the executor BlockManager, user class loader, plugins, and heartbeater; runs assigned TaskRunners on its daemon UninterruptibleThread pool; tracks kill marks and optional task reapers; and reports periodic heartbeats to the driver.',
     keyDistinction:
@@ -1144,7 +1391,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'Task Attempt',
     subsystem: 'executor-rpc',
     hostZone: 'worker-node-a',
-    clusterPos: [408, 854],
+    clusterPos: [408, 944],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'One UninterruptibleThread in Executor pool (Executor.TaskRunner + TaskContextImpl)',
     role: 'Executes one scheduled attempt of a ShuffleMapTask or ResultTask: fetches dependencies, deserializes the Task, installs thread-local TaskContext and TaskMemoryManager, runs partition computation, cleans locks/memory, and sends terminal StatusUpdate.',
     keyDistinction:
@@ -1196,7 +1444,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'executor-rpc',
     hostZone: 'driver-jvm',
     subZone: 'SQL PLANNING & SCHEDULERS',
-    clusterPos: [584, 558],
+    clusterPos: [780, 672],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM worker pool (4 daemon task-result-getter threads owned by TaskSchedulerImpl)',
     role: 'Deserializes direct task results or fetches IndirectTaskResult blocks via BlockManager outside the scheduler lock, enforces spark.driver.maxResultSize via TaskSetManager, decodes failure reasons, and invokes scheduler completion callbacks.',
     keyDistinction:
@@ -1247,7 +1496,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'executor-rpc',
     hostZone: 'driver-jvm',
     subZone: 'AM BRIDGE & DRIVER CORE',
-    clusterPos: [344, 578],
+    clusterPos: [344, 558],
+    languages: ['pyspark', 'scala', 'java'],
     port: ':41000',
     process: 'Control-plane Netty transport router in driver (server mode), executors & client AM (clientMode=true)',
     role: 'Multiplexes named Spark RpcEndpoints over one listening port on the driver and delivers reverse LaunchTask/KillTask commands to client-mode executors over the existing TCP connection each executor opened.',
@@ -1292,7 +1542,109 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     docFile: 'rpc-env.md',
   },
 
-  // 6. Capacity & Observability (9)
+  'rpc-file-server': {
+    id: 'rpc-file-server',
+    name: 'RPC File Server (NettyStreamManager)',
+    shortName: 'RPC File Server',
+    subsystem: 'executor-rpc',
+    hostZone: 'driver-jvm',
+    subZone: 'AM BRIDGE & DRIVER CORE',
+    clusterPos: [344, 624],
+    languages: ['pyspark', 'scala', 'java'],
+    port: ':41000 /files,/jars',
+    process: 'Driver NettyRpcEnv NettyStreamManager (spark://driver:41000/files & /jars)',
+    role: 'Registers dynamic files, archives, and JARs added via SparkContext.addFile() / addJar() and streams them over the Driver NettyRpcEnv channel when executors call Executor.updateDependencies(), making downloaded files readable locally through SparkFiles.get().',
+    keyDistinction:
+      'Serves runtime addFile/addJar streams directly from the Driver RpcEnv; completely distinct from YARN HDFS .sparkStaging container localization (pre-launch) and BlockTransferService shuffle/RDD transfers.',
+    startedBy: 'NettyRpcEnv instantiates NettyStreamManager on the driver and exposes it as rpcEnv.fileServer',
+    monitoredBy: 'SparkContext.addFile / addJar logs and Executor.updateDependencies fetch logs on workers',
+    stoppedBy: 'Torn down when Driver NettyRpcEnv shuts down on SparkContext.stop()',
+    inputs: [
+      'Local file/JAR/directory registrations from SparkContext.addFile() and SparkContext.addJar()',
+      'Executor TransportClient stream requests for spark://driver:41000/files/<name> and /jars/<name>',
+    ],
+    outputs: [
+      'spark://driver:41000/files/... and /jars/... URIs propagated in TaskDescription resource maps',
+      'FileSegmentManagedBuffer streams copied into executor SparkFiles root directory and URLClassLoader',
+    ],
+    internalState: [
+      'ConcurrentHashMap registries: files, jars, and dirs mapping stream names to driver-local File paths',
+      'StreamId parser routing /files/<name>, /jars/<name>, and /<dir>/<path> to openStream()',
+      'Executor-side SparkFiles.getRootDirectory() cache avoiding duplicate downloads for unchanged timestamps',
+    ],
+    failureClues: [
+      'FileNotFoundException on SparkFiles.get(name) means the file was not registered via addFile/--files or was passed with a directory prefix instead of its basename',
+      'Stream open timeout from executors to driver:41000 points to driver overload or network firewall blocking spark:// file downloads',
+      'Large multi-GB files added via sc.addFile() saturate driver network bandwidth because every executor fetches directly from the driver rather than HDFS',
+    ],
+    sourceLinks: [
+      {
+        label: 'NettyStreamManager.openStream, addFile & addJar',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/rpc/netty/NettyStreamManager.scala#L39-L95',
+      },
+      {
+        label: 'SparkFiles.get localized file path lookup',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/SparkFiles.scala#L25-L43',
+      },
+    ],
+    docFile: 'rpc-file-server.md',
+  },
+
+  'transport-context': {
+    id: 'transport-context',
+    name: 'Netty TransportContext',
+    shortName: 'TransportContext',
+    subsystem: 'executor-rpc',
+    hostZone: 'worker-node-a',
+    clusterPos: [408, 1116],
+    languages: ['pyspark', 'scala', 'java'],
+    port: 'Netty TCP',
+    process: 'Shared spark-network-common Netty substrate in Driver, Executor & ESS JVMs',
+    role: 'Provides the shared Netty framing, connection pooling, chunked zero-copy streaming, and SASL/AES channel bootstrap layer (TransportServer, TransportClientFactory, TransportChannelHandler) underlying NettyRpcEnv, NettyBlockTransferService, and ExternalShuffleService.',
+    keyDistinction:
+      'Shared Netty transport infrastructure embedded in multiple JVMs (Driver, Executors, ESS) rather than a separate daemon or an extra network hop on Worker A.',
+    startedBy:
+      'Instantiated by NettyRpcEnv, NettyBlockTransferService, and YarnShuffleService/ExternalShuffleBlockHandler with their module TransportConf and RpcHandler',
+    monitoredBy:
+      'TransportServer / TransportClientFactory Netty metrics (direct memory, open connections) and IOException / TimeoutException logs',
+    stoppedBy:
+      'Closed alongside its owning NettyRpcEnv, BlockTransferService, or ExternalShuffleService shutdown',
+    inputs: [
+      'Module-scoped TransportConf (rpc, shuffle, or files io.mode, io.numConnectionsPerPeer, io.serverThreads, io.clientThreads)',
+      'Pluggable RpcHandler and optional TransportServerBootstrap / TransportClientBootstrap (SaslServerBootstrap, AuthClientBootstrap)',
+    ],
+    outputs: [
+      'Bound Netty TransportServer listening sockets and pooled TransportClient channels per (host, port)',
+      'Framed RpcRequest, ChunkFetchRequest, StreamRequest, and PushBlockStream messages dispatched to TransportRequestHandler / TransportResponseHandler',
+    ],
+    internalState: [
+      'TransportConf, RpcHandler, MessageEncoder/MessageDecoder, and Netty PooledByteBufAllocator',
+      'TransportClientFactory connection pool keyed by SocketAddress with per-peer connection array',
+      'IdleStateHandler channel timeout monitors (spark.network.timeout)',
+    ],
+    failureClues: [
+      'OutOfDirectMemoryError in Netty points to high concurrent shuffle/RPC chunk buffers exceeding off-heap direct memory limits',
+      'Connection reset / ClosedChannelException across peers can stem from GC pauses exceeding spark.network.timeout or mismatched SASL auth bootstraps',
+      'Each service (rpc vs shuffle) owns its own TransportContext and TransportConf prefix (spark.rpc.io.* vs spark.shuffle.io.*)',
+    ],
+    sourceLinks: [
+      {
+        label: 'TransportContext server, client factory & pipeline init',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/common/network-common/src/main/java/org/apache/spark/network/TransportContext.java#L75-L210',
+      },
+      {
+        label: 'TransportServer Netty bind & channel bootstrap',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/common/network-common/src/main/java/org/apache/spark/network/server/TransportServer.java#L45-L125',
+      },
+      {
+        label: 'TransportClientFactory pooled client connections',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/common/network-common/src/main/java/org/apache/spark/network/client/TransportClientFactory.java#L66-L195',
+      },
+    ],
+    docFile: 'transport-context.md',
+  },
+
+  // 6. Capacity & Observability (10)
   'executor-allocation-manager': {
     id: 'executor-allocation-manager',
     name: 'ExecutorAllocationManager',
@@ -1300,7 +1652,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'observability',
     hostZone: 'driver-jvm',
     subZone: 'CAPACITY, LIVENESS & MASTERS',
-    clusterPos: [1020, 306],
+    clusterPos: [1020, 304],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM policy controller (100 ms fixed-delay daemon thread, active only with dynamic allocation)',
     role: 'Computes per-ResourceProfile executor demand from pending/running tasks, ramps target executor counts exponentially on sustained backlog, lowers target when demand falls, and removes eligible idle executors supplied by ExecutorMonitor.',
     keyDistinction:
@@ -1351,7 +1704,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'observability',
     hostZone: 'driver-jvm',
     subZone: 'CAPACITY, LIVENESS & MASTERS',
-    clusterPos: [1020, 390],
+    clusterPos: [1020, 396],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM SparkListener on executorManagement queue (owned by ExecutorAllocationManager)',
     role: 'Tracks each executor running-task count, cached RDD blocks, and tracked shuffle outputs to compute idle expiration deadlines and return removal-eligible (executorId, resourceProfileId) candidates.',
     keyDistinction:
@@ -1402,7 +1756,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'observability',
     hostZone: 'driver-jvm',
     subZone: 'CAPACITY, LIVENESS & MASTERS',
-    clusterPos: [1020, 474],
+    clusterPos: [1020, 488],
+    languages: ['pyspark', 'scala', 'java'],
     port: 'HeartbeatReceiver',
     process: 'Driver JVM ThreadSafeRpcEndpoint (RPC name: HeartbeatReceiver) + SparkListener',
     role: 'Tracks driver receipt timestamps for executor heartbeats, forwards in-flight task accumulator and metric updates to TaskScheduler/DAGScheduler and BlockManagerMasterHeartbeat, and expires silent executors past network timeout.',
@@ -1455,7 +1810,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'observability',
     hostZone: 'driver-jvm',
     subZone: 'OBSERVABILITY & LIVE UI',
-    clusterPos: [1554, 298],
+    clusterPos: [1554, 304],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM asynchronous event dispatcher (named AsyncEventQueue daemon threads)',
     role: 'Decouples scheduler threads from observers by offering posted SparkListenerEvents into isolated, bounded per-queue FIFOs (appStatus, eventLog, executorManagement, shared) for serial per-queue delivery.',
     keyDistinction:
@@ -1505,7 +1861,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'observability',
     hostZone: 'driver-jvm',
     subZone: 'OBSERVABILITY & LIVE UI',
-    clusterPos: [1554, 382],
+    clusterPos: [1554, 580],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM EventLoggingListener (eventLog queue) writing JSONL files to shared storage',
     role: 'Serializes selected SparkListenerEvents via JsonProtocol as UTF-8 JSON lines (optionally compressed and rolled into eventlog_v2 segments) to shared HDFS/filesystem storage for offline History Server replay.',
     keyDistinction:
@@ -1556,7 +1913,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'observability',
     hostZone: 'driver-jvm',
     subZone: 'OBSERVABILITY & LIVE UI',
-    clusterPos: [1554, 466],
+    clusterPos: [1554, 488],
+    languages: ['pyspark', 'scala', 'java'],
     port: ':4040',
     process: 'Embedded Jetty HTTP server + AppStatusStore inside the driver JVM',
     role: 'Serves live web tabs (Jobs, Stages, Storage, Environment, Executors, SQL) and /api/v1 REST endpoints directly from the driver in-memory/local KV AppStatusStore updated by AppStatusListener and SQLAppStatusListener.',
@@ -1608,6 +1966,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'observability',
     hostZone: 'storage-history',
     clusterPos: [1616, 106],
+    languages: ['pyspark', 'scala', 'java'],
     port: ':18080',
     process: 'Optional standalone JVM daemon (org.apache.spark.deploy.history.HistoryServer)',
     role: 'Scans shared spark.history.fs.logDirectory event logs across many applications, indexes application attempts, and synchronously replays JSONL event logs through ReplayListenerBus to serve reconstructed read-only SparkUI and REST views.',
@@ -1658,12 +2017,13 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'observability',
     hostZone: 'driver-jvm',
     subZone: 'OBSERVABILITY & LIVE UI',
-    clusterPos: [1554, 550],
+    clusterPos: [1554, 672],
+    languages: ['pyspark', 'scala', 'java'],
     port: '/metrics/*',
     process: 'Per-JVM Dropwizard MetricRegistry engine (driver, each executor, and YARN ApplicationMaster)',
     role: 'Instantiates a per-JVM Dropwizard MetricRegistry via MetricsSystem.createMetricsSystem(instance, conf), loads metrics.properties sources and sinks, registers internal Spark Sources (DAGSchedulerSource, BlockManagerSource, ExecutorMetricsSource, ApplicationMasterSource), runs periodic Sink reporters, and exposes /metrics/json and /metrics/prometheus servlets on SparkUI.',
     keyDistinction:
-      'MetricsSystem is a live Dropwizard push/scrape telemetry plane running independently inside every Spark JVM (driver, executors, AM) with its own sinks—completely separate from LiveListenerBus, AppStatusStore, and offline History Server event logs.',
+      'MetricsSystem is a live Dropwizard push/scrape telemetry plane running independently inside every Spark JVM (driver, executors, AM) with its own sinks -- completely separate from LiveListenerBus, AppStatusStore, and offline History Server event logs.',
     startedBy: 'SparkEnv.create (driver defers start() until SparkContext gets appId; executors start immediately after setting spark.executor.id) and ApplicationMaster.createAllocator (start(false))',
     monitoredBy: 'Configured Dropwizard Sinks (JmxSink, GraphiteSink, CsvSink, Slf4jSink), Prometheus scrapers on /metrics/prometheus, and /metrics/json probes',
     stoppedBy: 'SparkContext.stop() (report() flush) then SparkEnv.stop() calling metricsSystem.stop(), and ApplicationMaster shutdown',
@@ -1684,7 +2044,7 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     ],
     failureClues: [
       'Calling getServletHandlers before start() throws IllegalArgumentException; driver defers start() so spark.app.id prefixes registry names',
-      'Executor Dropwizard sinks report directly from each worker JVM—Prometheus scraping only driver :4040 will not see executor-only sources unless configured or proxied',
+      'Executor Dropwizard sinks report directly from each worker JVM -- Prometheus scraping only driver :4040 will not see executor-only sources unless configured or proxied',
       'MetricsSystem time-series vanish with the JVM and are never replayed by History Server (unlike HDFS event logs)',
     ],
     sourceLinks: [
@@ -1710,7 +2070,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'ExecMetricsPoller',
     subsystem: 'observability',
     hostZone: 'worker-node-b',
-    clusterPos: [1652, 950],
+    clusterPos: [1652, 1030],
+    languages: ['pyspark', 'scala', 'java'],
     port: 'in-JVM poll',
     process: 'Per-executor JVM sampler (ExecutorMetricsPoller + ExecutorMetricsSource)',
     role: 'Samples live JVM heap/off-heap, direct/mapped buffer, UnifiedMemoryManager, and optional Linux /proc process-tree metrics via ExecutorMetrics.getCurrentMetrics(memoryManager), maintains atomic per-stage (stageTCMP) and per-task (taskMetricPeaks) high-water marks, updates ExecutorMetricsSource Dropwizard gauges, and drains stage peaks into Executor.reportHeartBeat().',
@@ -1756,14 +2117,73 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     docFile: 'executor-metrics-poller.md',
   },
 
-  // 7. Block Storage (5)
+  'app-status-store': {
+    id: 'app-status-store',
+    name: 'AppStatusStore & KVStore',
+    shortName: 'AppStatusStore',
+    subsystem: 'observability',
+    hostZone: 'driver-jvm',
+    subZone: 'OBSERVABILITY & LIVE UI',
+    clusterPos: [1554, 396],
+    languages: ['pyspark', 'scala', 'java'],
+    process: 'Driver JVM (AppStatusListener -> ElementTrackingStore -> AppStatusStore)',
+    role: 'Ingests SparkListener events from LiveListenerBus via AppStatusListener, stores bounded job, stage, task, RDD, and executor summaries in ElementTrackingStore (InMemoryStore by default, or RocksDB when spark.ui.store.path is configured), and serves indexed queries to SparkUI and the /api/v1 REST endpoints.',
+    keyDistinction:
+      'Driver AppStatusStore holds live in-flight state fed by LiveListenerBus (disk-backed live UI uses RocksDB only per KVUtils.scala:50-58); after completion, History Server reads HDFS event logs via FsHistoryProvider.rebuildAppStore and replays them into its own separate KVStore.',
+    startedBy:
+      'AppStatusStore.createLiveStore() inside SparkContext initialization attaches AppStatusListener to the appStatus listener queue',
+    monitoredBy:
+      'Driver heap / KVStore retention counts (spark.ui.retainedJobs, retainedStages, retainedTasks) and LiveListenerBus appStatus drop counters',
+    stoppedBy:
+      'AppStatusStore.close() closes the underlying ElementTrackingStore / KVStore during SparkContext.stop()',
+    inputs: [
+      'SparkListenerJobStart, StageSubmitted, TaskEnd, ExecutorMetricsUpdate, and BlockUpdated events delivered via LiveListenerBus',
+      'Retention limits (spark.ui.retainedJobs, spark.ui.retainedStages, spark.ui.retainedTasks, spark.ui.liveUpdate.period)',
+    ],
+    outputs: [
+      'Typed v1 API projections (jobsList, stageList, taskList, executorList, rddList) backing SparkUI :4040 and REST API',
+      'Async ElementTrackingStore threshold triggers pruning old jobs/stages/tasks to cap driver memory',
+    ],
+    internalState: [
+      'AppStatusListener live mutable maps (liveJobs, liveStages, liveTasks, liveExecutors) flushed on update period',
+      'ElementTrackingStore wrapping InMemoryStore (default live) or RocksDB disk-backed KVStore (live UI uses RocksDB only) with count triggers',
+      'AppStatusStore read-only query facade shared across SparkUI tabs (distinct from History Server replay store)',
+    ],
+    failureClues: [
+      'Driver OOM during apps with hundreds of thousands of tasks or stages often traces to high spark.ui.retainedTasks / retainedStages in live InMemoryStore',
+      'Missing or frozen stages in SparkUI :4040 while tasks finish points to LiveListenerBus appStatus queue drops or AppStatusListener backlog',
+      'Differences between live SparkUI :4040 and History Server :18080 occur because History Server rebuilds a separate store by replaying HDFS event logs',
+    ],
+    sourceLinks: [
+      {
+        label: 'AppStatusStore.createLiveStore',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/status/AppStatusStore.scala#L857-L885',
+      },
+      {
+        label: 'AppStatusListener event ingestion',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/status/AppStatusListener.scala#L48-L95',
+      },
+      {
+        label: 'ElementTrackingStore retention triggers',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/status/ElementTrackingStore.scala#L50-L135',
+      },
+      {
+        label: 'FsHistoryProvider.rebuildAppStore & parseAppEventLogs (separate History Server replay store)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/deploy/history/FsHistoryProvider.scala#L1428-L1474',
+      },
+    ],
+    docFile: 'app-status-store.md',
+  },
+
+  // 7. Block Storage & Memory (8)
   'block-manager': {
     id: 'block-manager',
     name: 'BlockManager',
     shortName: 'BlockManager',
     subsystem: 'block-storage',
     hostZone: 'worker-node-a',
-    clusterPos: [660, 854],
+    clusterPos: [660, 944],
+    languages: ['pyspark', 'scala', 'java'],
     port: ':42001',
     process: 'Per-JVM storage subsystem (one in driver SparkEnv, one in each executor SparkEnv)',
     role: 'Stores and retrieves RDD partitions, broadcast pieces, and task results in local MemoryStore or DiskStore under per-block locks, replicates blocks to peer managers, reports statuses to BlockManagerMaster, and falls back to peer fetches on local misses.',
@@ -1816,7 +2236,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'block-storage',
     hostZone: 'driver-jvm',
     subZone: 'CAPACITY, LIVENESS & MASTERS',
-    clusterPos: [1216, 306],
+    clusterPos: [1216, 304],
+    languages: ['pyspark', 'scala', 'java'],
     port: 'BlockManagerMaster',
     process: 'Driver JVM RPC endpoints (BlockManagerMaster & BlockManagerMasterHeartbeat) + per-JVM client facade',
     role: 'Indexes which BlockManagers have reported each RDD, broadcast, or task-result block along with storage tiers, sizes, and memory accounting; answers location and peer lookups; and fans out block removal commands without ever storing or proxying bytes.',
@@ -1868,7 +2289,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'BlockTransferSvc',
     subsystem: 'block-storage',
     hostZone: 'worker-node-a',
-    clusterPos: [912, 854],
+    clusterPos: [912, 944],
+    languages: ['pyspark', 'scala', 'java'],
     port: ':42001',
     process: 'Per-JVM Netty data-plane server & client (NettyBlockTransferService + NettyBlockRpcServer)',
     role: 'Moves raw block bytes (RDD partitions, broadcast pieces, indirect task results, non-ESS shuffle blocks, and replicated uploads) between Spark JVMs on a dedicated Netty port separate from scheduler RPC.',
@@ -1919,7 +2341,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'RDD Cache',
     subsystem: 'block-storage',
     hostZone: 'worker-node-a',
-    clusterPos: [156, 950],
+    clusterPos: [156, 1030],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Executor JVM RDD.iterator / getOrCompute collaborating with local BlockManager',
     role: 'Implements the per-partition cache lookup, write-lock admission, memory-or-disk storage, and lineage recomputation fallback for RDDBlockId(rddId, partitionIndex) whenever a persisted RDD is evaluated.',
     keyDistinction:
@@ -1969,7 +2392,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'block-storage',
     hostZone: 'driver-jvm',
     subZone: 'CAPACITY, LIVENESS & MASTERS',
-    clusterPos: [1216, 474],
+    clusterPos: [1216, 488],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Per-JVM BroadcastManager + TorrentBroadcastFactory (seeded on driver, resolved lazily on executors)',
     role: 'Seeds a read-only broadcast value on the driver as numbered 4 MiB torrent pieces in BlockManager, hands tasks a compact Broadcast handle, and lazily fetches missing pieces from driver or peers to reassemble and cache the value per JVM.',
     keyDistinction:
@@ -2013,7 +2437,166 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     docFile: 'broadcast-manager.md',
   },
 
-  // 8. Shuffle (6)
+  'memory-manager': {
+    id: 'memory-manager',
+    name: 'UnifiedMemoryManager & TaskMemoryManager',
+    shortName: 'MemoryManager',
+    subsystem: 'block-storage',
+    hostZone: 'worker-node-a',
+    clusterPos: [156, 1116],
+    languages: ['pyspark', 'scala', 'java'],
+    port: 'in-JVM heap/offheap',
+    process: 'Per-SparkEnv UnifiedMemoryManager + per-TaskRunner TaskMemoryManager',
+    role: 'Manages the shared on-heap and off-heap unified memory region (spark.memory.fraction) across ExecutionMemoryPool (shuffle, sort, hash aggregation, join) and StorageMemoryPool (RDD cache, broadcast), allowing dynamic borrowing, storage eviction back to storageFraction, and MemoryConsumer spill callbacks via TaskMemoryManager.',
+    keyDistinction:
+      'Governs JVM execution and storage pools inside each SparkEnv (driver and executors), and does NOT track or bound external Python worker process RSS (which YARN NodeManager PMEM checks enforce against memoryOverhead / pyspark.memory).',
+    startedBy:
+      'UnifiedMemoryManager.apply() is created in SparkEnv.create(); Executor creates one TaskMemoryManager per TaskRunner',
+    monitoredBy:
+      'TaskMetrics memoryBytesSpilled / diskBytesSpilled, Spark UI Storage/Executors memory columns, and TaskMemoryManager leak warnings',
+    stoppedBy:
+      'TaskMemoryManager.cleanUpAllAllocatedMemory() frees pages in TaskRunner finally block; UnifiedMemoryManager exits with SparkEnv',
+    inputs: [
+      'spark.memory.fraction (default 0.6), spark.memory.storageFraction (default 0.5), spark.memory.offHeap.enabled / size',
+      'acquireExecutionMemory() from UnsafeExternalSorter / BytesToBytesMap and acquireStorageMemory() from MemoryStore',
+    ],
+    outputs: [
+      'Allocated Tungsten MemoryBlocks (13-bit page table + 51-bit offset) and ExecutionMemoryPool grants per active task',
+      'Spill triggers invoked on TaskMemoryManager MemoryConsumers and MemoryStore block eviction callbacks',
+    ],
+    internalState: [
+      'onHeapExecutionMemoryPool, onHeapStorageMemoryPool, offHeapExecutionMemoryPool, and offHeapStorageMemoryPool',
+      'TaskMemoryManager pageTable (up to 8192 pages per task) and active MemoryConsumer registry',
+      'Per-task fair share bounds (1/(2N) .. 1/N of execution pool across N active tasks)',
+    ],
+    failureClues: [
+      'SparkOutOfMemoryError ("Unable to acquire N bytes of memory") means execution consumers could not spill enough pages to satisfy a single allocation',
+      'YARN container exit 143 / PMEM kill during Python UDFs happens outside UnifiedMemoryManager because python3 worker RSS lives outside the JVM',
+      '"Managed memory leak detected" logged at task end means a MemoryConsumer failed to release pages before TaskMemoryManager cleanup',
+    ],
+    sourceLinks: [
+      {
+        label: 'UnifiedMemoryManager execution & storage borrowing',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/memory/UnifiedMemoryManager.scala#L58-L215',
+      },
+      {
+        label: 'TaskMemoryManager acquireExecutionMemory & spill loop',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/java/org/apache/spark/memory/TaskMemoryManager.java#L58-L210',
+      },
+      {
+        label: 'TaskMemoryManager.cleanUpAllAllocatedMemory leak guard',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/java/org/apache/spark/memory/TaskMemoryManager.java#L925-L960',
+      },
+    ],
+    docFile: 'memory-manager.md',
+  },
+
+  'context-cleaner': {
+    id: 'context-cleaner',
+    name: 'ContextCleaner',
+    shortName: 'ContextCleaner',
+    subsystem: 'block-storage',
+    hostZone: 'driver-jvm',
+    subZone: 'CAPACITY, LIVENESS & MASTERS',
+    clusterPos: [1216, 580],
+    languages: ['pyspark', 'scala', 'java'],
+    process: 'Driver JVM daemon thread (Spark Context Cleaner)',
+    role: 'Tracks WeakReference handles for RDDs, ShuffleDependencies, Broadcast variables, and Accumulators in a JVM ReferenceQueue; once driver GC collects an unreferenced object, its background cleaning thread triggers async cleanup on BlockManagerMaster, MapOutputTrackerMaster, and DAGScheduler.',
+    keyDistinction:
+      'Cleanup is asynchronous and driven by driver JVM GC of weak references -- not synchronous end-of-stage deletion -- so shuffle files and broadcast blocks remain until GC enqueues the reference or explicit unpersist()/destroy() is called.',
+    startedBy: 'SparkContext starts ContextCleaner (when spark.cleaner.referenceTracking=true, the default)',
+    monitoredBy: 'CleanerListener callbacks and ContextCleaner debug/info logs ("Cleaned rdd/shuffle/broadcast")',
+    stoppedBy: 'ContextCleaner.stop() sets stopped=true and interrupts the cleaning thread during SparkContext.stop()',
+    inputs: [
+      'registerRDDForCleanup, registerShuffleForCleanup, registerBroadcastForCleanup, and registerAccumulatorForCleanup calls',
+      'JVM ReferenceQueue notifications emitted asynchronously after driver garbage collection',
+    ],
+    outputs: [
+      'BlockManagerMaster.removeRdd(), removeShuffle(), and removeBroadcast() RPC fanout to executors',
+      'MapOutputTrackerMaster.unregisterShuffle() and optional periodic System.gc() (spark.cleaner.periodicGC.interval)',
+    ],
+    internalState: [
+      'referenceBuffer: ConcurrentHashMap.newKeySet[CleanupTaskWeakReference] keeping weak refs alive until enqueued',
+      'referenceQueue: ReferenceQueue[AnyRef] polled continuously by the Spark Context Cleaner daemon thread',
+      'blocking/non-blocking cleanup flags (spark.cleaner.referenceTracking.blocking & blocking.shuffle)',
+    ],
+    failureClues: [
+      'Growing shuffle disk usage in long-running SparkSession apps often means driver objects still hold strong references or driver GC has not run yet',
+      'Setting spark.cleaner.referenceTracking=false disables automatic cleanup entirely, leaking RDD, shuffle, and broadcast blocks until app exit',
+      'Explicit df.unpersist() / broadcast.destroy() is deterministic, whereas relying on ContextCleaner depends on driver GC timing',
+    ],
+    sourceLinks: [
+      {
+        label: 'ContextCleaner ReferenceQueue & keepCleaning daemon loop',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/ContextCleaner.scala#L65-L224',
+      },
+      {
+        label: 'doCleanupRDD, doCleanupShuffle & doCleanupBroadcast',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/ContextCleaner.scala#L225-L330',
+      },
+    ],
+    docFile: 'context-cleaner.md',
+  },
+
+  'block-manager-decommissioner': {
+    id: 'block-manager-decommissioner',
+    name: 'BlockManagerDecommissioner',
+    shortName: 'BM Decommissioner',
+    subsystem: 'block-storage',
+    hostZone: 'worker-node-a',
+    clusterPos: [912, 1116],
+    languages: ['pyspark', 'scala', 'java'],
+    port: ':42001 -> peer',
+    process: 'Executor JVM (org.apache.spark.storage.BlockManagerDecommissioner)',
+    role: 'Proactively migrates cached RDD storage blocks and local shuffle data/index files off a decommissioning executor onto live peer BlockManagers via BlockTransferService before YARN terminates the container, preserving shuffle outputs without stage recomputation.',
+    keyDistinction:
+      'On YARN, YarnAllocator enables RM DECOMMISSIONING handling ONLY when spark.decommission.enabled=true AND External Shuffle Service is OFF (spark.shuffle.service.enabled=false, SPARK-39018), alongside storage/shuffle migration configs.',
+    startedBy:
+      'CoarseGrainedExecutorBackend.decommissionSelf() triggers BlockManager.decommissionBlockManager() -> new BlockManagerDecommissioner().start()',
+    monitoredBy:
+      'BlockManagerDecommissioner.lastMigrationInfo(), executor migration logs, and BlockManagerMaster updated peer block locations',
+    stoppedBy:
+      'BlockManagerDecommissioner.stop() shuts down migration threads once all blocks/shuffle files migrate or the container exits',
+    inputs: [
+      'RM AllocateResponse NodeState.DECOMMISSIONING -> YarnAllocator -> DecommissionExecutorsOnHost -> DecommissionExecutor RPC',
+      'spark.decommission.enabled=true, spark.storage.decommission.rddBlocks.enabled, spark.storage.decommission.shuffleBlocks.enabled',
+    ],
+    outputs: [
+      'BlockTransferService.uploadBlockSync() pushing RDD blocks and shuffle .data/.index files to selected live peer BlockManagers',
+      'MapOutputTrackerMaster / BlockManagerMaster location updates pointing reducers to peer executors',
+    ],
+    internalState: [
+      'shufflesToMigrate queue and per-peer ShuffleMigrationRunnable worker pool',
+      'rddBlockMigrationThread replicating cached RDD blocks via BlockManager.replicateBlock()',
+      'fallbackStorage fallback option when no live peer executor has room for migrated blocks',
+    ],
+    failureClues: [
+      'Setting spark.decommission.enabled=true with spark.shuffle.service.enabled=true logs a SPARK-39018 warning and disables YARN DECOMMISSIONING executor handling in YarnAllocator',
+      'If shuffle migration lags behind YARN graceful decommission timeout, unmigrated map blocks trigger FetchFailed and stage recomputation',
+      'Zero live peer executors leaves BlockManagerDecommissioner unable to migrate unless spark.storage.decommission.fallbackStorage.path is configured',
+    ],
+    sourceLinks: [
+      {
+        label: 'BlockManagerDecommissioner & ShuffleMigrationRunnable',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/storage/BlockManagerDecommissioner.scala#L39-L115',
+      },
+      {
+        label: 'YarnAllocator isYarnExecutorDecommissionEnabled (ESS OFF gate)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnAllocator.scala#L192-L203',
+      },
+      {
+        label: 'YarnAllocator.handleNodesInDecommissioningState',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/resource-managers/yarn/src/main/scala/org/apache/spark/deploy/yarn/YarnAllocator.scala#L475-L510',
+      },
+      {
+        label: 'CoarseGrainedExecutorBackend.decommissionSelf',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/executor/CoarseGrainedExecutorBackend.scala#L318-L345',
+      },
+    ],
+    docFile: 'block-manager-decommissioner.md',
+  },
+
+  // 8. Shuffle (7)
   'map-output-tracker-master': {
     id: 'map-output-tracker-master',
     name: 'MapOutputTrackerMaster',
@@ -2021,7 +2604,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'shuffle',
     hostZone: 'driver-jvm',
     subZone: 'CAPACITY, LIVENESS & MASTERS',
-    clusterPos: [1216, 390],
+    clusterPos: [1216, 396],
+    languages: ['pyspark', 'scala', 'java'],
     port: 'MapOutputTracker',
     process: 'Driver JVM RPC endpoint (MapOutputTracker) + dedicated serialization dispatcher pool',
     role: 'Maintains the driver directory of accepted MapStatus entries per shuffle (indexed by logical mapIndex), serves compressed or broadcast status snapshots to executors, computes per-reducer statistics for AQE, and advances epoch on map-output invalidation.',
@@ -2072,7 +2656,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'MapOutputWorker',
     subsystem: 'shuffle',
     hostZone: 'worker-node-a',
-    clusterPos: [912, 950],
+    clusterPos: [912, 1030],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Executor JVM shared shuffle metadata cache (one instance per executor SparkEnv)',
     role: 'Caches full shuffle MapStatus arrays per executor, fetches missing snapshots once per shuffle via per-shuffle KeyLock, filters out zero-byte blocks, groups nonempty ShuffleBlockIds by serving BlockManagerId, and invalidates its cache on higher task epochs.',
     keyDistinction:
@@ -2122,7 +2707,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'Shuffle Writer',
     subsystem: 'shuffle',
     hostZone: 'worker-node-a',
-    clusterPos: [408, 950],
+    clusterPos: [408, 1030],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Task-local writer in map executor JVM (BypassMergeSort / Unsafe / SortShuffleWriter)',
     role: 'Consumes one map partition iterator, routes each record to its destination reduce partition (with optional combine/spill), commits contiguous partition segments via IndexShuffleBlockResolver, and returns MapStatus metadata to the driver.',
     keyDistinction:
@@ -2171,7 +2757,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'Shuffle Reader',
     subsystem: 'shuffle',
     hostZone: 'worker-node-b',
-    clusterPos: [1204, 758],
+    clusterPos: [1204, 858],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Task-local BlockStoreShuffleReader + ShuffleBlockFetcherIterator in reducing executor JVM',
     role: 'Reads a reducer task partition range across map outputs via local disk, host-local direct reads, or asynchronous remote Netty fetches (bounded by in-flight limits), decompresses/deserializes streams, and applies optional reduce-side aggregation or sorting.',
     keyDistinction:
@@ -2220,7 +2807,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'ShuffleResolver',
     subsystem: 'shuffle',
     hostZone: 'worker-node-a',
-    clusterPos: [660, 950],
+    clusterPos: [660, 1030],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Executor JVM file-format resolver (IndexShuffleBlockResolver + DiskBlockManager)',
     role: 'Commits each map output into permanent shuffle_<shuffleId>_<mapId>_0.data and .index files (8*(R+1) big-endian 64-bit offsets), and translates logical ShuffleBlockId / ShuffleBlockBatchId reads into exact FileSegmentManagedBuffer byte ranges.',
     keyDistinction:
@@ -2269,7 +2857,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'Ext Shuffle Service',
     subsystem: 'shuffle',
     hostZone: 'worker-node-a',
-    clusterPos: [912, 758],
+    clusterPos: [912, 858],
+    languages: ['pyspark', 'scala', 'java'],
     port: ':7337',
     process: 'Optional NodeManager auxiliary service inside NM JVM (YarnShuffleService)',
     role: 'Runs a Netty shuffle server inside each NodeManager so reducers can fetch local shuffle file slices (and optionally disk RDD blocks) even after the producing executor JVM exits, decoupling shuffle availability from executor lifetime.',
@@ -2314,7 +2903,65 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     docFile: 'external-shuffle-service.md',
   },
 
-  // 9. SQL Execution (5)
+  'push-based-shuffle': {
+    id: 'push-based-shuffle',
+    name: 'Push-Based Shuffle (Pusher & Merger)',
+    shortName: 'Push-Based Shuffle',
+    subsystem: 'shuffle',
+    hostZone: 'worker-node-a',
+    clusterPos: [660, 1116],
+    languages: ['pyspark', 'scala', 'java'],
+    port: 'ESS :7337 push',
+    process: 'Executor ShuffleBlockPusher -> ExternalShuffleService RemoteBlockPushResolver',
+    role: 'Asynchronously pushes completed map shuffle blocks from map executors to DAGScheduler-selected ExternalShuffleService mergers (RemoteBlockPushResolver), merging blocks per reduce partition into sequential merged data/index/meta files so reducers read large sequential chunks (via push-merged-local disk reads on the merger host or remote FetchShuffleBlockChunks) with automatic unmerged fallback.',
+    keyDistinction:
+      'Requires External Shuffle Service ON (spark.shuffle.service.enabled=true) with ESS-side spark.shuffle.push.server.mergedShuffleFileManagerImpl=org.apache.spark.network.shuffle.RemoteBlockPushResolver (defaults to no-op NoOpMergedShuffleFileManager), YARN mode, spark.shuffle.push.enabled=true, I/O encryption OFF, and a relocation-capable serializer; pushes are best-effort, so reducers read merged chunks plus any unmerged original blocks via fallback.',
+    startedBy:
+      'DAGScheduler selects shuffle merger locations for a ShuffleMapStage; ShuffleWriteProcessor registers a PostStatusUpdateListener so ShuffleBlockPusher.initiateBlockPush() runs after the map task finishes writing and sends its status update to the driver',
+    monitoredBy:
+      'ShuffleReadMetrics mergedFetchFallbackCount / remoteMergedBlocksFetched and ESS RemoteBlockPushResolver merge logs',
+    stoppedBy:
+      'DAGScheduler waits spark.shuffle.push.finalize.timeout before sending FinalizeShuffleMerge and spark.shuffle.push.results.timeout for merger replies before starting the reduce stage; ShuffleBlockPusher pool stops with Executor',
+    inputs: [
+      'Completed local shuffle .data/.index files and target BlockManagerId merger locations assigned by DAGScheduler',
+      'ESS-side spark.shuffle.push.server.mergedShuffleFileManagerImpl=org.apache.spark.network.shuffle.RemoteBlockPushResolver (default NoOpMergedShuffleFileManager), plus client spark.shuffle.push.enabled=true, spark.shuffle.service.enabled=true, spark.io.encryption.enabled=false, and min merger threshold configs',
+    ],
+    outputs: [
+      'Async PushBlockStream transfers over Netty to ESS :7337 RemoteBlockPushResolver.receiveBlockDataAsStream()',
+      'Merged shuffle .data / .index / .meta files and MergeStatus bitmaps registered in MapOutputTrackerMaster after FinalizeShuffleMerge',
+    ],
+    internalState: [
+      'ShuffleBlockPusher bounded in-flight push queues (maxBlockSizeToPush, maxBlocksInFlightPerAddress)',
+      'RemoteBlockPushResolver per-(appId, shuffleId, reduceId) AppShufflePartitionInfo merge state and RoaringBitmap of merged mapIds',
+      'Reducer ShuffleBlockFetcherIterator routing same-host mergers to push-merged-local (ESS dir discovery + local disk read) and remote mergers to FetchShuffleBlockChunks, plus FetchShuffleBlocks unmerged fallback',
+    ],
+    failureClues: [
+      'Omitting ESS-side spark.shuffle.push.server.mergedShuffleFileManagerImpl=org.apache.spark.network.shuffle.RemoteBlockPushResolver leaves the default NoOpMergedShuffleFileManager active, silently disabling server-side merge',
+      'Utils.isPushBasedShuffleEnabled silently falls back to standard shuffle with a warning if ESS is disabled, I/O encryption is enabled, or serializer lacks relocation support',
+      'Small 2-worker clusters require lowering spark.shuffle.push.mergersMinThresholdRatio / mergersMinStaticThreshold so DAGScheduler activates mergers; late pushes after FinalizeShuffleMerge are rejected cleanly and read via unmerged fallback',
+    ],
+    sourceLinks: [
+      {
+        label: 'ShuffleWriteProcessor post-status-update push trigger',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/shuffle/ShuffleWriteProcessor.scala#L74-L115',
+      },
+      {
+        label: 'ShuffleBlockPusher.initiateBlockPush & pushUpToMax',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/shuffle/ShuffleBlockPusher.scala#L52-L175',
+      },
+      {
+        label: 'RemoteBlockPushResolver.receiveBlockDataAsStream & finalizeShuffleMerge',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/common/network-shuffle/src/main/java/org/apache/spark/network/shuffle/RemoteBlockPushResolver.java#L644-L790',
+      },
+      {
+        label: 'Utils.isPushBasedShuffleEnabled preconditions (ESS ON, no I/O encryption)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/core/src/main/scala/org/apache/spark/util/Utils.scala#L2638-L2673',
+      },
+    ],
+    docFile: 'push-based-shuffle.md',
+  },
+
+  // 9. SQL Execution (8)
   'sql-planner': {
     id: 'sql-planner',
     name: 'Spark SQL Physical Planner',
@@ -2322,7 +2969,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'sql-execution',
     hostZone: 'driver-jvm',
     subZone: 'SQL PLANNING & SCHEDULERS',
-    clusterPos: [584, 306],
+    clusterPos: [584, 396],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM Catalyst planning pipeline (SessionState.planner + QueryExecution)',
     role: 'Transforms an analyzed and optimized LogicalPlan through ordered SparkStrategies (such as JoinSelection) into a physical SparkPlan tree, then runs preparation rules like EnsureRequirements to insert exchanges and local sorts.',
     keyDistinction:
@@ -2373,7 +3021,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'sql-execution',
     hostZone: 'driver-jvm',
     subZone: 'SQL PLANNING & SCHEDULERS',
-    clusterPos: [584, 390],
+    clusterPos: [584, 488],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM AdaptiveSparkPlanExec execution loop',
     role: 'Materializes leaf ShuffleQueryStageExec and BroadcastQueryStageExec stages, reads actual runtime MapOutputStatistics, and replans unread portions of the query to coalesce partitions, switch joins to broadcast, or split skewed join reads.',
     keyDistinction:
@@ -2423,7 +3072,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'sql-execution',
     hostZone: 'driver-jvm',
     subZone: 'SQL PLANNING & SCHEDULERS',
-    clusterPos: [584, 474],
+    clusterPos: [584, 580],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM async build job on broadcast-exchange thread pool',
     role: 'Collects all rows of the build-side child onto the driver, constructs an indexed HashedRelation (LongHashedRelation or UnsafeHashedRelation), checks row and 8 GiB table-size guards, and publishes it via SparkContext.broadcastInternal(serializedOnly=true).',
     keyDistinction:
@@ -2473,7 +3123,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'BroadcastHashJoin',
     subsystem: 'sql-execution',
     hostZone: 'worker-node-b',
-    clusterPos: [1428, 758],
+    clusterPos: [1428, 858],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Executor JVM task operator (codegen or row path) + Driver plan node',
     role: 'Resolves the Broadcast[HashedRelation] handle via asReadOnlyCopy() inside each streamed-side partition task, probes the in-memory hash table for every streamed row, evaluates residual non-equi predicates, and emits joined rows without shuffling the streamed side.',
     keyDistinction:
@@ -2523,7 +3174,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'Python UDF Exec',
     subsystem: 'sql-execution',
     hostZone: 'worker-node-b',
-    clusterPos: [1652, 758],
+    clusterPos: [1652, 858],
+    languages: ['pyspark'],
     process: 'Executor JVM EvalPythonExec (BatchEvalPythonExec / ArrowEvalPythonExec)',
     role: 'Extracts non-JVM scalar PythonUDFs into a physical operator that projects and deduplicates only UDF arguments to a local Python worker via pickle or Arrow batches, buffers pass-through columns in a FIFO HybridRowQueue, and joins returning results one-for-one.',
     keyDistinction:
@@ -2566,14 +3218,192 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     docFile: 'python-udf-operator.md',
   },
 
-  // 10. Python Workers & Output Commits (6)
+  'session-catalog': {
+    id: 'session-catalog',
+    name: 'SessionCatalog & CatalogManager',
+    shortName: 'SessionCatalog',
+    subsystem: 'sql-execution',
+    hostZone: 'driver-jvm',
+    subZone: 'SQL PLANNING & SCHEDULERS',
+    clusterPos: [584, 304],
+    languages: ['pyspark', 'scala', 'java'],
+    process: 'Driver JVM (CatalogManager + SessionCatalog + optional HiveExternalCatalog)',
+    role: 'Resolves multi-part table identifiers, namespaces, temp views, and SQL/UDF function registries via V2 CatalogManager and V1 SessionCatalog, backed by InMemoryCatalog by default or optional HiveExternalCatalog when Hive metastore support is enabled.',
+    keyDistinction:
+      'Default InMemoryCatalog resolves databases, tables, and temp views purely inside the Driver JVM with zero external metastore RPCs; Hive Metastore Thrift RPCs occur only when enableHiveSupport() configures HiveExternalCatalog.',
+    startedBy:
+      'SparkSession / BaseSessionStateBuilder instantiates CatalogManager and SessionCatalog per session (sharing SharedState.externalCatalog)',
+    monitoredBy:
+      'Catalyst Analyzer resolution errors (TABLE_OR_VIEW_NOT_FOUND, UNRESOLVED_ROUTINE) and Hive client connection logs when Hive is enabled',
+    stoppedBy:
+      'Session temp views drop when SparkSession stops; shared ExternalCatalog closes with SparkContext',
+    inputs: [
+      'UnresolvedRelation / UnresolvedFunction nodes from Catalyst SQL Parser and DataFrame API calls',
+      'spark.sql.catalogImplementation (in-memory vs hive) and spark.sql.catalog.<name> V2 CatalogPlugin entries',
+    ],
+    outputs: [
+      'UnresolvedCatalogRelation (wrapping V1 CatalogTable metadata, later converted by FindDataSourceTable / RelationConversions into LogicalRelation), V2 DataSourceV2Relation, temp view LogicalPlans, and FunctionRegistry ExpressionBuilders',
+      'Optional Hive Metastore Thrift RPCs only when HiveExternalCatalog is configured',
+    ],
+    internalState: [
+      'CatalogManager currentCatalog / currentNamespace and lazy CatalogPlugin cache',
+      'SessionCatalog tempViews, globalTempViewManager, functionRegistry, and externalCatalog reference',
+      'Optional HiveExternalCatalog wrapping HiveClientImpl Thrift connection pool',
+    ],
+    failureClues: [
+      'TABLE_OR_VIEW_NOT_FOUND when querying a Hive table means spark.sql.catalogImplementation defaulted to in-memory (missing enableHiveSupport())',
+      'Stale file-listing errors after external table writes point to cached FileStatus / table metadata needing REFRESH TABLE',
+      'Multi-part catalog names (e.g. prod.db.orders) bypass local temp-view lookup and route through CatalogManager to the named persistent catalog',
+    ],
+    sourceLinks: [
+      {
+        label: 'SessionCatalog.createTable',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/catalog/SessionCatalog.scala#L569-L610',
+      },
+      {
+        label: 'SessionCatalog.lookupRelation & getRelation (UnresolvedCatalogRelation)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/catalog/SessionCatalog.scala#L1107-L1145',
+      },
+      {
+        label: 'CatalogManager V2 catalog routing & v2SessionCatalog',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/catalyst/src/main/scala/org/apache/spark/sql/connector/catalog/CatalogManager.scala#L130-L170',
+      },
+      {
+        label: 'HiveExternalCatalog optional metastore client',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/hive/src/main/scala/org/apache/spark/sql/hive/HiveExternalCatalog.scala#L60-L95',
+      },
+    ],
+    docFile: 'session-catalog.md',
+  },
+
+  'whole-stage-codegen': {
+    id: 'whole-stage-codegen',
+    name: 'WholeStageCodegen (Janino)',
+    shortName: 'WholeStageCodegen',
+    subsystem: 'sql-execution',
+    hostZone: 'driver-jvm',
+    subZone: 'SQL PLANNING & SCHEDULERS',
+    clusterPos: [584, 672],
+    languages: ['pyspark', 'scala', 'java'],
+    port: 'in-JVM JIT',
+    process:
+      'Driver WholeStageCodegenExec.doCodeGen() + trial compile; Executor CodeGenerator.compile() & BufferedRowIterator',
+    role: 'Fuses adjacent Volcano physical operators (Scan, Filter, Project, HashAggregate, BroadcastHashJoin) into one tight generated Java class extending BufferedRowIterator on the driver via doCodeGen(), then compiles and caches the bytecode on executors (Janino SimpleCompiler by default) to eliminate virtual dispatch and row boxing.',
+    keyDistinction:
+      'Driver emits generated Java source and runs trial compilation, whereas executors compile or hit the generated-class cache per task; Janino is the default compiler. Oversized methods (> spark.sql.codegen.hugeMethodLimit, default 65535; optionally lowered e.g. to 8000 for HotSpot JIT) log INFO and fall back to child.execute(), whereas compilation-exception fallback is conditional on spark.sql.codegen.fallback=true (when false, compilation failures throw and fail the query).',
+    startedBy:
+      'CollapseCodegenStages physical planning rule wraps CodegenSupport subtrees in WholeStageCodegenExec on the driver',
+    monitoredBy:
+      'EXPLAIN CODEGEN output, codegen compileTime metrics in Spark UI SQL tab, and CodeGenerator fallback INFO/WARN logs',
+    stoppedBy:
+      'Generated classes remain cached in the bounded CodeGenerator Guava cache until evicted or JVM exits',
+    inputs: [
+      'CodegenSupport physical plan subtree (produce/consume Java templates) and spark.sql.codegen.wholeStage / maxFields / hugeMethodLimit (default 65535) / fallback',
+      'Cleaned CodeAndComment source strings serialized inside task closures to executors',
+    ],
+    outputs: [
+      'Generated BufferedRowIterator subclass compiled on executors and driven in a tight JVM loop over UnsafeRow / ColumnarBatch',
+      'Fallback to interpreted child.execute() when maxMethodCodeSize > hugeMethodLimit (default 65535), or on compilation exception only when spark.sql.codegen.fallback=true',
+    ],
+    internalState: [
+      'CodegenContext (fresh variable names, inlined mutable states, split expressions, references array)',
+      'CodeGenerator Guava compile cache keyed by generated source code',
+      'WholeStageCodegenExec codegenStageId visible as *(1), *(2) prefixes in EXPLAIN plans',
+    ],
+    failureClues: [
+      'Missing *(N) prefix in EXPLAIN indicates an operator broke codegen fusion (e.g. Python UDF BatchEvalPythonExec, wide schema > maxFields, or unsupported operator)',
+      'INFO "Found too long generated codes" disables codegen when maxMethodCodeSize > spark.sql.codegen.hugeMethodLimit (default 65535); WARN "Whole-stage codegen disabled" on compile exception falls back only if spark.sql.codegen.fallback=true (otherwise throws and fails the query)',
+      'High driver or first-task compileTime on huge SQL expressions points to method splitting or expression complexity under Janino',
+    ],
+    sourceLinks: [
+      {
+        label: 'WholeStageCodegenExec.doCodeGen',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/core/src/main/scala/org/apache/spark/sql/execution/WholeStageCodegenExec.scala#L783-L793',
+      },
+      {
+        label: 'WholeStageCodegenExec.doExecute (fallback & hugeMethodLimit)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/core/src/main/scala/org/apache/spark/sql/execution/WholeStageCodegenExec.scala#L1021-L1060',
+      },
+      {
+        label: 'CodeGenerator.compile & bytecode cache',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/codegen/CodeGenerator.scala#L2692-L2740',
+      },
+      {
+        label: 'BufferedRowIterator generated execution base class',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/core/src/main/java/org/apache/spark/sql/execution/BufferedRowIterator.java#L34-L111',
+      },
+    ],
+    docFile: 'whole-stage-codegen.md',
+  },
+
+  'dataset-encoder-udf': {
+    id: 'dataset-encoder-udf',
+    name: 'Dataset Encoders & JVM UDFs',
+    shortName: 'Encoder / JVM UDF',
+    subsystem: 'sql-execution',
+    hostZone: 'worker-node-b',
+    clusterPos: [1204, 1116],
+    languages: ['pyspark', 'scala', 'java'],
+    port: 'in-JVM InternalRow',
+    process:
+      'Driver ExpressionEncoder / Encoders.bean & UDFRegistration; Executor ScalaUDF / Java UDF1..22 eval',
+    role: 'Covers two distinct in-JVM SQL execution mechanisms: (1) synthesizing Catalyst InternalRow <-> JVM object serializer/deserializer expressions via ExpressionEncoder and Encoders.bean() (JavaTypeInference) for typed Scala/Java Dataset[T] operations like Dataset.map(Order => ...), and (2) executing registered ScalaUDF or Java scalar UDF1..22 functions directly inside Executor JVMs via CatalystTypeConverters / primitive converters without requiring a typed-object input encoder or Python worker IPC.',
+    keyDistinction:
+      'Used by ALL THREE languages: Scala and Java build typed Dataset[T] via ExpressionEncoder / Encoders.bean (deserializing UnsafeRow -> Order), whereas scalar Java UDFs (including PySpark spark.udf.registerJavaFunction) consume column primitives directly via CatalystTypeConverters (ScalaUDF.scala:142-164) with no typed-object input encoder and zero Python worker serialization.',
+    startedBy:
+      'Driver infers ExpressionEncoder on typed Dataset construction and binds ScalaUDF via SparkSession.udf.register / registerJava / registerJavaFunction; executors evaluate inside WholeStageCodegen or interpreted Projection',
+    monitoredBy:
+      'Catalyst analysis errors (CIRCULAR_CLASS_REFERENCE, ENCODER_NOT_FOUND) and FAILED_EXECUTE_UDF task failure stack traces',
+    stoppedBy:
+      'Encoder expressions and UDF instances are released when the task finishes and query plan is GCed',
+    inputs: [
+      'Scala case classes / tuples (spark.implicits._) or JavaBeans (Encoders.bean) for typed Dataset.map, OR Java scalar UDF1..22 classes registered via registerJava / registerJavaFunction',
+      'Catalyst InternalRow / UnsafeRow input columns passed directly in-JVM inside executor tasks',
+    ],
+    outputs: [
+      'Zero-reflection generated InternalRow <-> JVM object converters (ExpressionEncoder for typed Dataset[T] ops)',
+      'In-JVM scalar UDF return values written directly into UnsafeRow without typed-object input encoders, socket IPC, or pickle/Arrow conversion',
+    ],
+    internalState: [
+      'ExpressionEncoder(objSerializer, objDeserializer, clsTag) compiled into Catalyst projection bytecode for typed Dataset[T]',
+      'JavaTypeInference.encoderFor recursive bean property graph with seenTypeSet cycle detector',
+      'ScalaUDF catalyst expression wrapping user Scala function or Java UDF1..22 (using CatalystTypeConverters for Java UDF / primitive inputs)',
+    ],
+    failureClues: [
+      'CIRCULAR_CLASS_REFERENCE thrown by JavaTypeInference.encoderFor() when a self-referential JavaBean is passed to Encoders.bean()',
+      'Deterministic exceptions inside a ScalaUDF / Java UDF1 wrap as SparkException(FAILED_EXECUTE_UDF), exhaust 4 task attempts, and fail the job',
+      'PySpark apps calling spark.udf.registerJavaFunction() execute Java UDFs in the executor JVM without BatchEvalPythonExec, Python workers, or typed Dataset encoders',
+    ],
+    sourceLinks: [
+      {
+        label: 'ExpressionEncoder typed Dataset serializer & deserializer',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/encoders/ExpressionEncoder.scala#L52-L155',
+      },
+      {
+        label: 'JavaTypeInference.encoderFor & Encoders.bean',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/api/src/main/scala/org/apache/spark/sql/catalyst/JavaTypeInference.scala#L39-L95',
+      },
+      {
+        label: 'ScalaUDF.scalaConverter (CatalystTypeConverters vs ExpressionEncoder)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/ScalaUDF.scala#L142-L175',
+      },
+      {
+        label: 'UDFRegistration.registerJava (Java/Scala/PySpark JVM UDFs)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/core/src/main/scala/org/apache/spark/sql/classic/UDFRegistration.scala#L158-L185',
+      },
+    ],
+    docFile: 'dataset-encoder-udf.md',
+  },
+
+  // 10. Python Workers, Connectors & Output Commits (7)
   'python-worker-factory': {
     id: 'python-worker-factory',
     name: 'PythonWorkerFactory',
     shortName: 'PythonWorkerFactory',
     subsystem: 'python-output',
     hostZone: 'worker-node-b',
-    clusterPos: [1204, 854],
+    clusterPos: [1204, 944],
+    languages: ['pyspark'],
     port: 'local socket',
     process: 'Executor JVM factory cached in SparkEnv (manages local pyspark.daemon & forked worker sockets)',
     role: 'Lazily starts a local pyspark.daemon (Unix) or direct worker process, hands executor runners a connected SocketChannel + PythonWorkerHandle from an idle pool or newly forked child, and evicts or destroys dead/excess idle workers.',
@@ -2623,7 +3453,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'Python Worker',
     subsystem: 'python-output',
     hostZone: 'worker-node-b',
-    clusterPos: [1652, 854],
+    clusterPos: [1652, 944],
+    languages: ['pyspark'],
     port: 'local socket',
     process: 'Forked/spawned Python subprocess inside executor container (pyspark.worker)',
     role: 'Decodes one task invocation init frame, checks Python major.minor compatibility, installs Python TaskContext and incremental broadcasts, executes the deserialized partition function or SQL UDF over streamed inputs, and returns results, metrics, and END_OF_STREAM.',
@@ -2673,7 +3504,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'BasePythonRunner',
     subsystem: 'python-output',
     hostZone: 'worker-node-b',
-    clusterPos: [1428, 854],
+    clusterPos: [1428, 944],
+    languages: ['pyspark'],
     port: 'local socket',
     process: 'Executor JVM task-scoped runner (org.apache.spark.api.python.BasePythonRunner)',
     role: 'Acquires a local Python worker socket from SparkEnv, sends the init header and incremental broadcast diffs, multiplexes input feeding and result reading via a non-blocking selector (or pipelined UDF writer), and releases the worker only on clean END_OF_STREAM.',
@@ -2723,7 +3555,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'FileFormatWriter',
     subsystem: 'python-output',
     hostZone: 'worker-node-b',
-    clusterPos: [1204, 950],
+    clusterPos: [1204, 1030],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver write coordinator + executor FileFormatDataWriter tasks (Spark SQL DataSource V1)',
     role: 'Validates output schema and calls FileFormat.prepareWrite on the driver, runs WriteFilesExec/executeTask per partition to encode rows into Parquet/file writers (with dynamic directory/bucket rollover), collects WriteTaskResults, and invokes FileCommitProtocol.commitJob.',
     keyDistinction:
@@ -2773,7 +3606,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     shortName: 'FileCommitProtocol',
     subsystem: 'python-output',
     hostZone: 'worker-node-b',
-    clusterPos: [1428, 950],
+    clusterPos: [1428, 1030],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Serializable driver/executor protocol (default: SQLHadoopMapReduceCommitProtocol)',
     role: 'Separates file encoding from publication by allocating attempt staging paths, gating Hadoop OutputCommitter task commits via OutputCommitCoordinator, finalizing Hadoop commitJob on the driver, and replacing touched directories during dynamic partition overwrite.',
     keyDistinction:
@@ -2825,7 +3659,8 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
     subsystem: 'python-output',
     hostZone: 'driver-jvm',
     subZone: 'CAPACITY, LIVENESS & MASTERS',
-    clusterPos: [1020, 558],
+    clusterPos: [1020, 672],
+    languages: ['pyspark', 'scala', 'java'],
     process: 'Driver JVM RPC endpoint (OutputCommitCoordinator) + executor client in SparkEnv',
     role: 'Arbitrates competing attempts of the same Spark partition (such as speculative copies or retries) by granting commit permission (Boolean) to the first eligible (stageAttempt, taskAttempt) per (stageId, partitionId) slot.',
     keyDistinction:
@@ -2866,6 +3701,65 @@ export const COMPONENTS: Record<ComponentId, ComponentSpec> = {
       },
     ],
     docFile: 'output-commit-coordinator.md',
+  },
+
+  'datasource-v2': {
+    id: 'datasource-v2',
+    name: 'DataSource V2 (Scan & BatchWrite)',
+    shortName: 'DataSource V2',
+    subsystem: 'python-output',
+    hostZone: 'worker-node-b',
+    clusterPos: [1428, 1116],
+    languages: ['pyspark', 'scala', 'java'],
+    port: 'V2 connector API',
+    process:
+      'Driver BatchScanExec / V2TableWriteExec; Executor PartitionReader / DataWriter tasks',
+    role: 'Executes explicit DataSource V2 TableProvider connectors (such as Iceberg, Delta, Kafka, or file formats opted out of spark.sql.sources.useV1SourceList): the driver builds Scan InputPartitions and commits BatchWrite(WriterCommitMessage[]), while executors run PartitionReader and DataWriter tasks.',
+    keyDistinction:
+      'Used only for explicit DataSource V2 providers -- built-in Parquet, ORC, JSON, and CSV stay on the V1 FileFormatWriter / FileCommitProtocol path by default via spark.sql.sources.useV1SourceList -- replacing Hadoop OutputCommitter directory renames with explicit driver BatchWrite.commit().',
+    startedBy:
+      'DataSource.lookupDataSourceV2() resolves a TableProvider on the driver, planning BatchScanExec for reads or V2TableWriteExec for writes',
+    monitoredBy:
+      'Custom V2 Scan/Write SQLMetrics in Spark UI, DataWritingSparkTask commit/abort logs, and BatchWrite.commit()/abort() driver outcomes',
+    stoppedBy:
+      'Executor PartitionReader.close() / DataWriter.commit() end per task; driver BatchWrite.commit() or abort() finalizes the write',
+    inputs: [
+      'Explicit V2 TableProvider / SupportsRead / SupportsWrite implementations plus pushed filters, column pruning, and aggregates',
+      'Serialized InputPartition / PartitionReaderFactory (reads) or DataWriterFactory (writes) shipped to executors',
+    ],
+    outputs: [
+      'InternalRow or ColumnarBatch streams from PartitionReader on executor tasks',
+      'Task-level WriterCommitMessage objects returned AFTER a successful DataWriter.commit() to driver V2TableWriteExec for BatchWrite.commit(messages) (connectors like Apache Iceberg / Delta Lake publish snapshots atomically here)',
+    ],
+    internalState: [
+      'Driver ScanBuilder -> Batch.planInputPartitions() list and V2TableWriteExec BatchWrite handle',
+      'Executor DataWritingSparkTask optionally requesting OutputCommitCoordinator.canCommit() pre-commit authorization (when useCommitCoordinator=true) before calling DataWriter.commit() and returning WriterCommitMessage',
+      'SQLConf.USE_V1_SOURCE_LIST governing which built-in file formats fall back to V1 instead of V2',
+    ],
+    failureClues: [
+      'Default spark.read.parquet() / df.write.parquet() uses V1 FileFormatWriter unless parquet is removed from spark.sql.sources.useV1SourceList',
+      'Task failures invoke DataWriter.abort(); job-level failure invokes BatchWrite.abort(messages), which the Spark BatchWrite contract (BatchWrite.java:122-136) defines as best-effort cleanup (atomic visibility guarantees belong to transactional connectors like Iceberg / Delta Lake, not every V2 connector)',
+      'Missing TableProvider JAR on executors causes ClassNotFoundException when deserializing PartitionReaderFactory or DataWriterFactory',
+    ],
+    sourceLinks: [
+      {
+        label: 'BatchScanExec V2 scan planning & PartitionReaderFactory',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/v2/BatchScanExec.scala#L50-L135',
+      },
+      {
+        label: 'V2TableWriteExec.writeWithV2 & DataWritingSparkTask (canCommit -> commit)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/v2/WriteToDataSourceV2Exec.scala#L653-L826',
+      },
+      {
+        label: 'BatchWrite.commit & best-effort abort contract',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/catalyst/src/main/java/org/apache/spark/sql/connector/write/BatchWrite.java#L95-L137',
+      },
+      {
+        label: 'DataSource.lookupDataSourceV2 (USE_V1_SOURCE_LIST fallback)',
+        url: 'https://github.com/apache/spark/blob/dada2a6db5d73b152d6ba16e4fe21406f86abfe3/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/DataSource.scala#L820-L841',
+      },
+    ],
+    docFile: 'datasource-v2.md',
   },
 };
 

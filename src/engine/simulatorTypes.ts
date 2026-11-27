@@ -1,3 +1,5 @@
+import { SPARK_LANGUAGES } from '../data/types.ts';
+import type { SparkLanguage } from '../data/types.ts';
 import {
   FAULT_CATEGORIES,
   FAULT_CATEGORY_MAP,
@@ -19,6 +21,7 @@ export {
   FAULT_MAP,
   FAULTS_BY_CATEGORY,
   SIMULATED_FAULTS,
+  SPARK_LANGUAGES,
 };
 export type {
   FaultCategoryId,
@@ -26,6 +29,7 @@ export type {
   FaultMeta,
   FaultRequirements,
   SimulatedFault,
+  SparkLanguage,
 };
 
 export type SimulatedJobType =
@@ -34,6 +38,7 @@ export type SimulatedJobType =
   | 'broadcast-join'
   | 'sort-merge-skew'
   | 'python-udf'
+  | 'jvm-udf-dataset'
   | 'cached-rdd'
   | 'collect-action';
 
@@ -47,6 +52,7 @@ export type SimulatedDataProfile =
 export type PythonUdfMode = 'pickled' | 'arrow';
 
 export interface SimulationConfig {
+  language: SparkLanguage;
   jobType: SimulatedJobType;
   dataProfile: SimulatedDataProfile;
   deployMode: 'cluster' | 'client';
@@ -72,6 +78,7 @@ export interface JobTypeMeta {
   hasBroadcast: boolean;
   hasPythonUdf: boolean;
   hasSqlCodegen: boolean;
+  languages: readonly SparkLanguage[];
   summary: string;
   defaultDataProfile: SimulatedDataProfile;
 }
@@ -103,6 +110,7 @@ export interface SimulationPreset {
 }
 
 export const DEFAULT_SIMULATION_CONFIG: SimulationConfig = {
+  language: 'pyspark',
   jobType: 'wide-shuffle',
   dataProfile: 'uniform',
   deployMode: 'cluster',
@@ -128,6 +136,7 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasBroadcast: false,
     hasPythonUdf: false,
     hasSqlCodegen: true,
+    languages: ['pyspark', 'scala', 'java'],
     summary: 'Single ResultStage pipelining HDFS scan, predicate filter, and Parquet write with 0 shuffle exchanges.',
     defaultDataProfile: 'uniform',
   },
@@ -142,6 +151,7 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasBroadcast: false,
     hasPythonUdf: false,
     hasSqlCodegen: true,
+    languages: ['pyspark', 'scala', 'java'],
     summary: 'Two stages separated by 1 ShuffleDependency: map writes .data/.index, reducers fetch remote shuffle slices.',
     defaultDataProfile: 'uniform',
   },
@@ -156,6 +166,7 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasBroadcast: true,
     hasPythonUdf: false,
     hasSqlCodegen: true,
+    languages: ['pyspark', 'scala', 'java'],
     summary: 'Driver builds HashedRelation, TorrentBroadcast distributes 4 MiB pieces, streamed fact table probes with 0 large shuffle.',
     defaultDataProfile: 'small-dim',
   },
@@ -170,6 +181,7 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasBroadcast: false,
     hasPythonUdf: false,
     hasSqlCodegen: true,
+    languages: ['pyspark', 'scala', 'java'],
     summary: 'Two materialized shuffle stages; when AQE is ON and skew exceeds both 5x median & 256 MiB, OptimizeSkewedJoin splits into PartialReducerPartitionSpec.',
     defaultDataProfile: 'skewed',
   },
@@ -184,7 +196,23 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasBroadcast: false,
     hasPythonUdf: true,
     hasSqlCodegen: true,
+    languages: ['pyspark'],
     summary: 'Extracts scalar PythonUDF into EvalPythonExec; executors stream batches over local sockets to pyspark.daemon workers.',
+    defaultDataProfile: 'uniform',
+  },
+  {
+    id: 'jvm-udf-dataset',
+    label: 'Typed Dataset[T] + JVM UDF (Scala / Java)',
+    short: 'Typed Dataset + JVM UDF',
+    actionSink: 'orders.as[Order].map(score).withColumn("n", norm_amt($"amount")).write.parquet(...)',
+    hasShuffle: false,
+    hasFileCommit: true,
+    hasCollect: false,
+    hasBroadcast: false,
+    hasPythonUdf: false,
+    hasSqlCodegen: true,
+    languages: ['scala', 'java'],
+    summary: 'Pure-JVM typed Dataset[Order].map (ExpressionEncoder / Encoders.bean) + scalar ScalaUDF/Java UDF1 executing directly on Executor JVM task threads with 0 Python workers.',
     defaultDataProfile: 'uniform',
   },
   {
@@ -198,6 +226,7 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasBroadcast: false,
     hasPythonUdf: false,
     hasSqlCodegen: false,
+    languages: ['pyspark', 'scala', 'java'],
     summary: 'Action 1 computes and caches partitions in executor MemoryStore (MEMORY_ONLY); Action 2 reads cache hits or recomputes evicted partitions via RDD.getOrCompute.',
     defaultDataProfile: 'uniform',
   },
@@ -212,6 +241,7 @@ export const SIMULATED_JOBS: JobTypeMeta[] = [
     hasBroadcast: false,
     hasPythonUdf: false,
     hasSqlCodegen: true,
+    languages: ['pyspark', 'scala', 'java'],
     summary: 'Gathers partition arrays back to driver via direct StatusUpdate or IndirectTaskResult (TaskResultBlock), guarded by spark.driver.maxResultSize.',
     defaultDataProfile: 'large-result',
   },
@@ -327,24 +357,219 @@ export const SIMULATION_PRESETS: SimulationPreset[] = [
     badge: '8 GiB LIMIT',
     config: { ...DEFAULT_SIMULATION_CONFIG, jobType: 'broadcast-join', dataProfile: 'small-dim', numExecutors: 3, fault: 'broadcast-over-8gb' },
   },
+  {
+    id: 'preset-scala-shuffle',
+    label: 'Scala Cluster Shuffle (Zero Python)',
+    badge: 'SCALA',
+    config: { ...DEFAULT_SIMULATION_CONFIG, language: 'scala', jobType: 'wide-shuffle', fault: 'none' },
+  },
+  {
+    id: 'preset-java-dataset',
+    label: 'Java Typed Dataset + Encoders.bean',
+    badge: 'JAVA JVM',
+    config: { ...DEFAULT_SIMULATION_CONFIG, language: 'java', jobType: 'jvm-udf-dataset', fault: 'none' },
+  },
+  {
+    id: 'preset-scala-cnf',
+    label: 'Scala ClassNotFound (101 / 13 / 15)',
+    badge: 'EXIT 13/101',
+    config: { ...DEFAULT_SIMULATION_CONFIG, language: 'scala', jobType: 'wide-shuffle', fault: 'class-not-found-jar' },
+  },
+  {
+    id: 'preset-kryo-overflow',
+    label: 'Kryo Buffer Overflow (> 64 MiB)',
+    badge: 'KRYO 64M',
+    config: { ...DEFAULT_SIMULATION_CONFIG, language: 'scala', jobType: 'wide-shuffle', fault: 'kryo-buffer-overflow' },
+  },
 ];
 
+const VALID_LANGUAGES: ReadonlySet<string> = new Set(SPARK_LANGUAGES.map((l) => l.id));
+const VALID_DATA_PROFILES: ReadonlySet<string> = new Set(
+  SIMULATED_DATA_PROFILES.map((p) => p.id),
+);
+const VALID_PYTHON_UDF_MODES: ReadonlySet<string> = new Set(['pickled', 'arrow']);
+const VALID_DEPLOY_MODES: ReadonlySet<string> = new Set(['cluster', 'client']);
+const VALID_EXECUTOR_CORES: ReadonlySet<number> = new Set([1, 2, 4]);
+const VALID_NUM_PARTITIONS: ReadonlySet<number> = new Set([4, 8, 12, 24]);
+
+function hasOwn<T extends object>(obj: T, key: PropertyKey): boolean {
+  return typeof key === 'string' && Object.prototype.hasOwnProperty.call(obj, key);
+}
+
 export function validateSimulationConfig(config: SimulationConfig): SimulationValidation {
-  const job = JOB_TYPE_MAP[config.jobType];
-  const fault = FAULT_MAP[config.fault];
-  const req = fault.requires;
   const blockers: SimulationValidationIssue[] = [];
   const notes: string[] = [];
 
-  if (req) {
-    if (req.shuffle && !job.hasShuffle) {
+  const hasValidLanguage = typeof config.language === 'string' && VALID_LANGUAGES.has(config.language);
+  const hasValidJob = hasOwn(JOB_TYPE_MAP, config.jobType);
+  const hasValidDataProfile =
+    typeof config.dataProfile === 'string' && VALID_DATA_PROFILES.has(config.dataProfile);
+  const hasValidPythonUdfMode =
+    typeof config.pythonUdfMode === 'string' && VALID_PYTHON_UDF_MODES.has(config.pythonUdfMode);
+  const hasValidFault = hasOwn(FAULT_MAP, config.fault);
+  const hasValidDeployMode =
+    typeof config.deployMode === 'string' && VALID_DEPLOY_MODES.has(config.deployMode);
+  const hasValidCores =
+    typeof config.executorCores === 'number' && VALID_EXECUTOR_CORES.has(config.executorCores);
+  const hasValidPartitions =
+    typeof config.numPartitions === 'number' && VALID_NUM_PARTITIONS.has(config.numPartitions);
+  const hasValidExecutors =
+    typeof config.numExecutors === 'number' &&
+    Number.isInteger(config.numExecutors) &&
+    config.numExecutors >= 1 &&
+    config.numExecutors <= 6;
+  const hasValidEssFlag = typeof config.externalShuffleService === 'boolean';
+  const hasValidDaFlag = typeof config.dynamicAllocation === 'boolean';
+  const hasValidAqeFlag = typeof config.aqeEnabled === 'boolean';
+
+  if (!hasValidLanguage) {
+    blockers.push({
+      field: 'language',
+      reason: `Unknown Spark language "${String(config.language)}"; expected one of pyspark, scala, or java.`,
+      suggestedPatch: { language: DEFAULT_SIMULATION_CONFIG.language },
+    });
+  }
+  if (!hasValidJob) {
+    blockers.push({
+      field: 'jobType',
+      reason: `Unknown job type "${String(config.jobType)}"; choose a supported Spark job template.`,
+      suggestedPatch: { jobType: DEFAULT_SIMULATION_CONFIG.jobType },
+    });
+  }
+  if (!hasValidDataProfile) {
+    blockers.push({
+      field: 'dataProfile',
+      reason: `Unknown data profile "${String(config.dataProfile)}"; choose a supported data profile.`,
+      suggestedPatch: {
+        dataProfile: hasValidJob
+          ? JOB_TYPE_MAP[config.jobType].defaultDataProfile
+          : DEFAULT_SIMULATION_CONFIG.dataProfile,
+      },
+    });
+  }
+  if (!hasValidPythonUdfMode) {
+    blockers.push({
+      field: 'pythonUdfMode',
+      reason: `Invalid pythonUdfMode "${String(config.pythonUdfMode)}"; expected "pickled" or "arrow".`,
+      suggestedPatch: { pythonUdfMode: DEFAULT_SIMULATION_CONFIG.pythonUdfMode },
+    });
+  }
+  if (!hasValidFault) {
+    blockers.push({
+      field: 'fault',
+      reason: `Unknown fault "${String(config.fault)}"; reset fault to none or pick a cataloged fault.`,
+      suggestedPatch: { fault: DEFAULT_SIMULATION_CONFIG.fault },
+    });
+  }
+  if (!hasValidDeployMode) {
+    blockers.push({
+      field: 'deployMode',
+      reason: `Invalid deploy mode "${String(config.deployMode)}"; expected "cluster" or "client".`,
+      suggestedPatch: { deployMode: DEFAULT_SIMULATION_CONFIG.deployMode },
+    });
+  }
+  if (!hasValidExecutors) {
+    const suggestedExecutors =
+      typeof config.numExecutors === 'number' && Number.isFinite(config.numExecutors)
+        ? Math.max(1, Math.min(6, Math.round(config.numExecutors)))
+        : DEFAULT_SIMULATION_CONFIG.numExecutors;
+    blockers.push({
+      field: 'numExecutors',
+      reason: `Invalid executor count "${String(config.numExecutors)}"; expected an integer in 1..6.`,
+      suggestedPatch: { numExecutors: suggestedExecutors },
+    });
+  }
+  if (!hasValidCores) {
+    blockers.push({
+      field: 'executorCores',
+      reason: `Invalid executorCores "${String(config.executorCores)}"; expected 1, 2, or 4.`,
+      suggestedPatch: { executorCores: DEFAULT_SIMULATION_CONFIG.executorCores },
+    });
+  }
+  if (!hasValidPartitions) {
+    blockers.push({
+      field: 'numPartitions',
+      reason: `Invalid numPartitions "${String(config.numPartitions)}"; expected 4, 8, 12, or 24.`,
+      suggestedPatch: { numPartitions: DEFAULT_SIMULATION_CONFIG.numPartitions },
+    });
+  }
+  if (!hasValidEssFlag) {
+    blockers.push({
+      field: 'externalShuffleService',
+      reason: `Invalid externalShuffleService flag "${String(config.externalShuffleService)}"; expected boolean.`,
+      suggestedPatch: {
+        externalShuffleService:
+          String(config.externalShuffleService).toLowerCase() === 'true'
+            ? true
+            : String(config.externalShuffleService).toLowerCase() === 'false'
+              ? false
+              : DEFAULT_SIMULATION_CONFIG.externalShuffleService,
+      },
+    });
+  }
+  if (!hasValidDaFlag) {
+    blockers.push({
+      field: 'dynamicAllocation',
+      reason: `Invalid dynamicAllocation flag "${String(config.dynamicAllocation)}"; expected boolean.`,
+      suggestedPatch: {
+        dynamicAllocation:
+          String(config.dynamicAllocation).toLowerCase() === 'true'
+            ? true
+            : String(config.dynamicAllocation).toLowerCase() === 'false'
+              ? false
+              : DEFAULT_SIMULATION_CONFIG.dynamicAllocation,
+      },
+    });
+  }
+  if (!hasValidAqeFlag) {
+    blockers.push({
+      field: 'aqeEnabled',
+      reason: `Invalid aqeEnabled flag "${String(config.aqeEnabled)}"; expected boolean.`,
+      suggestedPatch: {
+        aqeEnabled:
+          String(config.aqeEnabled).toLowerCase() === 'true'
+            ? true
+            : String(config.aqeEnabled).toLowerCase() === 'false'
+              ? false
+              : DEFAULT_SIMULATION_CONFIG.aqeEnabled,
+      },
+    });
+  }
+
+  const job = hasValidJob ? JOB_TYPE_MAP[config.jobType] : undefined;
+  const fault = hasValidFault ? FAULT_MAP[config.fault] : undefined;
+  const req = fault?.requires;
+
+  if (fault && req) {
+    if (hasValidLanguage && req.jvmApp && config.language === 'pyspark') {
+      blockers.push({
+        field: 'language',
+        reason: `${fault.short} applies to Scala/Java JVM applications; switch language to Scala or Java.`,
+        suggestedPatch:
+          config.jobType === 'python-udf'
+            ? { language: 'scala', jobType: 'wide-shuffle' }
+            : { language: 'scala' },
+      });
+    }
+    if (hasValidLanguage && req.pysparkOnly && config.language !== 'pyspark') {
+      blockers.push({
+        field: 'language',
+        reason: `${fault.short} applies only to PySpark Python workers; switch language to PySpark with Python UDF.`,
+        suggestedPatch: {
+          language: 'pyspark',
+          jobType: 'python-udf',
+          dataProfile: 'uniform',
+        },
+      });
+    }
+    if (job && req.shuffle && !job.hasShuffle) {
       blockers.push({
         field: 'fault',
         reason: `${job.short} has no ShuffleDependency; switch to Shuffle Aggregation or Skewed SMJ to trigger ${fault.short}.`,
         suggestedPatch: { jobType: 'wide-shuffle' },
       });
     }
-    if (req.fileCommit && !job.hasFileCommit) {
+    if (job && req.fileCommit && !job.hasFileCommit) {
       blockers.push({
         field: 'fault',
         reason: `${job.short} does not run a file-output commit; switch to a Parquet write job to trigger ${fault.short}.`,
@@ -353,49 +578,52 @@ export function validateSimulationConfig(config: SimulationConfig): SimulationVa
         },
       });
     }
-    if (req.collect && !job.hasCollect) {
+    if (job && req.collect && !job.hasCollect) {
       blockers.push({
         field: 'fault',
         reason: `${fault.short} applies to driver result-gathering actions like collect(), not executor-to-HDFS writes.`,
         suggestedPatch: { jobType: 'collect-action', dataProfile: 'large-result' },
       });
     }
-    if (req.broadcast && !job.hasBroadcast) {
+    if (job && req.broadcast && !job.hasBroadcast) {
       blockers.push({
         field: 'fault',
         reason: `${job.short} has no BroadcastExchangeExec / TorrentBroadcast; switch to Broadcast Join to trigger ${fault.short}.`,
         suggestedPatch: { jobType: 'broadcast-join', dataProfile: 'small-dim' },
       });
     }
-    if (req.pythonUdf && !job.hasPythonUdf) {
+    if (job && req.pythonUdf && !job.hasPythonUdf) {
       blockers.push({
         field: 'fault',
         reason: `${job.short} does not spawn pyspark.daemon / Python workers; switch to Python UDF to trigger ${fault.short}.`,
-        suggestedPatch: { jobType: 'python-udf', dataProfile: 'uniform' },
+        suggestedPatch:
+          config.language !== 'pyspark'
+            ? { language: 'pyspark', jobType: 'python-udf', dataProfile: 'uniform' }
+            : { jobType: 'python-udf', dataProfile: 'uniform' },
       });
     }
-    if (req.sqlCodegen && !job.hasSqlCodegen) {
+    if (job && req.sqlCodegen && !job.hasSqlCodegen) {
       blockers.push({
         field: 'fault',
         reason: `${job.short} uses the RDD API rather than Catalyst WholeStageCodegenExec; switch to a SQL DataFrame job to trigger ${fault.short}.`,
         suggestedPatch: { jobType: 'wide-shuffle', dataProfile: 'uniform' },
       });
     }
-    if (req.clusterMode && config.deployMode !== 'cluster') {
+    if (hasValidDeployMode && req.clusterMode && config.deployMode !== 'cluster') {
       blockers.push({
         field: 'deployMode',
         reason: `${fault.short} applies to cluster mode where the driver runs inside the AM container.`,
         suggestedPatch: { deployMode: 'cluster' },
       });
     }
-    if (req.clientMode && config.deployMode !== 'client') {
+    if (hasValidDeployMode && req.clientMode && config.deployMode !== 'client') {
       blockers.push({
         field: 'deployMode',
         reason: `${fault.short} requires deployMode = client (external driver on edge-01 / yarn-client AM).`,
         suggestedPatch: { deployMode: 'client' },
       });
     }
-    if (req.minExecutors !== undefined && config.numExecutors < req.minExecutors) {
+    if (hasValidExecutors && req.minExecutors !== undefined && config.numExecutors < req.minExecutors) {
       blockers.push({
         field: 'numExecutors',
         reason: `${fault.short} requires >= ${req.minExecutors} executors for peer or surviving-host execution.`,
@@ -428,6 +656,22 @@ export function validateSimulationConfig(config: SimulationConfig): SimulationVa
         field: 'dynamicAllocation',
         reason: `${fault.short} requires spark.dynamicAllocation.enabled = false.`,
         suggestedPatch: { dynamicAllocation: false },
+      });
+    }
+  }
+
+  if (job && hasValidLanguage && !job.languages.includes(config.language)) {
+    if (config.jobType === 'python-udf' && config.language !== 'pyspark') {
+      blockers.push({
+        field: 'jobType',
+        reason: `${job.short} requires PySpark; switch to Typed Dataset + JVM UDF for ${config.language === 'scala' ? 'Scala' : 'Java'}.`,
+        suggestedPatch: { jobType: 'jvm-udf-dataset', dataProfile: 'uniform' },
+      });
+    } else if (config.jobType === 'jvm-udf-dataset' && config.language === 'pyspark') {
+      blockers.push({
+        field: 'jobType',
+        reason: `${job.short} requires Scala or Java; switch to Python UDF for PySpark.`,
+        suggestedPatch: { jobType: 'python-udf', dataProfile: 'uniform' },
       });
     }
   }
@@ -478,4 +722,58 @@ export function validateSimulationConfig(config: SimulationConfig): SimulationVa
     blockers,
     notes,
   };
+}
+
+export function adaptSimConfigForLanguage(
+  cfg: SimulationConfig,
+  nextLang: SparkLanguage,
+): SimulationConfig {
+  const safeExecutors = Number.isFinite(cfg.numExecutors)
+    ? Math.max(1, Math.min(6, Math.round(cfg.numExecutors)))
+    : DEFAULT_SIMULATION_CONFIG.numExecutors;
+
+  let next: SimulationConfig = {
+    ...cfg,
+    language: nextLang,
+    numExecutors: safeExecutors,
+  };
+
+  if (nextLang !== 'pyspark' && next.jobType === 'python-udf') {
+    next = { ...next, jobType: 'jvm-udf-dataset', dataProfile: 'uniform' };
+  } else if (nextLang === 'pyspark' && next.jobType === 'jvm-udf-dataset') {
+    next = { ...next, jobType: 'python-udf', dataProfile: 'uniform' };
+  }
+
+  const faultReq = hasOwn(FAULT_MAP, next.fault) ? FAULT_MAP[next.fault].requires : undefined;
+  if ((faultReq?.pysparkOnly || faultReq?.pythonUdf) && nextLang !== 'pyspark') {
+    next = {
+      ...next,
+      fault: 'none',
+    };
+  } else if (faultReq?.jvmApp && nextLang === 'pyspark') {
+    next = { ...next, fault: 'none' };
+  }
+
+  for (let i = 0; i < 12; i++) {
+    const check = validateSimulationConfig(next);
+    if (check.valid) break;
+    const patch = check.blockers[0]?.suggestedPatch;
+    if (!patch) break;
+    if (patch.language !== undefined && patch.language !== nextLang) {
+      next = { ...next, fault: 'none', language: nextLang };
+      continue;
+    }
+    const patchedExecutors =
+      patch.numExecutors !== undefined && Number.isFinite(patch.numExecutors)
+        ? Math.max(1, Math.min(6, Math.round(patch.numExecutors)))
+        : next.numExecutors;
+    next = {
+      ...next,
+      ...patch,
+      language: nextLang,
+      numExecutors: patchedExecutors,
+    };
+  }
+
+  return next;
 }

@@ -1,11 +1,13 @@
 import { LIFECYCLE_TRACES, SCENARIO_TRACES } from './tracesCore.ts';
 import { COMPONENT_TRACES_A } from './tracesCompA.ts';
 import { COMPONENT_TRACES_B } from './tracesCompB.ts';
+import { COMPONENT_TRACES_C } from './tracesCompC.ts';
 import type { ComponentId, TraceLesson } from './types.ts';
 
 export const COMPONENT_TRACES: TraceLesson[] = [
   ...COMPONENT_TRACES_A,
   ...COMPONENT_TRACES_B,
+  ...COMPONENT_TRACES_C,
 ];
 
 export const ALL_TRACES: TraceLesson[] = [

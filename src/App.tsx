@@ -55,15 +55,16 @@ import {
   SCENARIO_TRACES,
   TRACE_BY_ID,
 } from './data/traces';
-import { CHANNEL_META, SUBSYSTEM_META } from './data/types';
+import { CHANNEL_META, SPARK_LANGUAGES, SUBSYSTEM_META } from './data/types';
 import type {
   ChannelKind,
   ComponentId,
+  SparkLanguage,
   SubsystemId,
   TraceKind,
-  TraceLesson,
 } from './data/types';
 import { adaptTraceToRun } from './engine/adaptTrace';
+import { isDriverRuntimeInstance } from './engine/hostPlacement';
 import {
   collectStepIdsToExpandForStep,
   computeDeepOnlyCategoryCounts,
@@ -74,25 +75,33 @@ import {
   resolveEventAfterToggleExpand,
   stepJumpEventId,
 } from './engine/projection';
-import { buildSimulatedRun, resolveValidSimulationConfig } from './engine/simulator';
+import {
+  buildSimulatedRun,
+  resolveValidSimulationConfig,
+} from './engine/simulator';
 import {
   DEFAULT_SIMULATION_CONFIG,
   FAULT_MAP,
   JOB_TYPE_MAP,
-  SIMULATED_DATA_PROFILES,
-  SIMULATED_FAULTS,
+  adaptSimConfigForLanguage,
   validateSimulationConfig,
 } from './engine/simulatorTypes';
-import type {
-  PythonUdfMode,
-  SimulatedDataProfile,
-  SimulatedFault,
-  SimulatedJobType,
-  SimulationConfig,
-} from './engine/simulatorTypes';
+import type { SimulationConfig } from './engine/simulatorTypes';
+import {
+  encodeCatalogHash,
+  encodeSimHash,
+  parseSimHash,
+  parseUrlHash,
+  resolveExitSimulationTarget,
+  resolveInitialCatalogTraceId,
+  resolveLanguageAfterTraceSelect,
+  resolveLanguageVariantTraceId,
+} from './engine/urlRoute';
+import type { CanvasView } from './engine/urlRoute';
 import { advanceTimeline } from './playback';
 
-type CanvasView = 'topology' | 'cluster' | 'sequence';
+export { encodeSimHash, parseSimHash };
+
 type ModalKind = 'search' | 'shortcuts' | null;
 type PlaneId = 'yarn' | 'driver' | 'rpc' | 'data' | 'python' | 'hdfs';
 
@@ -105,10 +114,12 @@ interface PlaneMeta {
 interface ReturnStackEntry {
   traceId: string;
   traceName: string;
+  catalogTraceId?: string;
   run?: ExecutionRun;
   simConfig?: SimulationConfig;
   eventId: string | null;
   view: CanvasView;
+  language: SparkLanguage;
   expandedStepIds: string[];
   enabledCategories: Set<StepCategory>;
 }
@@ -148,32 +159,47 @@ const YARN_COMPONENTS = new Set<ComponentId>([
   'yarn-scheduler-backend',
   'executor-allocation-manager',
   'executor-monitor',
+  'delegation-token-manager',
+  'health-tracker',
+  'block-manager-decommissioner',
 ]);
 
 const RPC_COMPONENTS = new Set<ComponentId>([
   'rpc-env',
+  'rpc-file-server',
+  'transport-context',
+  'delegation-token-manager',
   'driver-scheduler-backend',
   'executor-backend',
   'heartbeat-receiver',
   'block-manager-master',
   'map-output-tracker-master',
   'map-output-tracker-worker',
+  'context-cleaner',
   'output-commit-coordinator',
 ]);
 
 const DATA_COMPONENTS = new Set<ComponentId>([
   'block-manager',
   'block-transfer-service',
+  'memory-manager',
+  'serializer-manager',
+  'context-cleaner',
+  'block-manager-decommissioner',
+  'transport-context',
   'rdd-cache',
   'broadcast-manager',
   'shuffle-writer',
   'shuffle-reader',
   'shuffle-block-resolver',
   'external-shuffle-service',
+  'push-based-shuffle',
   'broadcast-exchange',
   'broadcast-hash-join',
+  'dataset-encoder-udf',
   'file-format-writer',
   'file-commit-protocol',
+  'datasource-v2',
 ]);
 
 const PYTHON_COMPONENTS = new Set<ComponentId>([
@@ -188,10 +214,12 @@ const PYTHON_COMPONENTS = new Set<ComponentId>([
 const HDFS_COMPONENTS = new Set<ComponentId>([
   'hdfs-namenode',
   'hdfs-datanode',
+  'delegation-token-manager',
   'event-log',
   'history-server',
   'file-format-writer',
   'file-commit-protocol',
+  'datasource-v2',
 ]);
 
 const THEME_STORAGE_KEY = 'spark-visualizer-theme';
@@ -204,14 +232,17 @@ function readTheme(): 'dark' | 'light' {
   }
 }
 
-function planesForEvent(event: RunEvent): Set<PlaneId> {
+function planesForEvent(event: RunEvent, run: ExecutionRun): Set<PlaneId> {
   const planes = new Set<PlaneId>();
   const endpoints: ComponentId[] = [event.fromComponent, event.toComponent];
 
   if (event.channel === 'yarn' || endpoints.some((id) => YARN_COMPONENTS.has(id))) {
     planes.add('yarn');
   }
-  if (endpoints.some((id) => COMPONENTS[id]?.hostZone === 'driver-jvm')) {
+  if (
+    isDriverRuntimeInstance(run.instances[event.fromInstance]) ||
+    isDriverRuntimeInstance(run.instances[event.toInstance])
+  ) {
     planes.add('driver');
   }
   if (event.channel === 'rpc' || endpoints.some((id) => RPC_COMPONENTS.has(id))) {
@@ -232,10 +263,13 @@ function planesForEvent(event: RunEvent): Set<PlaneId> {
   return planes;
 }
 
-function planesForProjection(projection: ProjectedTimeline): Set<PlaneId> {
+function planesForProjection(
+  projection: ProjectedTimeline,
+  run: ExecutionRun,
+): Set<PlaneId> {
   const planes = new Set<PlaneId>();
   for (const frame of projection.visibleFrames) {
-    for (const p of planesForEvent(frame.event)) planes.add(p);
+    for (const p of planesForEvent(frame.event, run)) planes.add(p);
   }
   return planes;
 }
@@ -264,43 +298,9 @@ function collectDescendantStepIds(run: ExecutionRun, stepId: string): string[] {
   return descendants;
 }
 
-const VALID_DATA_PROFILES = new Set<SimulatedDataProfile>(
-  SIMULATED_DATA_PROFILES.map((p) => p.id),
-);
-const VALID_SIM_FAULTS = new Set<SimulatedFault>(
-  SIMULATED_FAULTS.map((f) => f.id),
-);
-const VALID_DEPLOY_MODES = new Set<SimulationConfig['deployMode']>([
-  'cluster',
-  'client',
-]);
-const VALID_EXECUTOR_CORES = new Set<SimulationConfig['executorCores']>([1, 2, 4]);
-const VALID_PARTITIONS = new Set<SimulationConfig['numPartitions']>([4, 8, 12, 24]);
-const VALID_PYTHON_UDF_MODES = new Set<PythonUdfMode>(['pickled', 'arrow']);
-
-function isValidJobType(value: string): value is SimulatedJobType {
-  return Object.prototype.hasOwnProperty.call(JOB_TYPE_MAP, value);
-}
-
-function isValidFault(value: string): value is SimulatedFault {
-  return VALID_SIM_FAULTS.has(value as SimulatedFault);
-}
-
-function parseStrictInt(raw: string | null): number | null {
-  if (raw === null) return null;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed)) return null;
-  return Number.parseInt(trimmed, 10);
-}
-
-function parseStrictBit(raw: string | null, fallback: boolean): boolean {
-  if (raw === '1') return true;
-  if (raw === '0') return false;
-  return fallback;
-}
-
 function simConfigsEqual(a: SimulationConfig, b: SimulationConfig): boolean {
   return (
+    a.language === b.language &&
     a.jobType === b.jobType &&
     a.dataProfile === b.dataProfile &&
     a.deployMode === b.deployMode &&
@@ -313,225 +313,6 @@ function simConfigsEqual(a: SimulationConfig, b: SimulationConfig): boolean {
     a.pythonUdfMode === b.pythonUdfMode &&
     a.fault === b.fault
   );
-}
-
-export function encodeSimHash(cfg: SimulationConfig, view: CanvasView): string {
-  const params = new URLSearchParams();
-  params.set('sim', 'v1');
-  params.set('job', cfg.jobType);
-  params.set('data', cfg.dataProfile);
-  params.set('mode', cfg.deployMode);
-  params.set('e', String(cfg.numExecutors));
-  params.set('c', String(cfg.executorCores));
-  params.set('p', String(cfg.numPartitions));
-  params.set('ess', cfg.externalShuffleService ? '1' : '0');
-  params.set('da', cfg.dynamicAllocation ? '1' : '0');
-  params.set('aqe', cfg.aqeEnabled ? '1' : '0');
-  params.set('udf', cfg.pythonUdfMode);
-  params.set('fault', cfg.fault);
-  if (view !== 'topology') {
-    params.set('view', view);
-  }
-  return `#${params.toString()}`;
-}
-
-export function parseSimHash(params: URLSearchParams): SimulationConfig | null {
-  const simParam = params.get('sim')?.trim();
-  if (!simParam) return null;
-
-  // Short fallback form: #sim=<jobType> (e.g. #sim=broadcast-join, #sim=cached-rdd)
-  if (simParam !== 'v1') {
-    if (!isValidJobType(simParam)) return null;
-    const shortCfg: SimulationConfig = {
-      ...DEFAULT_SIMULATION_CONFIG,
-      jobType: simParam,
-      dataProfile: JOB_TYPE_MAP[simParam].defaultDataProfile,
-    };
-    const resolved = resolveValidSimulationConfig(shortCfg);
-    return validateSimulationConfig(resolved).valid ? resolved : null;
-  }
-
-  const jobRaw = params.get('job')?.trim() ?? null;
-  if (jobRaw !== null && !isValidJobType(jobRaw)) {
-    return null;
-  }
-  const jobType: SimulatedJobType = jobRaw ?? DEFAULT_SIMULATION_CONFIG.jobType;
-
-  const dataRaw = params.get('data')?.trim() ?? null;
-  const dataProfile: SimulatedDataProfile =
-    dataRaw !== null && VALID_DATA_PROFILES.has(dataRaw as SimulatedDataProfile)
-      ? (dataRaw as SimulatedDataProfile)
-      : jobRaw !== null
-        ? JOB_TYPE_MAP[jobType].defaultDataProfile
-        : DEFAULT_SIMULATION_CONFIG.dataProfile;
-
-  const modeRaw = params.get('mode')?.trim() ?? null;
-  const deployMode: SimulationConfig['deployMode'] =
-    modeRaw !== null &&
-    VALID_DEPLOY_MODES.has(modeRaw as SimulationConfig['deployMode'])
-      ? (modeRaw as SimulationConfig['deployMode'])
-      : DEFAULT_SIMULATION_CONFIG.deployMode;
-
-  const eParsed = parseStrictInt(params.get('e'));
-  const numExecutors =
-    eParsed !== null && eParsed >= 1 && eParsed <= 6
-      ? eParsed
-      : DEFAULT_SIMULATION_CONFIG.numExecutors;
-
-  const cParsed = parseStrictInt(params.get('c'));
-  const executorCores: SimulationConfig['executorCores'] =
-    cParsed !== null &&
-    VALID_EXECUTOR_CORES.has(cParsed as SimulationConfig['executorCores'])
-      ? (cParsed as SimulationConfig['executorCores'])
-      : DEFAULT_SIMULATION_CONFIG.executorCores;
-
-  const pParsed = parseStrictInt(params.get('p'));
-  const numPartitions: SimulationConfig['numPartitions'] =
-    pParsed !== null &&
-    VALID_PARTITIONS.has(pParsed as SimulationConfig['numPartitions'])
-      ? (pParsed as SimulationConfig['numPartitions'])
-      : DEFAULT_SIMULATION_CONFIG.numPartitions;
-
-  const externalShuffleService = parseStrictBit(
-    params.get('ess')?.trim() ?? null,
-    DEFAULT_SIMULATION_CONFIG.externalShuffleService,
-  );
-  const dynamicAllocation = parseStrictBit(
-    params.get('da')?.trim() ?? null,
-    DEFAULT_SIMULATION_CONFIG.dynamicAllocation,
-  );
-  const aqeEnabled = parseStrictBit(
-    params.get('aqe')?.trim() ?? null,
-    DEFAULT_SIMULATION_CONFIG.aqeEnabled,
-  );
-
-  const udfRaw = params.get('udf')?.trim() ?? null;
-  const pythonUdfMode: PythonUdfMode =
-    udfRaw !== null && VALID_PYTHON_UDF_MODES.has(udfRaw as PythonUdfMode)
-      ? (udfRaw as PythonUdfMode)
-      : DEFAULT_SIMULATION_CONFIG.pythonUdfMode;
-
-  const faultRaw = params.get('fault')?.trim() ?? null;
-  const fault: SimulatedFault =
-    faultRaw !== null && isValidFault(faultRaw)
-      ? faultRaw
-      : DEFAULT_SIMULATION_CONFIG.fault;
-
-  const candidate: SimulationConfig = {
-    jobType,
-    dataProfile,
-    deployMode,
-    numExecutors,
-    executorCores,
-    numPartitions,
-    externalShuffleService,
-    dynamicAllocation,
-    aqeEnabled,
-    pythonUdfMode,
-    fault,
-  };
-
-  const resolved = resolveValidSimulationConfig(candidate);
-  return validateSimulationConfig(resolved).valid ? resolved : null;
-}
-
-interface ParsedHash {
-  trace: TraceLesson | null;
-  simConfig: SimulationConfig | null;
-  componentId: ComponentId | null;
-  view: CanvasView | null;
-}
-
-function parseLocationHash(rawHash: string): ParsedHash {
-  const cleaned = rawHash.replace(/^#/, '').trim();
-  if (!cleaned) {
-    return { trace: null, simConfig: null, componentId: null, view: null };
-  }
-
-  const rawParams = new URLSearchParams(cleaned);
-  const params = new URLSearchParams();
-  for (const [k, v] of rawParams.entries()) {
-    const key = k.trim().toLowerCase();
-    const val = v.trim();
-    if (key && val) params.set(key, val);
-  }
-
-  let view: CanvasView | null = null;
-  const viewParam = params.get('view');
-  if (viewParam === 'cluster' || viewParam === 'topology' || viewParam === 'sequence') {
-    view = viewParam;
-  }
-
-  if (params.has('sim')) {
-    const simConfig = parseSimHash(params);
-    if (simConfig) {
-      return { trace: null, simConfig, componentId: null, view };
-    }
-  }
-
-  const compParam = params.get('component');
-  if (compParam && compParam in COMPONENTS) {
-    const cid = compParam as ComponentId;
-    const trace =
-      COMPONENT_TRACE_BY_ID[cid] ?? TRACE_BY_ID[`comp-${cid}`] ?? null;
-    return { trace, simConfig: null, componentId: cid, view };
-  }
-
-  const scenarioParam = params.get('scenario');
-  if (scenarioParam) {
-    const num = Number.parseInt(scenarioParam, 10);
-    if (!Number.isNaN(num) && num >= 1) {
-      const trace =
-        SCENARIO_TRACES.find(
-          (t: TraceLesson) =>
-            t.scenarioNumber === num ||
-            t.id === `scenario-${num}` ||
-            t.id === `scenario-${String(num).padStart(2, '0')}`,
-        ) ??
-        SCENARIO_TRACES[num - 1] ??
-        null;
-      return { trace, simConfig: null, componentId: null, view };
-    }
-  }
-
-  const flowParam = params.get('flow');
-  if (flowParam) {
-    const trace =
-      TRACE_BY_ID[flowParam] ??
-      ALL_TRACES.find((t) => t.id.toLowerCase() === flowParam.toLowerCase()) ??
-      null;
-    return {
-      trace,
-      simConfig: null,
-      componentId: trace?.componentId ?? null,
-      view,
-    };
-  }
-
-  return { trace: null, simConfig: null, componentId: null, view };
-}
-
-function buildLocationHash(
-  run: ExecutionRun,
-  view: CanvasView,
-  simConfig?: SimulationConfig | null,
-): string {
-  if (run.sourceKind === 'simulation') {
-    if (simConfig) {
-      return encodeSimHash(simConfig, view);
-    }
-    const base = `sim=${encodeURIComponent(run.id)}`;
-    return view === 'topology' ? `#${base}` : `#${base}&view=${view}`;
-  }
-  let base: string;
-  if (run.traceKind === 'component' && run.componentId) {
-    base = `component=${encodeURIComponent(run.componentId)}`;
-  } else if (run.traceKind === 'scenario' && run.scenarioNumber != null) {
-    base = `scenario=${run.scenarioNumber}`;
-  } else {
-    base = `flow=${encodeURIComponent(run.id)}`;
-  }
-  return view === 'topology' ? `#${base}` : `#${base}&view=${view}`;
 }
 
 interface SearchEntry {
@@ -556,9 +337,20 @@ export default function App() {
   );
 
   const initialBoot = useMemo(() => {
-    const parsed = parseLocationHash(window.location.hash);
-    const trace = parsed.trace ?? DEFAULT_TRACE;
-    const simConfig = parsed.simConfig;
+    const parsed = parseUrlHash(
+      window.location.hash,
+      ALL_TRACES,
+      TRACE_BY_ID,
+      COMPONENT_TRACE_BY_ID,
+    );
+    const initialCatalogTraceId = resolveInitialCatalogTraceId(
+      parsed,
+      window.history.state,
+      TRACE_BY_ID,
+      DEFAULT_TRACE.id,
+    );
+    const trace = TRACE_BY_ID[initialCatalogTraceId] ?? DEFAULT_TRACE;
+    const simConfig = parsed.kind === 'sim' ? parsed.simConfig : null;
     const simRun = simConfig ? buildSimulatedRun(simConfig) : null;
     const run = simRun ?? adaptTraceToRun(trace);
     const proj = projectRun(run, new Set(), ALL_STEP_CATEGORIES);
@@ -572,9 +364,12 @@ export default function App() {
   }, []);
 
   const [traceId, setTraceId] = useState<string>(initialBoot.trace.id);
+  const [activeLanguage, setActiveLanguage] = useState<SparkLanguage>(
+    initialBoot.parsed.language,
+  );
   const [catalogMode, setCatalogMode] = useState<TraceKind>(initialBoot.trace.kind);
   const [subsystemFilter, setSubsystemFilter] = useState<SubsystemId | 'all'>('all');
-  const [view, setView] = useState<CanvasView>(initialBoot.parsed.view ?? 'topology');
+  const [view, setView] = useState<CanvasView>(initialBoot.parsed.view);
   const [theme, setTheme] = useState<'dark' | 'light'>(readTheme);
   const [sidebarOpen, setSidebarOpen] = useState(
     () => !window.matchMedia('(max-width: 760px)').matches,
@@ -583,10 +378,9 @@ export default function App() {
   const [floatingInspectorOpen, setFloatingInspectorOpen] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('step');
   const [selectedComponentId, setSelectedComponentId] = useState<ComponentId | null>(
-    initialBoot.parsed.componentId ??
-      initialBoot.simRun?.componentId ??
-      initialBoot.trace.componentId ??
-      null,
+    initialBoot.simRun
+      ? (initialBoot.simRun.componentId ?? null)
+      : (initialBoot.trace.componentId ?? null),
   );
 
   const [expandedStepIds, setExpandedStepIds] = useState<Set<string>>(() => new Set());
@@ -596,9 +390,14 @@ export default function App() {
   const [categoryBarOpen, setCategoryBarOpen] = useState<boolean>(false);
 
   const [simulatorOpen, setSimulatorOpen] = useState<boolean>(false);
-  const [simDraft, setSimDraft] = useState<SimulationConfig>(() => ({
-    ...(initialBoot.simConfig ?? DEFAULT_SIMULATION_CONFIG),
-  }));
+  const [simDraft, setSimDraft] = useState<SimulationConfig>(() =>
+    initialBoot.simConfig
+      ? { ...initialBoot.simConfig }
+      : adaptSimConfigForLanguage(
+          DEFAULT_SIMULATION_CONFIG,
+          initialBoot.parsed.language,
+        ),
+  );
   const [activeSimConfig, setActiveSimConfig] = useState<SimulationConfig | null>(
     initialBoot.simConfig,
   );
@@ -633,6 +432,8 @@ export default function App() {
   const playScopeRef = useRef<PlayScope | null>(null);
   const speedRef = useRef<number>(speed);
   speedRef.current = speed;
+  const navHistoryModeRef = useRef<'replace' | 'push'>('replace');
+  const lastAppliedHashRef = useRef<string>(window.location.hash);
 
   const dialogRef = useRef<HTMLDialogElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -710,10 +511,13 @@ export default function App() {
   const isCategoryFiltered = enabledCategories.size < STEP_CATEGORIES.length;
 
   const activeMessagePlanes = useMemo(
-    () => (activeFrame ? planesForEvent(activeFrame.event) : new Set<PlaneId>()),
-    [activeFrame],
+    () => (activeFrame ? planesForEvent(activeFrame.event, activeRun) : new Set<PlaneId>()),
+    [activeFrame, activeRun],
   );
-  const runPlanes = useMemo(() => planesForProjection(projection), [projection]);
+  const runPlanes = useMemo(
+    () => planesForProjection(projection, activeRun),
+    [projection, activeRun],
+  );
 
   function updateReadyAtStart(ready: boolean) {
     isReadyAtStartRef.current = ready;
@@ -878,11 +682,25 @@ export default function App() {
       closeMobile?: boolean;
       preserveReturnStack?: boolean;
       animate?: boolean;
+      languageOverride?: SparkLanguage;
+      historyMode?: 'replace' | 'push';
     },
   ) {
     const isCurrentRun = id === activeRun.id;
     const target = TRACE_BY_ID[id] ?? DEFAULT_TRACE;
     const nextRun = isCurrentRun ? activeRun : adaptTraceToRun(target);
+    const nextLanguage: SparkLanguage = opts?.languageOverride
+      ? opts.languageOverride
+      : TRACE_BY_ID[id]
+        ? resolveLanguageAfterTraceSelect(target, activeLanguage)
+        : activeLanguage;
+
+    if (
+      opts?.historyMode !== 'replace' &&
+      (!isCurrentRun || nextLanguage !== activeLanguage)
+    ) {
+      navHistoryModeRef.current = 'push';
+    }
 
     const nextExpanded = new Set<string>();
     if (opts?.stepId) {
@@ -938,6 +756,7 @@ export default function App() {
       setReturnStack([]);
     }
 
+    const leavingSim = !isCurrentRun && activeSimRun !== null;
     if (!isCurrentRun) {
       setActiveSimRun(null);
       setActiveSimConfig(null);
@@ -946,6 +765,15 @@ export default function App() {
 
     if (TRACE_BY_ID[id]) {
       setTraceId(target.id);
+    }
+    if (nextLanguage !== activeLanguage) {
+      setActiveLanguage(nextLanguage);
+    }
+    if (
+      leavingSim ||
+      (nextLanguage !== activeLanguage && activeSimConfig === null)
+    ) {
+      setSimDraft((prev) => adaptSimConfigForLanguage(prev, nextLanguage));
     }
     setCatalogMode(nextRun.traceKind);
     if (
@@ -1000,6 +828,51 @@ export default function App() {
     if (opts?.closeMobile && window.matchMedia('(max-width: 760px)').matches) {
       setSidebarOpen(false);
     }
+  }
+
+  function handleLanguageChange(nextLang: SparkLanguage) {
+    if (nextLang === activeLanguage) return;
+
+    if (activeSimRun !== null && activeSimConfig !== null) {
+      const adapted = adaptSimConfigForLanguage(activeSimConfig, nextLang);
+      const adaptedDraft = simConfigsEqual(simDraft, activeSimConfig)
+        ? adapted
+        : adaptSimConfigForLanguage(simDraft, nextLang);
+      handleRunSimulation(adapted, {
+        historyMode: 'push',
+        nextDraft: adaptedDraft,
+      });
+      return;
+    }
+
+    navHistoryModeRef.current = 'push';
+    setActiveLanguage(nextLang);
+    if (activeSimConfig === null) {
+      setSimDraft((prev) => adaptSimConfigForLanguage(prev, nextLang));
+    }
+
+    const resolvedId = resolveLanguageVariantTraceId(
+      selectedTrace.id,
+      nextLang,
+      ALL_TRACES,
+    );
+    if (resolvedId !== selectedTrace.id) {
+      selectTrace(resolvedId, {
+        tab: 'step',
+        animate: false,
+        languageOverride: nextLang,
+      });
+    }
+  }
+
+  function handleViewChange(nextView: CanvasView) {
+    if (nextView === view) {
+      setZoom(1);
+      return;
+    }
+    navHistoryModeRef.current = 'push';
+    setView(nextView);
+    setZoom(1);
   }
 
   function handleSelectStep(stepId: string) {
@@ -1067,12 +940,25 @@ export default function App() {
     if (diagramOnly) setFloatingInspectorOpen(true);
   }
 
-  function handleRunSimulation(config: SimulationConfig) {
+  function handleRunSimulation(
+    config: SimulationConfig,
+    opts?: { historyMode?: 'replace' | 'push'; nextDraft?: SimulationConfig },
+  ) {
     const validation = validateSimulationConfig(config);
     if (!validation.valid) return;
 
-    const nextConfig: SimulationConfig = { ...config };
-    const simRun = buildSimulatedRun(nextConfig);
+    const resolved: SimulationConfig = resolveValidSimulationConfig(config);
+    const isSameActiveSim =
+      activeSimRun !== null &&
+      activeSimConfig !== null &&
+      simConfigsEqual(resolved, activeSimConfig);
+    if (
+      opts?.historyMode !== 'replace' &&
+      (!isSameActiveSim || resolved.language !== activeLanguage)
+    ) {
+      navHistoryModeRef.current = 'push';
+    }
+    const simRun = buildSimulatedRun(resolved);
     const nextExpanded = new Set<string>();
     const nextProj = projectRun(simRun, nextExpanded, enabledCategories);
     const firstStep = nextProj.visibleSteps[0] ?? null;
@@ -1080,8 +966,9 @@ export default function App() {
       ? (nextProj.visibleFrames[firstStep.firstFrameIndex]?.event.id ?? null)
       : (nextProj.visibleFrames[0]?.event.id ?? null);
 
-    setSimDraft(nextConfig);
-    setActiveSimConfig(nextConfig);
+    setActiveLanguage(resolved.language);
+    setSimDraft(opts?.nextDraft ? { ...opts.nextDraft } : resolved);
+    setActiveSimConfig(resolved);
     setActiveSimRun(simRun);
     setReturnStack([]);
     setExpandedStepIds(nextExpanded);
@@ -1112,11 +999,23 @@ export default function App() {
 
   function handleExitSimulation() {
     if (!activeSimRun) return;
+    const exitTarget = resolveExitSimulationTarget(
+      selectedTrace.id,
+      activeLanguage,
+      ALL_TRACES,
+    );
+    const exitTrace = TRACE_BY_ID[exitTarget.traceId] ?? selectedTrace;
+    const destLang = resolveLanguageAfterTraceSelect(
+      exitTrace,
+      exitTarget.language,
+    );
     setSimulatorOpen(false);
-    selectTrace(selectedTrace.id, {
-      componentId: selectedTrace.componentId ?? null,
+    setSimDraft((prev) => adaptSimConfigForLanguage(prev, destLang));
+    selectTrace(exitTrace.id, {
+      componentId: exitTrace.componentId ?? null,
       tab: 'step',
       animate: false,
+      languageOverride: destLang,
     });
   }
 
@@ -1133,6 +1032,10 @@ export default function App() {
         {
           traceId: activeRun.id,
           traceName: activeRun.name,
+          catalogTraceId:
+            activeRun.sourceKind === 'simulation'
+              ? selectedTrace.id
+              : undefined,
           run: activeRun.sourceKind === 'simulation' ? activeRun : undefined,
           simConfig:
             activeRun.sourceKind === 'simulation'
@@ -1140,6 +1043,7 @@ export default function App() {
               : undefined,
           eventId: activeEventId,
           view,
+          language: activeLanguage,
           expandedStepIds: [...expandedStepIds],
           enabledCategories: new Set(enabledCategories),
         },
@@ -1173,14 +1077,26 @@ export default function App() {
       restoredProj,
     );
 
+    if (
+      restoredRun.id !== activeRun.id ||
+      entry.view !== view ||
+      entry.language !== activeLanguage
+    ) {
+      navHistoryModeRef.current = 'push';
+    }
+
     if (entry.run) {
       setActiveSimRun(entry.run);
       setActiveSimConfig(entry.simConfig ?? null);
+      if (entry.catalogTraceId && TRACE_BY_ID[entry.catalogTraceId]) {
+        setTraceId(entry.catalogTraceId);
+      }
     } else {
       setActiveSimRun(null);
       setActiveSimConfig(null);
       setTraceId(targetTrace.id);
     }
+    setActiveLanguage(entry.language);
     setCatalogMode(restoredRun.traceKind);
     setView(entry.view);
     setExpandedStepIds(restoredExpanded);
@@ -1196,8 +1112,7 @@ export default function App() {
 
   function handleViewOnClusterMap(id: ComponentId) {
     setSelectedComponentId(id);
-    setView('cluster');
-    setZoom(1);
+    handleViewChange('cluster');
   }
 
   function handleToggleExpandStep(stepId: string) {
@@ -1482,57 +1397,148 @@ export default function App() {
     }
   }, [theme]);
 
-  // Keep URL hash in sync with active run & canvas view
+  // Keep URL hash in sync with active run, canvas view, and language
   useEffect(() => {
-    const nextHash = buildLocationHash(activeRun, view, activeSimConfig);
+    const nextHash =
+      activeRun.sourceKind === 'simulation'
+        ? activeSimConfig
+          ? encodeSimHash(activeSimConfig, view, activeLanguage)
+          : `#sim=${encodeURIComponent(activeRun.id)}${
+              activeLanguage !== 'pyspark' ? `&lang=${activeLanguage}` : ''
+            }${view !== 'topology' ? `&view=${view}` : ''}`
+        : encodeCatalogHash(selectedTrace, view, activeLanguage);
+    const historyMode = navHistoryModeRef.current;
+    navHistoryModeRef.current = 'replace';
+    const historyState = { catalogTraceId: traceId };
     if (window.location.hash !== nextHash) {
       try {
-        window.history.replaceState(null, '', nextHash);
+        if (historyMode === 'push') {
+          window.history.pushState(historyState, '', nextHash);
+        } else {
+          window.history.replaceState(historyState, '', nextHash);
+        }
+      } catch {
+        // Ignore restricted history origin errors
+      }
+    } else if (
+      window.history.state?.catalogTraceId !== traceId
+    ) {
+      try {
+        window.history.replaceState(historyState, '', nextHash);
       } catch {
         // Ignore restricted history origin errors
       }
     }
-  }, [activeRun, view, activeSimConfig]);
+    lastAppliedHashRef.current = window.location.hash;
+  }, [activeRun, selectedTrace, traceId, view, activeSimConfig, activeLanguage]);
 
-  // Listen to external hashchange navigation (deep links / browser history)
+  // Listen to external hashchange/popstate navigation (deep links / browser history)
   const hashChangeHandlerRef = useRef<() => void>(() => {});
   hashChangeHandlerRef.current = () => {
-    const parsed = parseLocationHash(window.location.hash);
-    const hasRecognizedRun = Boolean(
-      parsed.simConfig || parsed.trace || parsed.componentId,
+    navHistoryModeRef.current = 'replace';
+    const parsed = parseUrlHash(
+      window.location.hash,
+      ALL_TRACES,
+      TRACE_BY_ID,
+      COMPONENT_TRACE_BY_ID,
     );
-    const nextView = parsed.view ?? (hasRecognizedRun ? 'topology' : null);
-    if (nextView && nextView !== view) {
-      setView(nextView);
+    const historyCatalogTraceId =
+      typeof window.history.state?.catalogTraceId === 'string' &&
+      Object.prototype.hasOwnProperty.call(
+        TRACE_BY_ID,
+        window.history.state.catalogTraceId,
+      )
+        ? window.history.state.catalogTraceId
+        : null;
+    if (parsed.language !== activeLanguage) {
+      setActiveLanguage(parsed.language);
+    }
+    if (parsed.view !== view) {
+      setView(parsed.view);
       setZoom(1);
     }
-    if (parsed.simConfig) {
+    if (parsed.kind === 'sim') {
+      if (historyCatalogTraceId && historyCatalogTraceId !== traceId) {
+        setTraceId(historyCatalogTraceId);
+      }
       const sameActiveSim =
         activeSimRun !== null &&
         activeSimConfig !== null &&
         simConfigsEqual(parsed.simConfig, activeSimConfig);
       if (!sameActiveSim) {
-        handleRunSimulation(parsed.simConfig);
-      } else if (!simConfigsEqual(simDraft, parsed.simConfig)) {
-        setSimDraft({ ...parsed.simConfig });
+        handleRunSimulation(parsed.simConfig, { historyMode: 'replace' });
       }
-    } else if (
-      parsed.trace &&
-      (parsed.trace.id !== traceId || activeSimRun !== null)
-    ) {
-      selectTrace(parsed.trace.id, {
-        componentId: parsed.componentId,
-        tab: 'step',
-      });
-    } else if (parsed.componentId && parsed.componentId !== selectedComponentId) {
-      setSelectedComponentId(parsed.componentId);
+      const canonicalHash = encodeSimHash(
+        parsed.simConfig,
+        parsed.view,
+        parsed.language,
+      );
+      if (window.location.hash !== canonicalHash) {
+        try {
+          window.history.replaceState(
+            { catalogTraceId: historyCatalogTraceId ?? traceId },
+            '',
+            canonicalHash,
+          );
+          lastAppliedHashRef.current = window.location.hash;
+        } catch {
+          // Ignore restricted history origin errors
+        }
+      }
+    } else {
+      const nextTrace = TRACE_BY_ID[parsed.traceId] ?? DEFAULT_TRACE;
+      if (
+        activeSimRun !== null ||
+        (parsed.language !== activeLanguage && activeSimConfig === null)
+      ) {
+        setSimDraft((prev) => adaptSimConfigForLanguage(prev, parsed.language));
+      }
+      if (nextTrace.id !== traceId || activeSimRun !== null) {
+        selectTrace(nextTrace.id, {
+          componentId: nextTrace.componentId ?? null,
+          tab: 'step',
+          languageOverride: parsed.language,
+          historyMode: 'replace',
+        });
+      } else if (
+        nextTrace.componentId &&
+        nextTrace.componentId !== selectedComponentId
+      ) {
+        setSelectedComponentId(nextTrace.componentId);
+      }
+      const canonicalHash = encodeCatalogHash(
+        nextTrace,
+        parsed.view,
+        parsed.language,
+      );
+      if (window.location.hash !== canonicalHash) {
+        try {
+          window.history.replaceState(
+            { catalogTraceId: nextTrace.id },
+            '',
+            canonicalHash,
+          );
+          lastAppliedHashRef.current = window.location.hash;
+        } catch {
+          // Ignore restricted history origin errors
+        }
+      }
     }
   };
 
   useEffect(() => {
-    const listener = () => hashChangeHandlerRef.current();
+    const listener = () => {
+      if (window.location.hash === lastAppliedHashRef.current) return;
+      lastAppliedHashRef.current = window.location.hash;
+      navHistoryModeRef.current = 'replace';
+      hashChangeHandlerRef.current();
+    };
     window.addEventListener('hashchange', listener);
-    return () => window.removeEventListener('hashchange', listener);
+    window.addEventListener('popstate', listener);
+    return () => {
+      window.removeEventListener('hashchange', listener);
+      window.removeEventListener('popstate', listener);
+    };
   }, []);
 
   // Sync viewport & reduced-motion media queries
@@ -1714,16 +1720,16 @@ export default function App() {
       case 'f':
         void handleToggleFullscreen();
         break;
-      case 'v':
-        setView((prev) =>
-          prev === 'topology'
+      case 'v': {
+        const nextView: CanvasView =
+          view === 'topology'
             ? 'cluster'
-            : prev === 'cluster'
+            : view === 'cluster'
               ? 'sequence'
-              : 'topology',
-        );
-        setZoom(1);
+              : 'topology';
+        handleViewChange(nextView);
         break;
+      }
       case 'c':
         setCategoryBarOpen((v) => {
           const next = !v;
@@ -1804,6 +1810,7 @@ export default function App() {
     projection,
     activeEventId,
     selectedComponentId,
+    activeLanguage,
     onPrevStep: handlePrevStep,
     onNextStep: handleNextStep,
     onSelectStep: handleSelectStep,
@@ -1819,8 +1826,24 @@ export default function App() {
 
   const topReturnEntry =
     returnStack.length > 0 ? returnStack[returnStack.length - 1] : null;
+  const exitSimulationTarget = useMemo(
+    () => resolveExitSimulationTarget(selectedTrace.id, activeLanguage, ALL_TRACES),
+    [selectedTrace.id, activeLanguage],
+  );
+  const exitSimulationTrace =
+    TRACE_BY_ID[exitSimulationTarget.traceId] ?? selectedTrace;
 
   const simTelemetry = activeSimRun?.telemetry ?? null;
+  const simLang = activeSimConfig?.language ?? activeLanguage;
+  const simLangBadgeClass =
+    simLang === 'pyspark'
+      ? 'lang-badge-py'
+      : simLang === 'scala'
+        ? 'lang-badge-scala'
+        : 'lang-badge-java';
+  const simLangBadgeText =
+    simLang === 'pyspark' ? 'PYSPARK' : simLang === 'scala' ? 'SCALA' : 'JAVA';
+  const simLangMeta = SPARK_LANGUAGES.find((l) => l.id === simLang);
   const simJobShort = activeSimConfig
     ? JOB_TYPE_MAP[activeSimConfig.jobType].short
     : (activeSimRun?.name ?? '');
@@ -1854,14 +1877,33 @@ export default function App() {
       <header className="topbar">
         <a
           className="brand"
-          href={`#flow=${DEFAULT_TRACE.id}`}
+          href={encodeCatalogHash(
+            TRACE_BY_ID[
+              resolveLanguageVariantTraceId(
+                DEFAULT_TRACE.id,
+                activeLanguage,
+                ALL_TRACES,
+              )
+            ] ?? DEFAULT_TRACE,
+            'topology',
+            activeLanguage,
+          )}
           onClick={(e) => {
             e.preventDefault();
-            setView('topology');
-            selectTrace(DEFAULT_TRACE.id, {
+            const homeId = resolveLanguageVariantTraceId(
+              DEFAULT_TRACE.id,
+              activeLanguage,
+              ALL_TRACES,
+            );
+            if (view !== 'topology') {
+              navHistoryModeRef.current = 'push';
+              setView('topology');
+            }
+            selectTrace(homeId, {
               componentId: null,
               tab: 'step',
               animate: false,
+              languageOverride: activeLanguage,
             });
           }}
         >
@@ -1885,10 +1927,32 @@ export default function App() {
               SPARK <em>VISUALIZER</em>
             </span>
             <span className="brand-tagline">
-              PYSPARK ON YARN · {COMPONENT_LIST.length} COMPONENTS · {ALL_TRACES.length} TRACES
+              SPARK ON YARN | {COMPONENT_LIST.length} COMPONENTS | {ALL_TRACES.length} TRACES
             </span>
           </span>
         </a>
+
+        <div
+          className="lang-switcher"
+          role="group"
+          aria-label="Spark application language"
+        >
+          {SPARK_LANGUAGES.map((langMeta) => {
+            const isActive = activeLanguage === langMeta.id;
+            return (
+              <button
+                key={langMeta.id}
+                type="button"
+                className={`lang-btn lang-${langMeta.id} ${isActive ? 'active' : ''}`}
+                aria-pressed={isActive}
+                title={langMeta.description}
+                onClick={() => handleLanguageChange(langMeta.id)}
+              >
+                {langMeta.label}
+              </button>
+            );
+          })}
+        </div>
 
         <div className="arch-planes" aria-label="Active architecture planes">
           <span className="small-label">PLANES</span>
@@ -1896,10 +1960,14 @@ export default function App() {
             {ARCHITECTURE_PLANES.map((plane) => {
               const isActive = activeMessagePlanes.has(plane.id);
               const isInRun = runPlanes.has(plane.id);
+              const planeTitle =
+                plane.id === 'python' && activeLanguage !== 'pyspark' && !isInRun
+                  ? 'PySpark only (0 Python/Py4J processes in pure Scala/Java jobs)'
+                  : plane.description;
               return (
                 <span
                   key={plane.id}
-                  title={plane.description}
+                  title={planeTitle}
                   className={[
                     'plane-pill',
                     `plane-${plane.id}`,
@@ -2007,6 +2075,7 @@ export default function App() {
             componentTraces={COMPONENT_TRACES}
             activeRun={activeRun}
             activeRunId={activeRun.id}
+            activeLanguage={activeLanguage}
             projection={projection}
             expandedStepIds={expandedStepIds}
             activeEventId={activeEventId}
@@ -2029,10 +2098,7 @@ export default function App() {
                   role="tab"
                   aria-selected={view === 'topology'}
                   className={view === 'topology' ? 'active' : ''}
-                  onClick={() => {
-                    setView('topology');
-                    setZoom(1);
-                  }}
+                  onClick={() => handleViewChange('topology')}
                 >
                   <Network size={13} aria-hidden="true" />
                   <span>Topology</span>
@@ -2042,10 +2108,7 @@ export default function App() {
                   role="tab"
                   aria-selected={view === 'cluster'}
                   className={view === 'cluster' ? 'active' : ''}
-                  onClick={() => {
-                    setView('cluster');
-                    setZoom(1);
-                  }}
+                  onClick={() => handleViewChange('cluster')}
                 >
                   <MapIcon size={13} aria-hidden="true" />
                   <span>All {COMPONENT_LIST.length} Map</span>
@@ -2055,10 +2118,7 @@ export default function App() {
                   role="tab"
                   aria-selected={view === 'sequence'}
                   className={view === 'sequence' ? 'active' : ''}
-                  onClick={() => {
-                    setView('sequence');
-                    setZoom(1);
-                  }}
+                  onClick={() => handleViewChange('sequence')}
                 >
                   <ListOrdered size={13} aria-hidden="true" />
                   <span>Sequence</span>
@@ -2207,6 +2267,12 @@ export default function App() {
                 <span className={`deploy-badge mode-${activeSimRun.deployMode}`}>
                   {activeSimRun.deployMode.toUpperCase()}
                 </span>
+                <span
+                  className={`lang-badge ${simLangBadgeClass} sim-strip-lang-badge`}
+                  title={simLangMeta?.description}
+                >
+                  {simLangBadgeText}
+                </span>
                 {simTelemetry && (
                   <>
                     <span className="sim-status-chip">
@@ -2266,7 +2332,7 @@ export default function App() {
                 <button
                   type="button"
                   className="sim-strip-btn exit"
-                  title={`Exit simulation and return to ${selectedTrace.name}`}
+                  title={`Exit simulation and return to ${exitSimulationTrace.name}`}
                   onClick={handleExitSimulation}
                 >
                   <ArrowLeft size={11} aria-hidden="true" />
@@ -2481,6 +2547,7 @@ export default function App() {
               <div className="diagram-content cluster-content">
                 <ClusterMapCanvas
                   {...canvasProps}
+                  activeLanguage={activeLanguage}
                   zoom={zoom}
                   onZoomChange={setZoom}
                 />

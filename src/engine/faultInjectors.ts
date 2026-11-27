@@ -34,7 +34,7 @@ export interface PythonUdfContext {
 }
 
 export type TerminalFailureOrigin =
-  | 'user-python-app'
+  | 'user-app-failure'
   | 'am-max-exec-failures'
   | 'am-sc-not-inited'
   | 'driver-port-bind';
@@ -63,13 +63,19 @@ function finalizeShortCircuit(
 }
 
 /**
- * Centralized terminal application finalizer enforcing:
+ * Unified multi-language terminal application finalizer across all 59 faults:
  * - Never emit unregisterApplicationMaster when !b.isAmRegistered(state.activeAm)
  * - Cluster unregistered AM finish -> EXIT_SC_NOT_INITED (13) or System.exit(1) on WebUI bind
- * - Cluster PySpark user app failures -> SparkUserAppException(exitCode = 1), NOT exit 15
- * - Client PySpark user app failures -> orders.py exits 1 while default SparkContext.stop()
- *   calls stop(0) (SparkContext.scala:2607), sending Shutdown(0) so client AM unregisters
- *   SUCCEEDED on YARN unless caller explicitly invokes JVM sc.stop(1) -> Shutdown(1)
+ * - Cluster registered user app failure:
+ *   - PySpark: orders.py exits 1 -> PythonRunner throws SparkUserAppException(1) -> AM FAILED/1
+ *   - Scala/Java: uncaught main() -> InvocationTargetException -> AM FAILED/15 (EXIT_EXCEPTION_USER_CLASS)
+ * - Client registered user app failure:
+ *   - PySpark: orders.py exits 1; default SparkContext.stop() = stop(0) sends Shutdown(0) -> AM SUCCEEDED/0
+ *   - Scala/Java: JavaMainApplication invokes main, SparkSubmit unwraps & rethrows (exits 1; NO automatic
+ *     sc.stop(1), AM NEVER selects exit 15); on ordinary JVM shutdown, SparkContext's shutdown hook
+ *     (SparkContext.scala:757-769) calls stop() -> Shutdown(0) -> AM SUCCEEDED/0 (explicit sc.stop(1)
+ *     sends Shutdown(1) -> FAILED; abrupt client death without Shutdown -> SUCCEEDED/0 or FAILED/17
+ *     with clientModeTreatDisconnectAsFailed=true)
  * - Explicit AM failure ceilings -> EXIT_MAX_EXECUTOR_FAILURES (11)
  * - Managed cluster AM only calls unregisterApplicationMaster(FAILED) on final attempt
  *   (isLastAttempt=true / maxAppAttempts=1; retryable earlier attempt omits unregister so RM retries)
@@ -132,62 +138,99 @@ export function emitTerminalAppOutcome(
     return;
   }
 
-  const isClientDefaultStop = b.isClient && opts.origin === 'user-python-app';
+  const isUserAppFailure = opts.origin === 'user-app-failure';
+  const isClientUserFailure = b.isClient && isUserAppFailure;
   const exitCode =
     opts.origin === 'am-max-exec-failures'
       ? 11
-      : opts.origin === 'user-python-app'
-        ? 1
+      : isUserAppFailure
+        ? b.isPySpark
+          ? 1
+          : 15
         : 13;
   const exitLabel =
     opts.origin === 'am-max-exec-failures'
       ? 'EXIT_MAX_EXECUTOR_FAILURES (11)'
-      : 'SparkUserAppException(exitCode=1)';
+      : b.isPySpark
+        ? 'SparkUserAppException(exitCode=1)'
+        : 'EXIT_EXCEPTION_USER_CLASS (15)';
   const shouldStopExecs =
-    (opts.stopLiveExecutors ?? opts.origin === 'user-python-app') && state.liveExecs.length > 0;
+    (opts.stopLiveExecutors ?? isUserAppFailure) && state.liveExecs.length > 0;
+  const jvmShortName = b.isScala ? 'OrdersJob' : 'OrdersJavaJob';
 
   const stepId =
     opts.stepId ??
     b.addStep({
       id: 'sim-step-terminal-outcome',
       title: isCluster
-        ? `orders.py exits ${exitCode} -> SparkContext.stop() & final-attempt AM unregisters FAILED`
-        : isClientDefaultStop
-          ? 'orders.py exits 1; default SparkContext.stop() sends Shutdown(0) -> YARN AM SUCCEEDED'
+        ? b.isPySpark
+          ? `orders.py exits ${exitCode} -> SparkContext.stop() & final-attempt AM unregisters FAILED`
+          : `Uncaught ${b.appEntryLabel}() -> AM exit 15 (EXIT_EXCEPTION_USER_CLASS) & unregister FAILED`
+        : isClientUserFailure
+          ? b.isPySpark
+            ? 'orders.py exits 1; default SparkContext.stop() sends Shutdown(0) -> YARN AM SUCCEEDED'
+            : `${jvmShortName} exits 1 (JavaMainApplication); SC shutdown hook sends Shutdown(0) -> AM SUCCEEDED`
           : `Client AM unregisters FAILED (exit=${exitCode})`,
       explanation: isCluster
-        ? `User Python script orders.py fails and exits ${exitCode}; PythonRunner throws SparkUserAppException(exitCode=${exitCode}) (NOT EXIT_EXCEPTION_USER_CLASS=15). SparkContext.stop() halts live executors, ApplicationMaster.finish records FAILED (exitCode=${exitCode}), and on the final attempt (isLastAttempt=true, spark.yarn.maxAppAttempts=1; a retryable attempt 1 < maxAppAttempts would omit unregister(FAILED) so RM can retry) AM cleans staging and calls unregisterApplicationMaster(FAILED).`
-        : isClientDefaultStop
-          ? `Client driver orders.py on edge-01 fails and exits 1 (${opts.diagnostic}). During teardown, standard PySpark SparkContext.stop() invokes zero-arg JVM SparkContext.stop() = stop(0) (SparkContext.scala:2607), stopping live executors and sending Shutdown(exitCode=0) over edge-01:41000. Per ApplicationMaster.scala:834-837,878-886, the client AM therefore unregisters FinalApplicationStatus.SUCCEEDED on YARN RM :8030 even though orders.py exited 1! YARN reports FAILED only if caller explicitly invokes JVM SparkContext.stop(1) (sending Shutdown(1)) or crashes without stop() when spark.yarn.am.clientModeTreatDisconnectAsFailed=true.`
+        ? b.isPySpark
+          ? `User Python script orders.py fails and exits ${exitCode}; PythonRunner throws SparkUserAppException(exitCode=${exitCode}) (NOT EXIT_EXCEPTION_USER_CLASS=15). SparkContext.stop() halts live executors, ApplicationMaster.finish records FAILED (exitCode=${exitCode}), and on the final attempt (isLastAttempt=true, spark.yarn.maxAppAttempts=1; a retryable attempt 1 < maxAppAttempts would omit unregister(FAILED) so RM can retry) AM cleans staging and calls unregisterApplicationMaster(FAILED).`
+          : `Uncaught exception escapes ${b.appEntryLabel}() inside driver-1 AM JVM (${opts.diagnostic}). ApplicationMaster.startUserApplication (ApplicationMaster.scala:775-785, 911) catches InvocationTargetException (NOT SparkUserAppException), halts live executors, records FinalApplicationStatus.FAILED with EXIT_EXCEPTION_USER_CLASS = 15, and on the final attempt (isLastAttempt=true) calls unregisterApplicationMaster(FAILED).`
+        : isClientUserFailure
+          ? b.isPySpark
+            ? `Client driver orders.py on edge-01 fails and exits 1 (${opts.diagnostic}). During teardown, standard PySpark SparkContext.stop() invokes zero-arg JVM SparkContext.stop() = stop(0) (SparkContext.scala:2607); YarnClientSchedulerBackend.stop() (YarnClientSchedulerBackend.scala:174-190) first sends Shutdown(exitCode=0) over edge-01:41000 to the AM and THEN calls super.stop() to send StopExecutor to live executors. Per ApplicationMaster.scala:834-837,878-886, the client AM therefore unregisters FinalApplicationStatus.SUCCEEDED on YARN RM :8030 even though orders.py exited 1! YARN reports FAILED only if caller explicitly invokes JVM SparkContext.stop(1) (sending Shutdown(1)) or crashes without stop() when spark.yarn.am.clientModeTreatDisconnectAsFailed=true.`
+            : `Uncaught exception escapes ${b.appEntryLabel}() on edge-01 (${opts.diagnostic}). JavaMainApplication invokes main() and SparkSubmit unwraps & rethrows so the submit JVM fails with exit code 1 (NO automatic sc.stop(1), and client AM NEVER selects EXIT_EXCEPTION_USER_CLASS=15). On ordinary JVM shutdown, SparkContext's shutdown hook (SparkContext.scala:757-769) invokes zero-arg stop() = stop(0) (SparkContext.scala:2607); YarnClientSchedulerBackend.stop() (YarnClientSchedulerBackend.scala:174-190) first sends Shutdown(exitCode=0) over edge-01:41000 to the AM and THEN calls super.stop() to send StopExecutor to live executors, after which the client AM disconnects and unregisters FinalApplicationStatus.SUCCEEDED (0) while the launcher fails! Calling explicit sc.stop(1) sends Shutdown(1) -> YARN FAILED, or abrupt client death without Shutdown hits clientModeTreatDisconnectAsFailed=true -> FAILED (17).`
           : `Client AM triggers ${exitLabel} and calls unregisterApplicationMaster(FAILED) on RM :8030.`,
       category: 'yarn-lifecycle',
-      keyState: isClientDefaultStop
-        ? 'orders.py FAILED (exit=1) | YARN AM SUCCEEDED via default SparkContext.stop() -> Shutdown(0) (need sc.stop(1) for YARN FAILED)'
+      keyState: isClientUserFailure
+        ? b.isPySpark
+          ? 'orders.py FAILED (exit=1) | YARN AM SUCCEEDED via default SparkContext.stop() -> Shutdown(0) (need sc.stop(1) for YARN FAILED)'
+          : `${jvmShortName} / JavaMainApplication FAILED (exit=1) | SC shutdown hook Shutdown(0) -> YARN AM SUCCEEDED (never exit 15)`
         : `FAILED (exit=${exitCode} ${exitLabel}) | FinalApplicationStatus.FAILED`,
       command: isCluster
-        ? `SparkUserAppException(exitCode=${exitCode}) -> finish(FAILED, ${exitCode}) -> unregister(FAILED)`
-        : isClientDefaultStop
-          ? 'orders.py exits 1 | SparkContext.stop() -> Shutdown(0) -> amClient.unregister(SUCCEEDED) // sc.stop(1) for FAILED'
+        ? b.isPySpark
+          ? `SparkUserAppException(exitCode=${exitCode}) -> finish(FAILED, ${exitCode}) -> unregister(FAILED)`
+          : `InvocationTargetException -> finish(FAILED, EXIT_EXCEPTION_USER_CLASS=15) -> unregister(FAILED)`
+        : isClientUserFailure
+          ? b.isPySpark
+            ? 'orders.py exits 1 | SparkContext.stop() -> Shutdown(0) -> super.stop(StopExecutors) -> amClient.unregister(SUCCEEDED)'
+            : `${b.appEntryLabel}() throws -> JavaMainApplication exits 1 | ShutdownHook stop() -> Shutdown(0) -> super.stop(StopExecutors) -> amClient.unregister(SUCCEEDED)`
           : `finish(FinalApplicationStatus.FAILED, ${exitCode}) -> amClient.unregister(FAILED)`,
       detailsPassed: [
+        { name: 'language', value: b.langDisplay },
         { name: 'deployMode', value: state.cfg.deployMode },
         { name: 'amRegistered', value: 'true' },
-        ...(isClientDefaultStop
-          ? [
-              { name: 'clientDriverExit', value: '1 (orders.py FAILED on edge-01)' },
-              {
-                name: 'yarnAmStatus',
-                value: 'FinalApplicationStatus.SUCCEEDED (default SparkContext.stop() calls stop(0) -> Shutdown(0))',
-              },
-              {
-                name: 'explicitFailedOpt',
-                value: 'Call JVM SparkContext.stop(1) -> Shutdown(1) -> FinalApplicationStatus.FAILED',
-              },
-              {
-                name: 'sourceRef',
-                value: 'SparkContext.scala:2607 (def stop(): Unit = stop(0)); ApplicationMaster.scala:834-886',
-              },
-            ]
+        ...(isClientUserFailure
+          ? b.isPySpark
+            ? [
+                { name: 'clientDriverExit', value: '1 (orders.py FAILED on edge-01)' },
+                {
+                  name: 'yarnAmStatus',
+                  value: 'FinalApplicationStatus.SUCCEEDED (default SparkContext.stop() calls stop(0) -> Shutdown(0) before super.stop())',
+                },
+                {
+                  name: 'explicitFailedOpt',
+                  value: 'Call JVM SparkContext.stop(1) -> Shutdown(1) -> FinalApplicationStatus.FAILED',
+                },
+                {
+                  name: 'sourceRef',
+                  value: 'SparkContext.scala:2607; YarnClientSchedulerBackend.scala:174-190; ApplicationMaster.scala:834-886',
+                },
+              ]
+            : [
+                { name: 'clientDriverExit', value: `1 (${jvmShortName} / JavaMainApplication FAILED on edge-01; NO automatic sc.stop(1))` },
+                {
+                  name: 'yarnAmStatus',
+                  value: 'FinalApplicationStatus.SUCCEEDED (SC shutdown hook calls stop() -> Shutdown(0) before super.stop(); AM NEVER selects exit 15)',
+                },
+                {
+                  name: 'explicitFailedOpt',
+                  value: 'Call explicit sc.stop(1) -> Shutdown(1) -> FAILED, or abrupt disconnect with clientModeTreatDisconnectAsFailed=true -> FAILED (17)',
+                },
+                {
+                  name: 'sourceRef',
+                  value: 'SparkContext.scala:757-769,2607; YarnClientSchedulerBackend.scala:174-190; JavaMainApplication; ApplicationMaster.scala:834-886',
+                },
+              ]
           : [
               { name: 'exitCode', value: `${exitCode} (${exitLabel})` },
               {
@@ -201,7 +244,8 @@ export function emitTerminalAppOutcome(
       deepDiveComponentId: 'application-master',
     });
 
-  if (shouldStopExecs) {
+  const emitStopLiveExecutors = (clientAfterShutdown = false) => {
+    if (!shouldStopExecs) return;
     for (const liveExecId of state.liveExecs) {
       b.addEvent({
         stepId,
@@ -211,83 +255,157 @@ export function emitTerminalAppOutcome(
         protocol: 'Spark Netty RPC',
         port: b.driverRpc,
         label: `StopExecutor(${liveExecId})`,
-        info: `SparkContext.stop() sends StopExecutor to live executor ${liveExecId} during failure cleanup.`,
+        info: clientAfterShutdown
+          ? `After YarnClientSchedulerBackend.stop() sends Shutdown(0) to AM (YarnClientSchedulerBackend.scala:174-190), super.stop() sends StopExecutor to live executor ${liveExecId}.`
+          : `SparkContext.stop() sends StopExecutor to live executor ${liveExecId} during failure cleanup.`,
         size: '340 B',
         command: `driverEndpoint.askSync[Boolean](StopExecutors) // target=${liveExecId}`,
         fields: [{ name: 'executorId', value: liveExecId }],
-        senderState: 'Cleaning up live executors after failure',
+        senderState: clientAfterShutdown
+          ? 'YarnClientSchedulerBackend super.stop() halting live executors'
+          : 'Cleaning up live executors after failure',
         receiverState: `${liveExecId} shutting down`,
       });
     }
+  };
+
+  if (!isClientUserFailure) {
+    emitStopLiveExecutors(false);
   }
 
-  if (opts.origin === 'user-python-app') {
+  if (isUserAppFailure) {
     if (b.isClient) {
       const sc = b.std('spark-context');
-      const pyDriver = b.std('python-driver');
       const yarnBackend = b.std('yarn-scheduler-backend');
       const link = b.driverToAmLink();
-      b.addEvent({
-        stepId,
-        from: sc,
-        to: pyDriver,
-        kind: 'local',
-        channel: 'error',
-        protocol: 'In-JVM Exception Propagate',
-        port: 'edge-01 in-JVM',
-        label: 'orders.py exits 1',
-        info: `Unhandled Spark failure propagates to orders.py on edge-01: ${opts.diagnostic}. The client Python driver process fails with exit code 1 (tracked separately from YARN AM status).`,
-        size: 'exit code 1',
-        command: `orders.py exits 1 // ${opts.diagnostic}`,
-        fields: [
-          { name: 'pythonProcessExit', value: '1 (FAILED on edge-01)' },
-          { name: 'yarnAmDivergence', value: 'YARN AM status depends on exitCode passed to SparkContext.stop(code)' },
-        ],
-        senderState: 'Exception propagated to client Python driver',
-        receiverState: 'orders.py exiting non-zero (exit 1) after teardown',
-        isError: true,
-      });
-      b.addEvent({
-        stepId,
-        from: yarnBackend,
-        to: state.activeAm,
-        kind: link.kind,
-        channel: 'rpc',
-        protocol: link.protocol,
-        port: link.port,
-        label: 'Shutdown(exit=0) -> AM',
-        info: `Default SparkContext.stop() delegates to stop(0) (SparkContext.scala:2607; PySpark stop() calls _jsc.stop() with no exitCode arg) and sends Shutdown(exitCode=0) over ${link.port}. Explicit JVM sc.stop(1) would send Shutdown(1) instead.`,
-        size: '640 B',
-        command: 'amEndpoint.send(Shutdown(exitCode=0)) // default SparkContext.stop(); sc.stop(1) sends Shutdown(1)',
-        fields: [
-          { name: 'exitCode', value: '0 (default SparkContext.stop() = stop(0))' },
-          { name: 'channel', value: link.port },
-          { name: 'explicitOverride', value: 'SparkContext.stop(1) -> Shutdown(1) -> YARN FAILED' },
-        ],
-        senderState: 'Client SparkContext.stop() sent Shutdown(0) while orders.py exits 1',
-        receiverState: 'AMEndpoint marking shutdown=true, exitCode=0',
-      });
-      b.addEvent({
-        stepId,
-        from: state.activeAm,
-        to: state.rm,
-        channel: 'yarn',
-        protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
-        port: 'rm01:8030',
-        label: 'unregisterAM(SUCCEEDED)',
-        info: `Client AM (${state.activeAm}) received Shutdown(0) and on driver disconnect (ApplicationMaster.scala:878-886) calls finish(FinalApplicationStatus.SUCCEEDED, EXIT_SUCCESS=0) on RM :8030. YARN UI therefore reports SUCCEEDED even though orders.py exited 1 (famous client-mode SparkContext.stop() default-0 gotcha; pass explicit JVM sc.stop(1) for YARN FAILED).`,
-        size: '1.1 KB',
-        command: 'amClient.unregister(FinalApplicationStatus.SUCCEEDED, "") // exitCode=0 from default sc.stop(); orders.py exited 1',
-        fields: [
-          { name: 'yarnFinalStatus', value: 'FinalApplicationStatus.SUCCEEDED (EXIT_SUCCESS=0)' },
-          { name: 'clientDriverExit', value: '1 (orders.py FAILED)' },
-          { name: 'whySucceeded', value: 'Default SparkContext.stop() calls stop(0); explicit JVM sc.stop(1) is required for YARN FAILED' },
-        ],
-        senderState: 'Client AM exiting SUCCEEDED (exitCode=0 from Shutdown(0))',
-        receiverState: 'RM marks app FINISHED / SUCCEEDED despite orders.py exit 1',
-      });
+      if (b.isPySpark) {
+        const pyDriver = b.std('python-driver');
+        b.addEvent({
+          stepId,
+          from: sc,
+          to: pyDriver,
+          channel: 'error',
+          protocol: 'Py4J Loopback Exception',
+          port: '127.0.0.1:44108',
+          label: 'orders.py exits 1',
+          info: `Unhandled Spark failure propagates over Py4J loopback to orders.py on edge-01: ${opts.diagnostic}. The client Python driver process fails with exit code 1 (tracked separately from YARN AM status).`,
+          size: 'exit code 1',
+          command: `orders.py exits 1 // ${opts.diagnostic}`,
+          fields: [
+            { name: 'pythonProcessExit', value: '1 (FAILED on edge-01)' },
+            { name: 'yarnAmDivergence', value: 'YARN AM status depends on exitCode passed to SparkContext.stop(code)' },
+          ],
+          senderState: 'Exception propagated to client Python driver',
+          receiverState: 'orders.py exiting non-zero (exit 1) after teardown',
+          isError: true,
+        });
+        b.addEvent({
+          stepId,
+          from: yarnBackend,
+          to: state.activeAm,
+          kind: link.kind,
+          channel: 'rpc',
+          protocol: link.protocol,
+          port: link.port,
+          label: 'Shutdown(exit=0) -> AM',
+          info: `Default SparkContext.stop() delegates to stop(0) (SparkContext.scala:2607; PySpark stop() calls _jsc.stop() with no exitCode arg); YarnClientSchedulerBackend.stop() (YarnClientSchedulerBackend.scala:174-190) calls yarnSchedulerEndpoint.signalDriverStop(0) -> Shutdown(exitCode=0) over ${link.port} BEFORE calling super.stop() (StopExecutor). Explicit JVM sc.stop(1) would send Shutdown(1) instead.`,
+          size: '640 B',
+          command: 'yarnSchedulerEndpoint.signalDriverStop(0) -> Shutdown(exitCode=0) // before super.stop()',
+          fields: [
+            { name: 'exitCode', value: '0 (default SparkContext.stop() = stop(0))' },
+            { name: 'order', value: 'YarnClientSchedulerBackend.scala:174-190 signals AM Shutdown(0) BEFORE super.stop() StopExecutor' },
+            { name: 'channel', value: link.port },
+            { name: 'explicitOverride', value: 'SparkContext.stop(1) -> Shutdown(1) -> YARN FAILED' },
+          ],
+          senderState: 'Client SparkContext.stop() sent Shutdown(0) before super.stop()',
+          receiverState: 'AMEndpoint marking shutdown=true, exitCode=0',
+        });
+        emitStopLiveExecutors(true);
+        b.addEvent({
+          stepId,
+          from: state.activeAm,
+          to: state.rm,
+          channel: 'yarn',
+          protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
+          port: 'rm01:8030',
+          label: 'unregisterAM(SUCCEEDED)',
+          info: `Client AM (${state.activeAm}) received Shutdown(0) and on driver disconnect (ApplicationMaster.scala:878-886) calls finish(FinalApplicationStatus.SUCCEEDED, EXIT_SUCCESS=0) on RM :8030. YARN UI therefore reports SUCCEEDED even though orders.py exited 1 (famous client-mode SparkContext.stop() default-0 gotcha; pass explicit JVM sc.stop(1) for YARN FAILED).`,
+          size: '1.1 KB',
+          command: 'amClient.unregister(FinalApplicationStatus.SUCCEEDED, "") // exitCode=0 from default sc.stop(); orders.py exited 1',
+          fields: [
+            { name: 'yarnFinalStatus', value: 'FinalApplicationStatus.SUCCEEDED (EXIT_SUCCESS=0)' },
+            { name: 'clientDriverExit', value: '1 (orders.py FAILED)' },
+            { name: 'whySucceeded', value: 'Default SparkContext.stop() calls stop(0); explicit JVM sc.stop(1) is required for YARN FAILED' },
+          ],
+          senderState: 'Client AM exiting SUCCEEDED (exitCode=0 from Shutdown(0))',
+          receiverState: 'RM marks app FINISHED / SUCCEEDED despite orders.py exit 1',
+        });
+      } else {
+        const jvmApp = b.std('jvm-user-app');
+        b.addEvent({
+          stepId,
+          from: sc,
+          to: jvmApp,
+          kind: 'local',
+          channel: 'error',
+          protocol: 'In-JVM JavaMainApplication',
+          port: 'edge-01 in-JVM',
+          label: `${jvmShortName} exits 1`,
+          info: `Uncaught exception escapes ${b.appEntryLabel}() on edge-01: ${opts.diagnostic}. JavaMainApplication invokes main and SparkSubmit unwraps & rethrows so the submit JVM fails with exit code 1 (NO automatic sc.stop(1); client AM NEVER selects exit 15).`,
+          size: 'exit code 1',
+          command: `JavaMainApplication.start() -> ${b.appEntryLabel}() throws -> SparkSubmit exits 1`,
+          fields: [
+            { name: 'submitJvmExit', value: '1 (JavaMainApplication failed on edge-01)' },
+            { name: 'noAutoStop1', value: 'NO automatic sc.stop(1) and AM NEVER selects exit 15 in client mode' },
+          ],
+          senderState: `Exception escaped ${b.appEntryLabel}() on edge-01`,
+          receiverState: 'SparkSubmit unwrapping & exiting 1; JVM shutdown hooks running',
+          isError: true,
+        });
+        b.addEvent({
+          stepId,
+          from: yarnBackend,
+          to: state.activeAm,
+          kind: link.kind,
+          channel: 'rpc',
+          protocol: link.protocol,
+          port: link.port,
+          label: 'Shutdown(exit=0) -> AM',
+          info: `On ordinary JVM shutdown, SparkContext's shutdown hook (SparkContext.scala:757-769) calls zero-arg stop() = stop(0) (SparkContext.scala:2607); YarnClientSchedulerBackend.stop() (YarnClientSchedulerBackend.scala:174-190) calls yarnSchedulerEndpoint.signalDriverStop(0) -> Shutdown(exitCode=0) over ${link.port} BEFORE calling super.stop() (StopExecutor). (Explicit sc.stop(1) sends Shutdown(1); abrupt disconnect uses clientModeTreatDisconnectAsFailed -> exit 17 if true.)`,
+          size: '640 B',
+          command: 'ShutdownHook (SparkContext.scala:757-769) -> stop() -> yarnSchedulerEndpoint.signalDriverStop(0) // Shutdown(exitCode=0) before super.stop()',
+          fields: [
+            { name: 'exitCode', value: '0 (SparkContext shutdown hook calls zero-arg stop())' },
+            { name: 'order', value: 'YarnClientSchedulerBackend.scala:174-190 signals AM Shutdown(0) BEFORE super.stop() StopExecutor' },
+            { name: 'channel', value: link.port },
+            { name: 'alternatives', value: 'Explicit sc.stop(1) -> FAILED; clientModeTreatDisconnectAsFailed=true on crash -> exit 17' },
+          ],
+          senderState: `SC shutdown hook sent Shutdown(0) before super.stop()`,
+          receiverState: 'AMEndpoint marking shutdown=true, exitCode=0',
+        });
+        emitStopLiveExecutors(true);
+        b.addEvent({
+          stepId,
+          from: state.activeAm,
+          to: state.rm,
+          channel: 'yarn',
+          protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
+          port: 'rm01:8030',
+          label: 'unregisterAM(SUCCEEDED)',
+          info: `Client AM (${state.activeAm}) received Shutdown(0) from SparkContext's shutdown hook and on driver disconnect calls finish(FinalApplicationStatus.SUCCEEDED, EXIT_SUCCESS=0) on RM :8030 even though ${b.appEntryLabel} / JavaMainApplication exited 1 (client AM NEVER selects exit 15).`,
+          size: '1.1 KB',
+          command: `amClient.unregister(FinalApplicationStatus.SUCCEEDED, "") // Shutdown(0) from SC shutdown hook; ${jvmShortName} exited 1`,
+          fields: [
+            { name: 'yarnFinalStatus', value: 'FinalApplicationStatus.SUCCEEDED (EXIT_SUCCESS=0)' },
+            { name: 'clientLauncherExit', value: `1 (${jvmShortName} / JavaMainApplication FAILED)` },
+            { name: 'whySucceeded', value: 'SparkContext shutdown hook sent Shutdown(0) without explicit sc.stop(1)' },
+          ],
+          senderState: 'Client AM exiting SUCCEEDED (exitCode=0 from Shutdown(0))',
+          receiverState: `RM marks app FINISHED / SUCCEEDED despite ${jvmShortName} exit 1`,
+        });
+      }
       return;
-    } else {
+    } else if (b.isPySpark) {
       const pyDriver = b.std('python-driver');
       b.addEvent({
         stepId,
@@ -295,8 +413,8 @@ export function emitTerminalAppOutcome(
         to: state.activeAm,
         kind: 'local',
         channel: 'error',
-        protocol: 'In-JVM SparkUserAppException',
-        port: 'driver-1 in-JVM',
+        protocol: 'ProcessBuilder Child Exit',
+        port: 'driver-1 OS exit',
         label: `UserApp exit=${exitCode} -> AM`,
         info: `orders.py exits with status ${exitCode}; deploy.PythonRunner throws SparkUserAppException(exitCode=${exitCode}) (NOT exit 15), and ApplicationMaster.startUserApplication calls finish(FAILED, ${exitCode}).`,
         size: `exit code ${exitCode}`,
@@ -307,6 +425,28 @@ export function emitTerminalAppOutcome(
         ],
         senderState: 'Python driver subprocess exited 1',
         receiverState: `AM finish(FAILED, ${exitCode})`,
+        isError: true,
+      });
+    } else {
+      const jvmApp = b.std('jvm-user-app');
+      b.addEvent({
+        stepId,
+        from: jvmApp,
+        to: state.activeAm,
+        kind: 'local',
+        channel: 'error',
+        protocol: 'In-JVM InvocationTargetException',
+        port: 'driver-1 in-JVM',
+        label: 'Uncaught main() -> exit 15',
+        info: `Uncaught exception escapes ${b.appEntryLabel}() inside driver-1 AM JVM; ApplicationMaster.startUserApplication (ApplicationMaster.scala:775-785, 911) catches InvocationTargetException (NOT SparkUserAppException) and calls finish(FinalApplicationStatus.FAILED, EXIT_EXCEPTION_USER_CLASS=15): ${opts.diagnostic}.`,
+        size: 'exit code 15',
+        command: `finish(FinalApplicationStatus.FAILED, EXIT_EXCEPTION_USER_CLASS=15, "${opts.diagnostic}")`,
+        fields: [
+          { name: 'exception', value: 'InvocationTargetException -> EXIT_EXCEPTION_USER_CLASS (15)' },
+          { name: 'sourceRef', value: 'ApplicationMaster.scala:775-785, 911 (vs PySpark SparkUserAppException=1)' },
+        ],
+        senderState: `${b.appEntryLabel}() threw uncaught exception`,
+        receiverState: 'AM finish(FAILED, EXIT_EXCEPTION_USER_CLASS=15)',
         isError: true,
       });
     }
@@ -488,6 +628,119 @@ export function tryInjectPreSubmitFault(
 ): ExecutionRun | null {
   const submit = b.std('spark-submit');
 
+  if (cfg.deployMode === 'client' && cfg.fault === 'class-not-found-jar') {
+    const jvmApp = b.std('jvm-user-app');
+    const missingClass = b.mainClass;
+    const s1 = b.addStep({
+      id: 'sim-step-cnf-client-parse',
+      title: `Client spark-submit prepares classpath & invokes Utils.classForName(${missingClass})`,
+      explanation:
+        `In --deploy-mode client, SparkSubmit.runMain (SparkSubmit.scala:992-1025) builds MutableURLClassLoader (or ChildFirstURLClassLoader when spark.driver.userClassPathFirst=true; note userClassPathFirst changes lookup order for version conflicts only and CANNOT supply a missing class) over ${b.appArtifact} and calls Utils.classForName("${missingClass}") locally on edge-01 before any SparkContext or YARN AM exists.`,
+      category: 'yarn-lifecycle',
+      keyState: `Client SparkSubmit looking up ${missingClass} locally on edge-01 (0 YARN contact)`,
+      command: `spark-submit --master yarn --deploy-mode client --class ${missingClass} ${b.appArtifact}`,
+      detailsPassed: [
+        { name: 'deployMode', value: 'client (lookup occurs locally on edge-01 before YARN submission)' },
+        { name: 'missingClass', value: missingClass },
+        { name: 'userClassPathFirstNote', value: 'spark.driver.userClassPathFirst changes lookup order only; cannot supply a missing class' },
+        { name: 'sourceRef', value: 'SparkSubmit.scala:992-1025; SparkExitCode.scala:44' },
+      ],
+      deepDiveComponentId: 'spark-submit',
+    });
+    b.addEvent({
+      stepId: s1,
+      from: submit,
+      to: submit,
+      kind: 'local',
+      channel: 'internal',
+      protocol: 'In-JVM SparkSubmit Classpath',
+      port: 'edge-01 in-JVM',
+      label: 'Parse CLI & classpath',
+      info: `SparkSubmit.prepareSubmitEnvironment resolves ${b.appArtifact} & --jars onto edge-01 URLClassLoader (spark.driver.userClassPathFirst changes lookup order only, cannot supply a missing class).`,
+      size: 'in-memory',
+      command: `SparkSubmit.prepareSubmitEnvironment(--class ${missingClass} ${b.appArtifact})`,
+      fields: [
+        { name: 'artifact', value: b.appArtifact },
+        { name: 'yarnContacted', value: 'false' },
+      ],
+      senderState: 'Prepared client classpath on edge-01',
+      receiverState: 'Invoking Utils.classForName(childMainClass)',
+    });
+    b.addEvent({
+      stepId: s1,
+      from: submit,
+      to: jvmApp,
+      kind: 'local',
+      channel: 'internal',
+      protocol: 'In-JVM ClassLoader Lookup',
+      port: 'edge-01 in-JVM',
+      label: 'classForName(mainClass)',
+      info: `SparkSubmit.runMain (SparkSubmit.scala:992-1025) calls Utils.classForName("${missingClass}") on edge-01 before any SparkContext or YARN AM exists.`,
+      size: 'in-memory',
+      command: `Utils.classForName("${missingClass}") // SparkSubmit.scala:992-1025`,
+      fields: [{ name: 'targetClass', value: missingClass }],
+      senderState: 'Resolving user main class',
+      receiverState: 'Class absent from local submit classpath',
+    });
+
+    const s2 = b.addStep({
+      id: 'sim-step-cnf-client-fail',
+      title: 'Utils.classForName fails -> SparkUserAppException(CLASS_NOT_FOUND = 101, 0 AM/RM)',
+      explanation:
+        `Utils.classForName("${missingClass}") throws ClassNotFoundException / NoClassDefFoundError. SparkSubmit.runMain (SparkSubmit.scala:992-1025) wraps it into SparkUserAppException(SparkExitCode.CLASS_NOT_FOUND = 101) and exits the submit JVM with code 101 on edge-01 BEFORE any SparkContext or YARN ApplicationMaster is created.`,
+      category: 'yarn-lifecycle',
+      keyState: 'FAILED pre-submit on edge-01: SparkUserAppException(SparkExitCode.CLASS_NOT_FOUND = 101) | 0 AM/RM events',
+      command: 'throw new SparkUserAppException(SparkExitCode.CLASS_NOT_FOUND) // exitCode = 101',
+      detailsPassed: [
+        { name: 'exitCode', value: '101 (SparkExitCode.CLASS_NOT_FOUND)' },
+        { name: 'exception', value: 'SparkUserAppException(101) wrapping ClassNotFoundException / NoClassDefFoundError' },
+        { name: 'yarnRmContacted', value: 'false (0 RM/AM RPCs, 0 SparkContext)' },
+      ],
+      deepDiveComponentId: 'spark-submit',
+    });
+    b.addEvent({
+      stepId: s2,
+      from: jvmApp,
+      to: submit,
+      kind: 'local',
+      channel: 'error',
+      protocol: 'In-JVM ClassNotFoundException',
+      port: 'edge-01 in-JVM',
+      label: 'ClassNotFound -> exit 101',
+      info: `ClassNotFoundException / NoClassDefFoundError for ${missingClass} caught by SparkSubmit.runMain and wrapped as SparkUserAppException(SparkExitCode.CLASS_NOT_FOUND = 101).`,
+      size: 'Exit 101',
+      command: `catch ClassNotFoundException -> throw new SparkUserAppException(101)`,
+      fields: [
+        { name: 'exitCode', value: '101 (SparkExitCode.CLASS_NOT_FOUND)' },
+        { name: 'sparkContextCreated', value: 'false' },
+      ],
+      senderState: 'Class lookup failed on edge-01',
+      receiverState: 'Wrapping in SparkUserAppException(101)',
+      isError: true,
+    });
+    b.addEvent({
+      stepId: s2,
+      from: submit,
+      to: submit,
+      kind: 'local',
+      channel: 'error',
+      protocol: 'Submit JVM Exit (101)',
+      port: 'edge-01 in-JVM',
+      label: 'Launcher exits 101',
+      info: 'spark-submit exits 101 (SparkExitCode.CLASS_NOT_FOUND) on edge-01 with ZERO SparkContext and ZERO YARN RM/AM contact (cluster mode instead fails in AM loadClass with unregistered exit 13).',
+      size: 'Exit 101',
+      command: 'exitFn(101) // SparkExitCode.CLASS_NOT_FOUND',
+      fields: [
+        { name: 'exitCode', value: '101' },
+        { name: 'yarnContainers', value: '0' },
+      ],
+      senderState: 'Aborted on edge-01 with exit 101',
+      receiverState: 'Shell receives exit status 101',
+      isError: true,
+    });
+    return finalizeShortCircuit(b, meta, 'CLASS NOT FOUND (101)');
+  }
+
   if (cfg.fault === 'oversized-request') {
     const yClient = b.std('yarn-client');
     const rm = b.std('resource-manager');
@@ -498,7 +751,7 @@ export function tryInjectPreSubmitFault(
         'spark-submit launches yarn.Client, which calls yarnClient.createApplication() on RM :8032 and receives yarn.scheduler.maximum-allocation-mb = 8192 MiB.',
       category: 'yarn-lifecycle',
       keyState: 'RM max container memory = 8192 MiB; app ID reserved but not submitted',
-      command: `spark-submit --master yarn --deploy-mode ${cfg.deployMode} --executor-memory 8g --num-executors ${cfg.numExecutors} orders.py`,
+      command: b.submitCommand(' --executor-memory 8g'),
       detailsPassed: [
         { name: 'executorMemory', value: '8192 MiB (--executor-memory 8g)' },
         { name: 'executorOverhead', value: '819 MiB (10% overhead)' },
@@ -600,7 +853,6 @@ export function tryInjectPreSubmitFault(
   }
 
   if (cfg.fault === 'am-invalid-java-opts') {
-    const pyDriver = b.std('python-driver');
     const sc = b.std('spark-context');
     const yarnBackend = b.std('yarn-scheduler-backend');
     const yClient = b.std('yarn-client');
@@ -612,7 +864,7 @@ export function tryInjectPreSubmitFault(
         'Per Client.scala:207-234, in yarn-client mode SparkContext starts on edge-01, YarnClientSchedulerBackend invokes yarn.Client.submitApplication(), yarn.Client ALREADY contacts ResourceManager (:8032) via createApplication() / getNewApplication() to reserve an applicationId and runs verifyClusterResources(), and then calls createContainerLaunchContext().',
       category: 'yarn-lifecycle',
       keyState: 'appId reserved on RM :8032; entering Client.createContainerLaunchContext()',
-      command: 'spark-submit --master yarn --deploy-mode client --conf spark.yarn.am.extraJavaOptions="-Xmx2g -Dspark.foo=bar" orders.py',
+      command: b.submitCommand(' --conf spark.yarn.am.extraJavaOptions="-Xmx2g -Dspark.foo=bar"'),
       detailsPassed: [
         { name: 'deployMode', value: 'client' },
         { name: 'rmContacted', value: 'Yes: getNewApplication on rm01:8032 -> appId reserved (no submitApplication yet)' },
@@ -620,37 +872,74 @@ export function tryInjectPreSubmitFault(
       ],
       deepDiveComponentId: 'yarn-client',
     });
-    b.addEvent({
-      stepId: s1,
-      from: submit,
-      to: pyDriver,
-      kind: 'local',
-      channel: 'python',
-      protocol: 'ProcessBuilder (edge-01)',
-      port: 'edge-01 OS',
-      label: 'Run orders.py locally',
-      info: 'spark-submit starts local PythonRunner and orders.py on edge-01.',
-      size: 'OS fork/exec',
-      command: 'PythonRunner.main(Array("orders.py", ""))',
-      fields: [{ name: 'host', value: 'edge-01' }],
-      senderState: 'Hosting client driver JVM',
-      receiverState: 'Initializing SparkContext',
-    });
-    b.addEvent({
-      stepId: s1,
-      from: pyDriver,
-      to: sc,
-      channel: 'python',
-      protocol: 'Py4J Loopback TCP',
-      port: '127.0.0.1:44108',
-      label: 'Init client SparkContext',
-      info: 'orders.py creates SparkContext on edge-01 with spark.yarn.am.extraJavaOptions set.',
-      size: '2.0 KB',
-      command: 'SparkContext.getOrCreate(conf)',
-      fields: [{ name: 'amExtraJavaOpts', value: '-Xmx2g -Dspark.foo=bar' }],
-      senderState: 'Awaiting YARN scheduler backend',
-      receiverState: 'Starting YarnClientSchedulerBackend',
-    });
+    if (b.isPySpark) {
+      const pyDriver = b.std('python-driver');
+      b.addEvent({
+        stepId: s1,
+        from: submit,
+        to: pyDriver,
+        kind: 'local',
+        channel: 'python',
+        protocol: 'ProcessBuilder (edge-01)',
+        port: 'edge-01 OS',
+        label: 'Run orders.py locally',
+        info: 'spark-submit starts local PythonRunner and orders.py on edge-01.',
+        size: 'OS fork/exec',
+        command: 'PythonRunner.main(Array("orders.py", ""))',
+        fields: [{ name: 'host', value: 'edge-01' }],
+        senderState: 'Hosting client driver JVM',
+        receiverState: 'Initializing SparkContext',
+      });
+      b.addEvent({
+        stepId: s1,
+        from: pyDriver,
+        to: sc,
+        channel: 'python',
+        protocol: 'Py4J Loopback TCP',
+        port: '127.0.0.1:44108',
+        label: 'Init client SparkContext',
+        info: 'orders.py creates SparkContext on edge-01 with spark.yarn.am.extraJavaOptions set.',
+        size: '2.0 KB',
+        command: 'SparkContext.getOrCreate(conf)',
+        fields: [{ name: 'amExtraJavaOpts', value: '-Xmx2g -Dspark.foo=bar' }],
+        senderState: 'Awaiting YARN scheduler backend',
+        receiverState: 'Starting YarnClientSchedulerBackend',
+      });
+    } else {
+      const jvmApp = b.std('jvm-user-app');
+      b.addEvent({
+        stepId: s1,
+        from: submit,
+        to: jvmApp,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM JavaMainApplication',
+        port: 'edge-01 in-JVM',
+        label: b.isScala ? 'JavaMainApp -> OrdersJob' : 'JavaMainApp -> JavaJob',
+        info: `spark-submit invokes JavaMainApplication.start() directly in-JVM on edge-01 -> ${b.appMainClass}.main().`,
+        size: 'in-memory',
+        command: `JavaMainApplication.start() -> ${b.appMainClass}.main(args)`,
+        fields: [{ name: 'host', value: 'edge-01' }],
+        senderState: 'Hosting client driver JVM',
+        receiverState: 'Initializing SparkContext',
+      });
+      b.addEvent({
+        stepId: s1,
+        from: jvmApp,
+        to: sc,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM SparkContext Init',
+        port: 'edge-01 in-JVM',
+        label: 'Init client SparkContext',
+        info: `${b.appEntryLabel}() creates SparkContext on edge-01 with spark.yarn.am.extraJavaOptions set.`,
+        size: 'in-memory',
+        command: 'SparkContext.getOrCreate(conf)',
+        fields: [{ name: 'amExtraJavaOpts', value: '-Xmx2g -Dspark.foo=bar' }],
+        senderState: 'Awaiting YARN scheduler backend',
+        receiverState: 'Starting YarnClientSchedulerBackend',
+      });
+    }
     b.addEvent({
       stepId: s1,
       from: yarnBackend,
@@ -735,7 +1024,7 @@ export function tryInjectPreSubmitFault(
       command: 'sc.stop() // failed before yarnClient.submitApplication()',
       fields: [{ name: 'finalStatus', value: 'FAILED (pre-submitApplication)' }],
       senderState: 'Client failed before submitting AM',
-      receiverState: 'orders.py exits non-zero with SparkException',
+      receiverState: `${b.appEntryLabel} exits non-zero with SparkException`,
       isError: true,
     });
     return finalizeShortCircuit(b, meta, 'INVALID AM OPTS');
@@ -751,7 +1040,6 @@ export function tryInjectPreSubmitFault(
 
 function emitPortBindExhaustedClient(b: SimRunBuilder, meta: SimRunMeta): ExecutionRun {
   const submit = b.std('spark-submit');
-  const pyDriver = b.std('python-driver');
   const sc = b.std('spark-context');
   const sparkEnv = b.std('spark-env');
   const sparkUi = b.std('spark-ui');
@@ -760,47 +1048,84 @@ function emitPortBindExhaustedClient(b: SimRunBuilder, meta: SimRunMeta): Execut
     id: 'sim-step-port-bind-boot',
     title: 'Client driver starts on edge-01 & initializes SparkContext / SparkEnv',
     explanation:
-      'In client mode, spark-submit launches orders.py locally on edge-01 and begins creating SparkContext and SparkEnv before contacting YARN.',
+      `In client mode, spark-submit launches ${b.appEntryLabel} locally on edge-01 and begins creating SparkContext and SparkEnv before contacting YARN.`,
     category: 'driver-python-bridge',
     keyState: 'Initializing SparkContext & SparkEnv on edge-01',
-    command: 'spark-submit --master yarn --deploy-mode client orders.py',
+    command: b.submitCommand(),
     detailsPassed: [
       { name: 'host', value: 'edge-01 (client driver)' },
       { name: 'spark.ui.port', value: '4040' },
     ],
     deepDiveComponentId: 'spark-context',
   });
-  b.addEvent({
-    stepId: sBoot,
-    from: submit,
-    to: pyDriver,
-    kind: 'local',
-    channel: 'python',
-    protocol: 'ProcessBuilder (edge-01)',
-    port: 'edge-01 OS',
-    label: 'Run orders.py locally',
-    info: 'spark-submit starts local Python driver on edge-01.',
-    size: 'OS fork/exec',
-    command: 'PythonRunner.main(Array("orders.py", ""))',
-    fields: [{ name: 'host', value: 'edge-01' }],
-    senderState: 'Hosting client driver JVM',
-    receiverState: 'Creating SparkContext',
-  });
-  b.addEvent({
-    stepId: sBoot,
-    from: pyDriver,
-    to: sc,
-    channel: 'python',
-    protocol: 'Py4J Loopback TCP',
-    port: '127.0.0.1:44108',
-    label: 'SparkContext.getOrCreate',
-    info: 'orders.py initializes SparkContext over Py4J on edge-01.',
-    size: '2.0 KB',
-    command: 'SparkContext.getOrCreate(conf)',
-    fields: [{ name: 'spark.ui.port', value: '4040' }],
-    senderState: 'Awaiting SparkContext',
-    receiverState: 'Creating SparkEnv and binding SparkUI',
-  });
+  if (b.isPySpark) {
+    const pyDriver = b.std('python-driver');
+    b.addEvent({
+      stepId: sBoot,
+      from: submit,
+      to: pyDriver,
+      kind: 'local',
+      channel: 'python',
+      protocol: 'ProcessBuilder (edge-01)',
+      port: 'edge-01 OS',
+      label: 'Run orders.py locally',
+      info: 'spark-submit starts local Python driver on edge-01.',
+      size: 'OS fork/exec',
+      command: 'PythonRunner.main(Array("orders.py", ""))',
+      fields: [{ name: 'host', value: 'edge-01' }],
+      senderState: 'Hosting client driver JVM',
+      receiverState: 'Creating SparkContext',
+    });
+    b.addEvent({
+      stepId: sBoot,
+      from: pyDriver,
+      to: sc,
+      channel: 'python',
+      protocol: 'Py4J Loopback TCP',
+      port: '127.0.0.1:44108',
+      label: 'SparkContext.getOrCreate',
+      info: 'orders.py initializes SparkContext over Py4J on edge-01.',
+      size: '2.0 KB',
+      command: 'SparkContext.getOrCreate(conf)',
+      fields: [{ name: 'spark.ui.port', value: '4040' }],
+      senderState: 'Awaiting SparkContext',
+      receiverState: 'Creating SparkEnv and binding SparkUI',
+    });
+  } else {
+    const jvmApp = b.std('jvm-user-app');
+    b.addEvent({
+      stepId: sBoot,
+      from: submit,
+      to: jvmApp,
+      kind: 'local',
+      channel: 'internal',
+      protocol: 'In-JVM JavaMainApplication',
+      port: 'edge-01 in-JVM',
+      label: b.isScala ? 'JavaMainApp -> OrdersJob' : 'JavaMainApp -> JavaJob',
+      info: `spark-submit invokes JavaMainApplication.start() directly in-JVM on edge-01 -> ${b.appMainClass}.main().`,
+      size: 'in-memory',
+      command: `JavaMainApplication.start() -> ${b.appMainClass}.main(args)`,
+      fields: [{ name: 'host', value: 'edge-01' }],
+      senderState: 'Hosting client driver JVM',
+      receiverState: 'Creating SparkContext',
+    });
+    b.addEvent({
+      stepId: sBoot,
+      from: jvmApp,
+      to: sc,
+      kind: 'local',
+      channel: 'internal',
+      protocol: 'In-JVM SparkContext Init',
+      port: 'edge-01 in-JVM',
+      label: 'SparkContext.getOrCreate',
+      info: `${b.appEntryLabel}() initializes SparkContext directly in-JVM on edge-01.`,
+      size: 'in-memory',
+      command: 'SparkContext.getOrCreate(conf)',
+      fields: [{ name: 'spark.ui.port', value: '4040' }],
+      senderState: 'Awaiting SparkContext',
+      receiverState: 'Creating SparkEnv and binding SparkUI',
+    });
+  }
   b.addEvent({
     stepId: sBoot,
     from: sc,
@@ -854,23 +1179,44 @@ function emitPortBindExhaustedClient(b: SimRunBuilder, meta: SimRunMeta): Execut
     receiverState: 'WebUI.bind() calling System.exit(1) directly',
     isError: true,
   });
-  b.addEvent({
-    stepId: sPort,
-    from: sc,
-    to: pyDriver,
-    kind: 'local',
-    channel: 'error',
-    protocol: 'In-JVM Direct System.exit(1)',
-    port: 'edge-01 in-JVM',
-    label: 'Driver JVM System.exit(1)',
-    info: 'Driver JVM exits directly with System.exit(1) on edge-01 before any YARN application is submitted.',
-    size: 'Exit 1',
-    command: 'System.exit(1) // driver JVM exits 1 (not 15)',
-    fields: [{ name: 'finalStatus', value: 'FAILED (System.exit(1); 0 YARN containers)' }],
-    senderState: 'Driver JVM exited with status 1',
-    receiverState: 'orders.py Py4J connection closed (exit 1)',
-    isError: true,
-  });
+  if (b.isPySpark) {
+    const pyDriver = b.std('python-driver');
+    b.addEvent({
+      stepId: sPort,
+      from: sc,
+      to: pyDriver,
+      channel: 'error',
+      protocol: 'Py4J Loopback EOF (System.exit(1))',
+      port: '127.0.0.1:43122',
+      label: 'Driver JVM System.exit(1)',
+      info: 'Driver JVM exits directly with System.exit(1) on edge-01 before any YARN application is submitted.',
+      size: 'Exit 1',
+      command: 'System.exit(1) // driver JVM exits 1 (not 15)',
+      fields: [{ name: 'finalStatus', value: 'FAILED (System.exit(1); 0 YARN containers)' }],
+      senderState: 'Driver JVM exited with status 1',
+      receiverState: 'orders.py Py4J connection closed (exit 1)',
+      isError: true,
+    });
+  } else {
+    const jvmApp = b.std('jvm-user-app');
+    b.addEvent({
+      stepId: sPort,
+      from: sc,
+      to: jvmApp,
+      kind: 'local',
+      channel: 'error',
+      protocol: 'In-JVM System.exit(1)',
+      port: 'edge-01 in-JVM',
+      label: 'Driver JVM System.exit(1)',
+      info: `Driver JVM exits directly with System.exit(1) inside ${b.appEntryLabel} on edge-01 before any YARN application is submitted (NOT exit 15).`,
+      size: 'Exit 1',
+      command: 'System.exit(1) // driver JVM exits 1 (not 15)',
+      fields: [{ name: 'finalStatus', value: 'FAILED (System.exit(1); 0 YARN containers)' }],
+      senderState: 'Driver JVM exited with status 1',
+      receiverState: `${b.appEntryLabel} terminated with exit 1`,
+      isError: true,
+    });
+  }
   return finalizeShortCircuit(b, meta, 'PORT BIND FAIL');
 }
 
@@ -887,12 +1233,13 @@ export function tryInjectClientDynAllocNoEssFault(
     return null;
   }
 
-  const pyDriver = b.std('python-driver');
   const sc = b.std('spark-context');
   const yarnBackend = b.std('yarn-scheduler-backend');
   const rm = b.std('resource-manager');
   const eam = b.std('executor-allocation-manager');
   const link = b.driverToAmLink();
+  const jvmShortName = b.isScala ? 'OrdersJob' : 'OrdersJavaJob';
+  const driverExitLabel = b.isPySpark ? 'orders.py exits 1' : `${jvmShortName} exits 1`;
 
   const sAmRun = b.addStep({
     id: 'sim-step-dynalloc-am-running',
@@ -944,18 +1291,18 @@ export function tryInjectClientDynAllocNoEssFault(
 
   const sGuard = b.addStep({
     id: 'sim-step-dynalloc-guard',
-    title: 'validateSettings fails -> SparkContext.stop() sends Shutdown(0) (YARN SUCCEEDED) while orders.py exits 1',
+    title: `validateSettings fails -> SparkContext.stop() sends Shutdown(0) (YARN SUCCEEDED) while ${b.appEntryLabel} exits 1`,
     explanation:
-      'After AM reaches RUNNING, SparkContext constructs ExecutorAllocationManager. validateSettings() (ExecutorAllocationManager.scala:234-255) throws SparkException because ALL 4 shuffle-preservation prerequisites are off: (1) spark.shuffle.service.enabled=false, (2) spark.dynamicAllocation.shuffleTracking.enabled=false, (3) shuffle-block decommission fallback off (spark.decommission.enabled / spark.storage.decommission.shuffleBlocks.enabled), and (4) no reliable ShuffleDataIO storage (supportsReliableStorage()=false). In SparkContext.scala:785-795, the constructor catch block calls zero-arg stop() (def stop(): Unit = stop(0) at SparkContext.scala:2607, NOT stop(1)!), which sends Shutdown(exitCode=0) to the connected client AM so YARN UI records FinalApplicationStatus.SUCCEEDED even though finally { throw e } causes orders.py to fail with Python exit code 1.',
+      `After AM reaches RUNNING, SparkContext constructs ExecutorAllocationManager. validateSettings() (ExecutorAllocationManager.scala:234-255) throws IllegalArgumentException / SparkException because ALL 4 shuffle-preservation prerequisites are off: (1) spark.shuffle.service.enabled=false, (2) spark.dynamicAllocation.shuffleTracking.enabled=false, (3) shuffle-block decommission fallback off (spark.decommission.enabled / spark.storage.decommission.shuffleBlocks.enabled), and (4) no reliable ShuffleDataIO storage (supportsReliableStorage()=false). In SparkContext.scala:785-795, the constructor catch block calls zero-arg stop() (def stop(): Unit = stop(0) at SparkContext.scala:2607, NOT stop(1)!), which sends Shutdown(exitCode=0) to the connected client AM so YARN UI records FinalApplicationStatus.SUCCEEDED even though finally { throw e } causes ${b.isPySpark ? 'orders.py to fail with Python exit code 1' : `JavaMainApplication / ${b.appEntryLabel} to fail with IllegalArgumentException`}.`,
     category: 'yarn-lifecycle',
-    keyState: 'orders.py FAILED (exit=1, SparkException) | YARN AM SUCCEEDED (SparkContext init catch calls stop() -> Shutdown(0))',
-    command: 'validateSettings() -> SparkException -> SparkContext.stop() -> Shutdown(0) -> unregisterAM(SUCCEEDED) | orders.py exits 1',
+    keyState: `${b.appEntryLabel} FAILED (exit=1) | YARN AM SUCCEEDED (SparkContext init catch calls stop() -> Shutdown(0))`,
+    command: `validateSettings() -> SparkException -> SparkContext.stop() -> Shutdown(0) -> unregisterAM(SUCCEEDED) | ${driverExitLabel}`,
     detailsPassed: [
       { name: 'prereq1_ESS', value: 'spark.shuffle.service.enabled = false' },
       { name: 'prereq2_tracking', value: 'spark.dynamicAllocation.shuffleTracking.enabled = false' },
       { name: 'prereq3_decommission', value: 'spark.decommission.enabled / spark.storage.decommission.shuffleBlocks.enabled = false' },
       { name: 'prereq4_shuffleDataIO', value: 'ShuffleDataIO.driver().supportsReliableStorage() = false' },
-      { name: 'yarnVsClientOutcome', value: 'SparkContext.scala:789 calls stop() = stop(0) -> Shutdown(0) -> YARN SUCCEEDED; orders.py exits 1' },
+      { name: 'yarnVsClientOutcome', value: `SparkContext.scala:789 calls stop() = stop(0) -> Shutdown(0) -> YARN SUCCEEDED; ${driverExitLabel}` },
     ],
     deepDiveComponentId: 'executor-allocation-manager',
   });
@@ -968,7 +1315,7 @@ export function tryInjectClientDynAllocNoEssFault(
     protocol: 'In-JVM validateSettings',
     port: 'edge-01 in-JVM',
     label: 'validateSettings() FAIL',
-    info: 'ExecutorAllocationManager.validateSettings() throws SparkException: all 4 prerequisites off (spark.shuffle.service.enabled=false, spark.dynamicAllocation.shuffleTracking.enabled=false, decommission shuffle-block fallback off, and no reliable ShuffleDataIO).',
+    info: 'ExecutorAllocationManager.validateSettings() throws IllegalArgumentException / SparkException: all 4 prerequisites off (spark.shuffle.service.enabled=false, spark.dynamicAllocation.shuffleTracking.enabled=false, decommission shuffle-block fallback off, and no reliable ShuffleDataIO).',
     size: 'SparkException',
     command: 'throw new SparkException("Dynamic allocation of executors requires one of the following conditions: 1) ESS 2) shuffleTracking 3) shuffleBlocks decommission 4) reliable ShuffleDataIO")',
     fields: [
@@ -995,7 +1342,7 @@ export function tryInjectClientDynAllocNoEssFault(
       { name: 'channel', value: link.port },
       { name: 'exitCodeSent', value: '0 (SparkContext.stop() default, NOT stop(1))' },
     ],
-    senderState: 'SparkContext init catch sent Shutdown(0) before rethrowing SparkException',
+    senderState: 'SparkContext init catch sent Shutdown(0) before rethrowing exception',
     receiverState: 'AMEndpoint marking shutdown=true, exitCode=0',
   });
   b.addEvent({
@@ -1006,37 +1353,61 @@ export function tryInjectClientDynAllocNoEssFault(
     protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
     port: 'rm01:8030',
     label: 'unregisterAM(SUCCEEDED)',
-    info: 'Because Shutdown(0) set exitCode=0, client AM on disconnect (ApplicationMaster.scala:878-886) calls finish(FinalApplicationStatus.SUCCEEDED, EXIT_SUCCESS=0) on RM :8030! YARN UI displays SUCCEEDED even though orders.py fails with exit code 1.',
+    info: `Because Shutdown(0) set exitCode=0, client AM on disconnect (ApplicationMaster.scala:878-886) calls finish(FinalApplicationStatus.SUCCEEDED, EXIT_SUCCESS=0) on RM :8030! YARN UI displays SUCCEEDED even though ${b.appEntryLabel} fails with exit code 1.`,
     size: '1.1 KB',
     command: 'amClient.unregister(FinalApplicationStatus.SUCCEEDED, "") // exitCode=0 from SparkContext init catch stop()',
     fields: [
       { name: 'amRegistered', value: 'true (registered prior to validateSettings)' },
       { name: 'yarnFinalStatus', value: 'FinalApplicationStatus.SUCCEEDED (EXIT_SUCCESS=0)' },
-      { name: 'clientDriverExit', value: '1 (orders.py fails with SparkException despite YARN SUCCEEDED)' },
+      { name: 'clientDriverExit', value: `1 (${b.appEntryLabel} fails despite YARN SUCCEEDED)` },
     ],
     senderState: 'Client AM exiting SUCCEEDED (exitCode=0)',
     receiverState: 'RM marks application FINISHED / SUCCEEDED despite client init error',
   });
-  b.addEvent({
-    stepId: sGuard,
-    from: sc,
-    to: pyDriver,
-    kind: 'local',
-    channel: 'error',
-    protocol: 'In-JVM Exception Propagate',
-    port: 'edge-01 in-JVM',
-    label: 'orders.py exits 1',
-    info: 'SparkContext.scala:793 finally { throw e } rethrows SparkException to orders.py on edge-01, so the client Python driver exits 1 even though YARN RM recorded FinalApplicationStatus.SUCCEEDED.',
-    size: 'SparkException',
-    command: 'orders.py exits 1 (SparkException from ExecutorAllocationManager.validateSettings)',
-    fields: [
-      { name: 'pythonExitCode', value: '1 (FAILED)' },
-      { name: 'yarnStatus', value: 'SUCCEEDED (SparkContext.stop() default-0 gotcha)' },
-    ],
-    senderState: 'SparkContext stopped (Shutdown(0)) and rethrew SparkException',
-    receiverState: 'orders.py exited non-zero (exit 1)',
-    isError: true,
-  });
+  if (b.isPySpark) {
+    const pyDriver = b.std('python-driver');
+    b.addEvent({
+      stepId: sGuard,
+      from: sc,
+      to: pyDriver,
+      channel: 'error',
+      protocol: 'Py4J Loopback Exception',
+      port: '127.0.0.1:43122',
+      label: 'orders.py exits 1',
+      info: 'SparkContext.scala:793 finally { throw e } rethrows SparkException to orders.py on edge-01, so the client Python driver exits 1 even though YARN RM recorded FinalApplicationStatus.SUCCEEDED.',
+      size: 'SparkException',
+      command: 'orders.py exits 1 (SparkException from ExecutorAllocationManager.validateSettings)',
+      fields: [
+        { name: 'pythonExitCode', value: '1 (FAILED)' },
+        { name: 'yarnStatus', value: 'SUCCEEDED (SparkContext.stop() default-0 gotcha)' },
+      ],
+      senderState: 'SparkContext stopped (Shutdown(0)) and rethrew SparkException',
+      receiverState: 'orders.py exited non-zero (exit 1)',
+      isError: true,
+    });
+  } else {
+    const jvmApp = b.std('jvm-user-app');
+    b.addEvent({
+      stepId: sGuard,
+      from: sc,
+      to: jvmApp,
+      kind: 'local',
+      channel: 'error',
+      protocol: 'In-JVM SparkContext Init Catch',
+      port: 'edge-01 in-JVM',
+      label: `${jvmShortName} exits 1`,
+      info: `SparkContext.scala:793 finally { throw e } rethrows IllegalArgumentException / SparkException to ${b.appEntryLabel}() on edge-01 -> JavaMainApplication exits nonzero even though YARN RM recorded FinalApplicationStatus.SUCCEEDED via SparkContext.scala:789 stop() -> Shutdown(0).`,
+      size: 'IllegalArgumentException',
+      command: `${b.appEntryLabel}() -> JavaMainApplication exits 1 (IllegalArgumentException / SparkException)`,
+      fields: [
+        { name: 'launcherExitCode', value: '1 (JavaMainApplication FAILED)' },
+        { name: 'yarnStatus', value: 'SUCCEEDED (SparkContext.scala:789 catch called stop() -> Shutdown(0))' },
+      ],
+      senderState: 'SparkContext stopped (Shutdown(0)) and rethrew init failure',
+      receiverState: `${jvmShortName} / JavaMainApplication exited non-zero`,
+      isError: true,
+    });
+  }
   return finalizeShortCircuit(b, meta, 'DYNALLOC GUARD');
 }
 
@@ -1050,15 +1421,97 @@ export function tryInjectPreDriverStartupFault(
   amNm: string,
   meta: SimRunMeta,
 ): ExecutionRun | null {
-  const pyDriver = b.std('python-driver');
   const rm = b.std('resource-manager');
+
+  if (cfg.fault === 'class-not-found-jar') {
+    const jvmApp = b.std('jvm-user-app');
+    const missingClass = b.mainClass;
+    const sCnf = b.addStep({
+      id: 'sim-step-cnf-cluster',
+      title: `Cluster AM loadClass(${missingClass}) fails pre-init -> EXIT_SC_NOT_INITED (13, 0 unreg)`,
+      explanation:
+        `Inside container_e01_000001 on driver-1, ApplicationMaster.startUserApplication (ApplicationMaster.scala:741-758, 741-793) calls userClassLoader.loadClass(args.userClass = "${missingClass}").getMethod("main", ...) BEFORE starting the user-thread handler and BEFORE AM registers on :8030. Note that spark.driver.userClassPathFirst=true switches AM to ChildFirstURLClassLoader (lookup order only; cannot supply a missing class). ClassNotFoundException hits the outer AM catch while registered=false (ApplicationMaster.scala:377-392), so finish() overrides exitCode to EXIT_SC_NOT_INITED = 13 with ZERO unregisterApplicationMaster RPCs. Contrast: a missing runtime dependency first loaded inside invoked main() AFTER AM registration exits EXIT_EXCEPTION_USER_CLASS = 15.`,
+      category: 'yarn-lifecycle',
+      keyState: 'FAILED pre-registration: EXIT_SC_NOT_INITED = 13 (0 unregisterApplicationMaster; post-reg dep in main() -> exit 15)',
+      command: `userClassLoader.loadClass("${missingClass}").getMethod("main", String[].class) -> finish(FAILED, EXIT_SC_NOT_INITED=13)`,
+      detailsPassed: [
+        { name: 'userClass', value: missingClass },
+        { name: 'failureSite', value: 'ApplicationMaster.scala:741-758 loadClass(args.userClass).getMethod() BEFORE user thread starts' },
+        { name: 'amRegistered', value: 'false (ApplicationMaster.scala:377-392 -> EXIT_SC_NOT_INITED=13, 0 unregisterApplicationMaster)' },
+        { name: 'postRegContrast', value: 'Missing dependency first loaded inside invoked main() AFTER AM registration exits EXIT_EXCEPTION_USER_CLASS=15' },
+        { name: 'userClassPathFirstNote', value: 'spark.driver.userClassPathFirst=true changes lookup order only; cannot supply a missing class' },
+      ],
+      deepDiveComponentId: 'application-master',
+    });
+    b.addEvent({
+      stepId: sCnf,
+      from: am,
+      to: jvmApp,
+      kind: 'local',
+      channel: 'error',
+      protocol: 'In-JVM ClassLoader Lookup',
+      port: 'driver-1 in-JVM',
+      label: 'loadClass() -> CNFE',
+      info: `ApplicationMaster.startUserApplication calls userClassLoader.loadClass("${missingClass}").getMethod("main", ...) BEFORE user-thread handler starts; throws ClassNotFoundException (spark.driver.userClassPathFirst cannot supply missing class).`,
+      size: 'ClassNotFound',
+      command: `userClassLoader.loadClass("${missingClass}").getMethod("main", String[].class) // throws ClassNotFoundException`,
+      fields: [
+        { name: 'exception', value: `java.lang.ClassNotFoundException: ${missingClass}` },
+        { name: 'registeredWithRM', value: 'false (before registerApplicationMaster)' },
+      ],
+      senderState: 'startUserApplication() threw before starting Driver thread',
+      receiverState: 'Entry class missing from localized __app__.jar / --jars',
+      isError: true,
+    });
+    b.addEvent({
+      stepId: sCnf,
+      from: am,
+      to: am,
+      kind: 'local',
+      channel: 'error',
+      protocol: 'In-JVM AM Outer Catch',
+      port: 'driver-1 in-JVM',
+      label: 'finish(FAILED, exit=13)',
+      info: 'ClassNotFoundException hits outer AM catch while registered=false (ApplicationMaster.scala:377-392): finish() records EXIT_SC_NOT_INITED = 13 with ZERO unregisterApplicationMaster RPC. (Contrast: a missing dependency first loaded inside invoked main() AFTER AM registration exits EXIT_EXCEPTION_USER_CLASS = 15.)',
+      size: 'exit code 13',
+      command: 'finish(FinalApplicationStatus.FAILED, EXIT_SC_NOT_INITED=13) // registered=false, 0 unregisterAM',
+      fields: [
+        { name: 'exitCode', value: '13 (EXIT_SC_NOT_INITED; 0 unregisterApplicationMaster RPCs)' },
+        { name: 'postRegistrationContrast', value: 'Missing dependency inside main() after AM registration -> EXIT_EXCEPTION_USER_CLASS = 15' },
+      ],
+      senderState: 'AM exiting locally with code 13',
+      receiverState: 'AM JVM terminating inside container_e01_000001',
+      isError: true,
+    });
+    b.addEvent({
+      stepId: sCnf,
+      from: amNm,
+      to: rm,
+      channel: 'error',
+      protocol: 'Hadoop RPC (ResourceTracker)',
+      port: 'rm01:8031',
+      label: 'AM container exit (13)',
+      info: 'driver-1 NodeManager reports AM container exitStatus=13 (EXIT_SC_NOT_INITED) to RM :8031; 0 executors ever allocated and 0 unregisterApplicationMaster RPCs sent.',
+      size: 'ContainerStatus',
+      command: 'NM ContainerStatus(container_e01_000001, COMPLETE, exitStatus=13)',
+      fields: [
+        { name: 'containerId', value: 'container_e01_000001' },
+        { name: 'exitStatus', value: '13 (EXIT_SC_NOT_INITED, unregistered)' },
+      ],
+      senderState: 'AM container exited on driver-1',
+      receiverState: 'RM marks Attempt 1 FAILED (0 executors allocated)',
+      isError: true,
+    });
+    return finalizeShortCircuit(b, meta, 'CLASS NOT FOUND (13)');
+  }
 
   if (cfg.fault === 'am-sc-timeout') {
     const sTimeout = b.addStep({
       id: 'sim-step-am-timeout',
-      title: 'orders.py stalls before getOrCreate(); AM times out at 100s',
-      explanation:
-        'ApplicationMaster starts deploy.PythonRunner and python3 orders.py, then blocks on sparkContextPromise.future up to spark.yarn.am.waitTime (100s). Because AM never registered with RM (registered==false, ApplicationMaster.scala:367 skips finishApplicationMaster), AM exits locally with EXIT_SC_NOT_INITED (13) and driver-1 NM reports container exit status 13 to RM with 0 executors ever requested.',
+      title: `${b.appEntryLabel} stalls before getOrCreate(); AM times out at 100s`,
+      explanation: b.isPySpark
+        ? 'ApplicationMaster starts deploy.PythonRunner and python3 orders.py, then blocks on sparkContextPromise.future up to spark.yarn.am.waitTime (100s). Because AM never registered with RM (registered==false, ApplicationMaster.scala:367 skips finishApplicationMaster), AM exits locally with EXIT_SC_NOT_INITED (13) and driver-1 NM reports container exit status 13 to RM with 0 executors ever requested.'
+        : `ApplicationMaster reflects ${b.appMainClass}.main() directly in-JVM on the Driver thread, then blocks on sparkContextPromise.future up to spark.yarn.am.waitTime (100s). Because AM never registered with RM (registered==false, ApplicationMaster.scala:367 skips finishApplicationMaster), AM exits locally with EXIT_SC_NOT_INITED (13) and driver-1 NM reports container exit status 13 to RM with 0 executors ever requested.`,
       category: 'driver-python-bridge',
       keyState: 'FAILED (EXIT_SC_NOT_INITED=13, registered=false) | 0 executors ever requested',
       command: 'ThreadUtils.awaitResult(sparkContextPromise.future, 100s) // TimeoutException',
@@ -1070,25 +1523,46 @@ export function tryInjectPreDriverStartupFault(
       ],
       deepDiveComponentId: 'application-master',
     });
-    b.addEvent({
-      stepId: sTimeout,
-      from: am,
-      to: pyDriver,
-      kind: 'local',
-      channel: 'python',
-      protocol: 'ProcessBuilder (PythonRunner)',
-      port: 'driver-1 OS',
-      label: 'Spawn orders.py (stalls)',
-      info: 'AM launches orders.py, which hangs waiting on an external service before SparkSession.builder.getOrCreate().',
-      size: 'OS fork/exec',
-      command: 'PythonRunner.main(Array("orders.py", ""))',
-      fields: [
-        { name: 'PYSPARK_GATEWAY_PORT', value: '43122' },
-        { name: 'scriptState', value: 'Blocked before SparkContext init' },
-      ],
-      senderState: 'AM awaiting sparkContextPromise (100s)',
-      receiverState: 'Python driver stalled before Py4J call',
-    });
+    if (b.isPySpark) {
+      const pyDriver = b.std('python-driver');
+      b.addEvent({
+        stepId: sTimeout,
+        from: am,
+        to: pyDriver,
+        kind: 'local',
+        channel: 'python',
+        protocol: 'ProcessBuilder (PythonRunner)',
+        port: 'driver-1 OS',
+        label: 'Spawn orders.py (stalls)',
+        info: 'AM launches orders.py, which hangs waiting on an external service before SparkSession.builder.getOrCreate().',
+        size: 'OS fork/exec',
+        command: 'PythonRunner.main(Array("orders.py", ""))',
+        fields: [
+          { name: 'PYSPARK_GATEWAY_PORT', value: '43122' },
+          { name: 'scriptState', value: 'Blocked before SparkContext init' },
+        ],
+        senderState: 'AM awaiting sparkContextPromise (100s)',
+        receiverState: 'Python driver stalled before Py4J call',
+      });
+    } else {
+      const jvmApp = b.std('jvm-user-app');
+      b.addEvent({
+        stepId: sTimeout,
+        from: am,
+        to: jvmApp,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM Reflection main()',
+        port: 'driver-1 in-JVM',
+        label: b.isScala ? 'OrdersJob.main stalls' : 'OrdersJavaJob stalls',
+        info: `AM invokes ${b.appMainClass}.main() directly in-JVM, which hangs waiting on an external service before SparkSession.builder.getOrCreate().`,
+        size: 'in-memory',
+        command: `${b.appMainClass}.main(args) // blocked before SparkSession.builder.getOrCreate()`,
+        fields: [{ name: 'driverThreadState', value: 'Blocked before SparkContext init' }],
+        senderState: 'AM awaiting sparkContextPromise (100s)',
+        receiverState: `${b.appEntryLabel}() stalled before SparkContext init`,
+      });
+    }
     b.addEvent({
       stepId: sTimeout,
       from: am,
@@ -1150,37 +1624,74 @@ export function tryInjectPreDriverStartupFault(
       ],
       deepDiveComponentId: 'spark-ui',
     });
-    b.addEvent({
-      stepId: sPort,
-      from: am,
-      to: pyDriver,
-      kind: 'local',
-      channel: 'python',
-      protocol: 'ProcessBuilder (PythonRunner)',
-      port: 'driver-1 OS',
-      label: 'Spawn orders.py',
-      info: 'AM launches orders.py inside container_e01_000001.',
-      size: 'OS fork/exec',
-      command: 'PythonRunner.main(Array("orders.py", ""))',
-      fields: [{ name: 'PYSPARK_GATEWAY_PORT', value: '43122' }],
-      senderState: 'AM awaiting SparkContext init',
-      receiverState: 'orders.py calling SparkContext.getOrCreate()',
-    });
-    b.addEvent({
-      stepId: sPort,
-      from: pyDriver,
-      to: sc,
-      channel: 'python',
-      protocol: 'Py4J Loopback TCP',
-      port: '127.0.0.1:43122',
-      label: 'SparkContext.getOrCreate',
-      info: 'orders.py initializes SparkContext inside the AM JVM.',
-      size: '2.1 KB',
-      command: 'SparkContext.getOrCreate(conf)',
-      fields: [{ name: 'spark.ui.port', value: '4040' }],
-      senderState: 'Awaiting SparkContext',
-      receiverState: 'Starting SparkEnv and Jetty SparkUI',
-    });
+    if (b.isPySpark) {
+      const pyDriver = b.std('python-driver');
+      b.addEvent({
+        stepId: sPort,
+        from: am,
+        to: pyDriver,
+        kind: 'local',
+        channel: 'python',
+        protocol: 'ProcessBuilder (PythonRunner)',
+        port: 'driver-1 OS',
+        label: 'Spawn orders.py',
+        info: 'AM launches orders.py inside container_e01_000001.',
+        size: 'OS fork/exec',
+        command: 'PythonRunner.main(Array("orders.py", ""))',
+        fields: [{ name: 'PYSPARK_GATEWAY_PORT', value: '43122' }],
+        senderState: 'AM awaiting SparkContext init',
+        receiverState: 'orders.py calling SparkContext.getOrCreate()',
+      });
+      b.addEvent({
+        stepId: sPort,
+        from: pyDriver,
+        to: sc,
+        channel: 'python',
+        protocol: 'Py4J Loopback TCP',
+        port: '127.0.0.1:43122',
+        label: 'SparkContext.getOrCreate',
+        info: 'orders.py initializes SparkContext inside the AM JVM.',
+        size: '2.1 KB',
+        command: 'SparkContext.getOrCreate(conf)',
+        fields: [{ name: 'spark.ui.port', value: '4040' }],
+        senderState: 'Awaiting SparkContext',
+        receiverState: 'Starting SparkEnv and Jetty SparkUI',
+      });
+    } else {
+      const jvmApp = b.std('jvm-user-app');
+      b.addEvent({
+        stepId: sPort,
+        from: am,
+        to: jvmApp,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM Reflection main()',
+        port: 'driver-1 in-JVM',
+        label: b.isScala ? 'Reflect OrdersJob.main' : 'Reflect OrdersJavaJob',
+        info: `AM reflects ${b.appMainClass}.main() directly inside container_e01_000001.`,
+        size: 'in-memory',
+        command: `${b.appMainClass}.main(args)`,
+        fields: [{ name: 'pythonProcesses', value: '0' }],
+        senderState: 'AM awaiting SparkContext init',
+        receiverState: `${b.appEntryLabel}() calling SparkContext.getOrCreate()`,
+      });
+      b.addEvent({
+        stepId: sPort,
+        from: jvmApp,
+        to: sc,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM SparkContext Init',
+        port: 'driver-1 in-JVM',
+        label: 'SparkContext.getOrCreate',
+        info: `${b.appEntryLabel}() initializes SparkContext directly inside the AM JVM.`,
+        size: 'in-memory',
+        command: 'SparkContext.getOrCreate(conf)',
+        fields: [{ name: 'spark.ui.port', value: '4040' }],
+        senderState: 'Awaiting SparkContext',
+        receiverState: 'Starting SparkEnv and Jetty SparkUI',
+      });
+    }
     b.addEvent({
       stepId: sPort,
       from: sc,
@@ -1278,37 +1789,74 @@ export function tryInjectPreDriverStartupFault(
       ],
       deepDiveComponentId: 'executor-allocation-manager',
     });
-    b.addEvent({
-      stepId: sGuard,
-      from: am,
-      to: pyDriver,
-      kind: 'local',
-      channel: 'python',
-      protocol: 'ProcessBuilder (PythonRunner)',
-      port: 'driver-1 OS',
-      label: 'Spawn orders.py',
-      info: 'AM starts orders.py inside container_e01_000001.',
-      size: 'OS fork/exec',
-      command: 'PythonRunner.main(Array("orders.py", ""))',
-      fields: [{ name: 'dynamicAllocation', value: 'true' }],
-      senderState: 'AM awaiting SparkContext',
-      receiverState: 'Creating SparkContext',
-    });
-    b.addEvent({
-      stepId: sGuard,
-      from: pyDriver,
-      to: sc,
-      channel: 'python',
-      protocol: 'Py4J Loopback TCP',
-      port: '127.0.0.1:43122',
-      label: 'Init SC (dynAlloc=true)',
-      info: 'orders.py initializes SparkContext with dynamicAllocation=true and all 4 shuffle-preservation options off.',
-      size: '2.1 KB',
-      command: 'SparkContext.getOrCreate(conf[dynamicAllocation=true, ess=false])',
-      fields: [{ name: 'essEnabled', value: 'false' }],
-      senderState: 'Awaiting SparkContext',
-      receiverState: 'Creating SparkEnv & ExecutorAllocationManager',
-    });
+    if (b.isPySpark) {
+      const pyDriver = b.std('python-driver');
+      b.addEvent({
+        stepId: sGuard,
+        from: am,
+        to: pyDriver,
+        kind: 'local',
+        channel: 'python',
+        protocol: 'ProcessBuilder (PythonRunner)',
+        port: 'driver-1 OS',
+        label: 'Spawn orders.py',
+        info: 'AM starts orders.py inside container_e01_000001.',
+        size: 'OS fork/exec',
+        command: 'PythonRunner.main(Array("orders.py", ""))',
+        fields: [{ name: 'dynamicAllocation', value: 'true' }],
+        senderState: 'AM awaiting SparkContext',
+        receiverState: 'Creating SparkContext',
+      });
+      b.addEvent({
+        stepId: sGuard,
+        from: pyDriver,
+        to: sc,
+        channel: 'python',
+        protocol: 'Py4J Loopback TCP',
+        port: '127.0.0.1:43122',
+        label: 'Init SC (dynAlloc=true)',
+        info: 'orders.py initializes SparkContext with dynamicAllocation=true and all 4 shuffle-preservation options off.',
+        size: '2.1 KB',
+        command: 'SparkContext.getOrCreate(conf[dynamicAllocation=true, ess=false])',
+        fields: [{ name: 'essEnabled', value: 'false' }],
+        senderState: 'Awaiting SparkContext',
+        receiverState: 'Creating SparkEnv & ExecutorAllocationManager',
+      });
+    } else {
+      const jvmApp = b.std('jvm-user-app');
+      b.addEvent({
+        stepId: sGuard,
+        from: am,
+        to: jvmApp,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM Reflection main()',
+        port: 'driver-1 in-JVM',
+        label: b.isScala ? 'Reflect OrdersJob.main' : 'Reflect OrdersJavaJob',
+        info: `AM invokes ${b.appMainClass}.main() directly inside container_e01_000001.`,
+        size: 'in-memory',
+        command: `${b.appMainClass}.main(args)`,
+        fields: [{ name: 'dynamicAllocation', value: 'true' }],
+        senderState: 'AM awaiting SparkContext',
+        receiverState: 'Creating SparkContext',
+      });
+      b.addEvent({
+        stepId: sGuard,
+        from: jvmApp,
+        to: sc,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM SparkContext Init',
+        port: 'driver-1 in-JVM',
+        label: 'Init SC (dynAlloc=true)',
+        info: `${b.appEntryLabel}() initializes SparkContext with dynamicAllocation=true and all 4 shuffle-preservation options off.`,
+        size: 'in-memory',
+        command: 'SparkContext.getOrCreate(conf[dynamicAllocation=true, ess=false])',
+        fields: [{ name: 'essEnabled', value: 'false' }],
+        senderState: 'Awaiting SparkContext',
+        receiverState: 'Creating SparkEnv & ExecutorAllocationManager',
+      });
+    }
     b.addEvent({
       stepId: sGuard,
       from: sc,
@@ -1334,7 +1882,7 @@ export function tryInjectPreDriverStartupFault(
       protocol: 'In-JVM validateSettings',
       port: 'driver-1 in-JVM',
       label: 'validateSettings() FAIL',
-      info: 'SparkException: Dynamic allocation requires ESS, shuffleTracking, shuffle-block decommission fallback (spark.decommission.enabled + spark.storage.decommission.shuffleBlocks.enabled), OR reliable ShuffleDataIO storage.',
+      info: 'SparkException / IllegalArgumentException: Dynamic allocation requires ESS, shuffleTracking, shuffle-block decommission fallback (spark.decommission.enabled + spark.storage.decommission.shuffleBlocks.enabled), OR reliable ShuffleDataIO storage.',
       size: 'SparkException',
       command: 'throw new SparkException("Dynamic allocation of executors requires one of the following conditions...")',
       fields: [
@@ -1354,7 +1902,7 @@ export function tryInjectPreDriverStartupFault(
       protocol: 'In-JVM ApplicationMaster.finish',
       port: 'driver-1 in-JVM',
       label: 'finish(FAILED, exit=13)',
-      info: 'orders.py exits 1 before SparkContext initializes -> ApplicationMaster.finish sees !registered && isClusterMode (ApplicationMaster.scala:386) and exits locally with EXIT_SC_NOT_INITED (13) without calling RM finish RPC.',
+      info: `${b.appEntryLabel} fails before SparkContext initializes -> ApplicationMaster.finish sees !registered && isClusterMode (ApplicationMaster.scala:386) and exits locally with EXIT_SC_NOT_INITED (13) without calling RM finish RPC.`,
       size: 'exit code 13',
       command: 'finish(FinalApplicationStatus.FAILED, EXIT_SC_NOT_INITED=13) // registered=false, no RM finish RPC',
       fields: [
@@ -1495,63 +2043,276 @@ export function tryInjectPreWorkloadFault(
   const fault = state.cfg.fault;
 
   if (fault === 'multiple-spark-contexts') {
-    const pyDriver = b.std('python-driver');
     const sc = b.std('spark-context');
     state.abortedByFault = true;
-    const sMulti = b.addStep({
-      id: 'sim-step-multi-sc',
-      title: 'Second SparkContext rejected by PySpark _ensure_initialized (SPARK-2243)',
+    if (b.isPySpark) {
+      const pyDriver = b.std('python-driver');
+      const sMulti = b.addStep({
+        id: 'sim-step-multi-sc',
+        title: 'Second SparkContext rejected by PySpark _ensure_initialized (SPARK-2243)',
+        explanation:
+          'After the first SparkContext is active and the AM has registered with YARN RM, orders.py attempts to construct a second SparkContext. In PySpark, SparkContext._ensure_initialized (python/pyspark/core/context.py:451-475) checks SparkContext._active_spark_context and immediately raises ValueError ("Cannot run multiple SparkContexts at once...") on the Python side BEFORE JVM construction. On the JVM side, SparkContext.assertNoOtherContextIsRunning (SparkContext.scala:3380-3386) unconditionally enforces the same single-context invariant (SparkException, SPARK-2243).',
+        category: 'driver-python-bridge',
+        keyState: 'FAILED: ValueError in SparkContext._ensure_initialized (and unconditional JVM assertNoOtherContextIsRunning)',
+        command: 'SparkContext._ensure_initialized() -> ValueError("Cannot run multiple SparkContexts at once")',
+        detailsPassed: [
+          { name: 'activeContext', value: 'First SparkContext live & AM registered with RM' },
+          { name: 'pysparkGuard', value: 'SparkContext._ensure_initialized (python/pyspark/core/context.py:451-475) -> ValueError before JVM call' },
+          { name: 'jvmGuard', value: 'Unconditional SparkContext.assertNoOtherContextIsRunning (SparkContext.scala:3380-3386) -> SparkException (SPARK-2243)' },
+          { name: 'remediation', value: 'Reuse SparkSession.builder.getOrCreate() or call sc.stop() first' },
+        ],
+        deepDiveComponentId: 'spark-context',
+      });
+      b.addEvent({
+        stepId: sMulti,
+        from: pyDriver,
+        to: pyDriver,
+        kind: 'local',
+        channel: 'error',
+        protocol: 'Python Guard (_ensure_initialized)',
+        port: `${b.driverHost} OS`,
+        label: 'PySpark ValueError (2nd SC)',
+        info: 'orders.py calls SparkContext(conf) while first SparkContext is active; PySpark SparkContext._ensure_initialized raises ValueError ("Cannot run multiple SparkContexts at once...") on the Python side BEFORE invoking the JVM constructor.',
+        size: 'ValueError',
+        command: 'SparkContext._ensure_initialized() // raises ValueError before JVM SparkContext()',
+        fields: [
+          { name: 'activeContext', value: 'SparkContext._active_spark_context != None' },
+          { name: 'jvmGuardNote', value: 'JVM SparkContext.assertNoOtherContextIsRunning also unconditionally rejects a 2nd JVM context (SPARK-2243)' },
+        ],
+        senderState: 'Rejected 2nd Python SparkContext before Py4J JVM construction',
+        receiverState: 'orders.py unwinding with ValueError (exit code 1)',
+        isError: true,
+      });
+      b.addEvent({
+        stepId: sMulti,
+        from: pyDriver,
+        to: sc,
+        channel: 'python',
+        protocol: 'Py4J Loopback -> sc.stop()',
+        port: b.isClient ? '127.0.0.1:44108' : '127.0.0.1:43122',
+        label: 'Stop live SparkContext #1',
+        info: 'orders.py exception teardown stops the live first SparkContext (noting JVM guard SparkContext.assertNoOtherContextIsRunning is unconditional with no override flag).',
+        size: '1.2 KB',
+        command: 'SparkContext.stop() // unwinding after ValueError (SPARK-2243)',
+        fields: [{ name: 'firstContextState', value: 'Shutting down cleanly' }],
+        senderState: 'Tearing down active SparkContext #1',
+        receiverState: 'Stopping scheduler backend & live executors',
+      });
+      emitTerminalAppOutcome(b, state, {
+        origin: 'user-app-failure',
+        diagnostic: 'ValueError: Cannot run multiple SparkContexts at once (SPARK-2243)',
+        stopLiveExecutors: true,
+      });
+    } else {
+      const jvmApp = b.std('jvm-user-app');
+      const sMulti = b.addStep({
+        id: 'sim-step-multi-sc',
+        title: 'Second SparkContext rejected unconditionally by JVM assertNoOtherContextIsRunning (SPARK-2243)',
+        explanation:
+          `After the first SparkContext is active and AM is registered with YARN RM, ${b.appEntryLabel}() attempts to construct a second SparkContext in the same JVM. SparkContext.assertNoOtherContextIsRunning (SparkContext.scala:3380-3386) unconditionally throws SparkException ("Only one SparkContext should be running in this JVM", SPARK-2243; there is no override config flag). Reuse SparkSession.builder.getOrCreate()${b.isJava ? ' or JavaSparkContext.fromSparkContext(spark.sparkContext())' : ''}.`,
+        category: 'driver-python-bridge',
+        keyState: 'FAILED: SparkException in unconditional JVM SparkContext.assertNoOtherContextIsRunning (SPARK-2243)',
+        command: 'new SparkContext(conf) -> SparkContext.assertNoOtherContextIsRunning() -> SparkException',
+        detailsPassed: [
+          { name: 'activeContext', value: 'First SparkContext live & AM registered with RM' },
+          { name: 'jvmGuard', value: 'Unconditional SparkContext.assertNoOtherContextIsRunning (SparkContext.scala:3380-3386, SPARK-2243)' },
+          {
+            name: 'remediation',
+            value: b.isJava
+              ? 'Use JavaSparkContext.fromSparkContext(spark.sparkContext()) or call sc.stop() first'
+              : 'Reuse SparkSession.builder.getOrCreate() or call sc.stop() first',
+          },
+        ],
+        deepDiveComponentId: 'spark-context',
+      });
+      b.addEvent({
+        stepId: sMulti,
+        from: jvmApp,
+        to: sc,
+        kind: 'local',
+        channel: 'error',
+        protocol: 'In-JVM SparkContext Guard',
+        port: `${b.driverHost} in-JVM`,
+        label: '2nd SC -> SparkException',
+        info: `${b.appEntryLabel}() constructs a second SparkContext in the same JVM; unconditional SparkContext.assertNoOtherContextIsRunning (SparkContext.scala:3380-3386) immediately throws SparkException ("Only one SparkContext should be running in this JVM", SPARK-2243).`,
+        size: 'SparkException',
+        command: 'SparkContext.assertNoOtherContextIsRunning() // SparkException: Only one SparkContext should be running in this JVM',
+        fields: [
+          { name: 'exception', value: 'SparkException: Only one SparkContext should be running in this JVM' },
+          { name: 'sourceRef', value: 'SparkContext.scala:3380-3386 (unconditional guard; SPARK-2243)' },
+        ],
+        senderState: 'Attempted 2nd SparkContext construction in-JVM',
+        receiverState: 'Unconditionally rejected 2nd context',
+        isError: true,
+      });
+      b.addEvent({
+        stepId: sMulti,
+        from: sc,
+        to: jvmApp,
+        kind: 'local',
+        channel: 'error',
+        protocol: 'In-JVM Exception Unwind',
+        port: `${b.driverHost} in-JVM`,
+        label: 'Unwind & fail main()',
+        info: `SparkException unwinds out of ${b.appEntryLabel}() while the first SparkContext is torn down cleanly.`,
+        size: 'SparkException',
+        command: `throw new SparkException("Only one SparkContext should be running in this JVM")`,
+        fields: [{ name: 'firstContextState', value: 'Stopping live executors during teardown' }],
+        senderState: 'Rethrew SparkException to user main()',
+        receiverState: `${b.appEntryLabel}() aborting with uncaught SparkException`,
+        isError: true,
+      });
+      emitTerminalAppOutcome(b, state, {
+        origin: 'user-app-failure',
+        diagnostic: 'SparkException: Only one SparkContext should be running in this JVM (SPARK-2243)',
+        stopLiveExecutors: true,
+      });
+    }
+    return true;
+  }
+
+  if (fault === 'java-bean-encoder-error') {
+    const jvmApp = b.std('jvm-user-app');
+    const driverEncoder = b.driverEncoderInstance();
+    state.abortedByFault = true;
+    const sBean = b.addStep({
+      id: 'sim-step-bean-encoder-error',
+      title: 'Driver Encoders.bean(OrderNode.class) -> CIRCULAR_CLASS_REFERENCE (0 stages launched)',
       explanation:
-        'After the first SparkContext is active and the AM has registered with YARN RM, orders.py attempts to construct a second SparkContext. In PySpark, SparkContext._ensure_initialized (python/pyspark/core/context.py:451-475) checks SparkContext._active_spark_context and immediately raises ValueError ("Cannot run multiple SparkContexts at once...") on the Python side BEFORE JVM construction. On the JVM side, SparkContext.assertNoOtherContextIsRunning (SparkContext.scala:3380-3386) unconditionally enforces the same single-context invariant (SparkException, SPARK-2243).',
-      category: 'driver-python-bridge',
-      keyState: 'FAILED: ValueError in SparkContext._ensure_initialized (and unconditional JVM assertNoOtherContextIsRunning)',
-      command: 'SparkContext._ensure_initialized() -> ValueError("Cannot run multiple SparkContexts at once")',
+        `On the driver (${b.driverHost}) BEFORE spark.createDataset(...) is ever entered or any stage launches, ${b.appEntryLabel}() evaluates static Encoders.bean(OrderNode.class) (Encoders.scala:211) on a self-referential JavaBean (OrderNode getParent()). Encoders.bean delegates directly to JavaTypeInference.encoderFor (JavaTypeInference.scala:153-186), which detects OrderNode already in seenTypeSet and throws SparkUnsupportedOperationException (errorClass="CIRCULAR_CLASS_REFERENCE", ExecutionErrors.scala:181-192). Sibling driver encoder errors include ENCODER_NOT_FOUND and BEAN_ENCODER_INTERFACE_NOT_SUPPORTED.`,
+      category: 'sql-planning-aqe',
+      keyState: 'FAILED pre-stage on Driver: SparkUnsupportedOperationException (CIRCULAR_CLASS_REFERENCE | 0 stages launched)',
+      command: 'Encoders.bean(OrderNode.class) -> JavaTypeInference.encoderFor() -> CIRCULAR_CLASS_REFERENCE',
       detailsPassed: [
-        { name: 'activeContext', value: 'First SparkContext live & AM registered with RM' },
-        { name: 'pysparkGuard', value: 'SparkContext._ensure_initialized (python/pyspark/core/context.py:451-475) -> ValueError before JVM call' },
-        { name: 'jvmGuard', value: 'Unconditional SparkContext.assertNoOtherContextIsRunning (SparkContext.scala:3380-3386) -> SparkException (SPARK-2243)' },
-        { name: 'remediation', value: 'Reuse SparkSession.builder.getOrCreate() or call sc.stop() first' },
+        { name: 'errorClass', value: 'CIRCULAR_CLASS_REFERENCE (SparkUnsupportedOperationException)' },
+        { name: 'callOrder', value: 'Static Encoders.bean(OrderNode.class) (Encoders.scala:211) fails BEFORE spark.createDataset(...) is entered' },
+        { name: 'siblings', value: 'ENCODER_NOT_FOUND & BEAN_ENCODER_INTERFACE_NOT_SUPPORTED' },
+        { name: 'stagesLaunched', value: '0 (failed on driver during encoder derivation)' },
+        { name: 'sourceRef', value: 'Encoders.scala:211; JavaTypeInference.scala:153-186; ExecutionErrors.scala:181-192' },
       ],
-      deepDiveComponentId: 'spark-context',
+      deepDiveComponentId: 'dataset-encoder-udf',
     });
     b.addEvent({
-      stepId: sMulti,
-      from: pyDriver,
-      to: pyDriver,
+      stepId: sBean,
+      from: jvmApp,
+      to: driverEncoder,
+      kind: 'local',
+      channel: 'internal',
+      protocol: 'Encoders.scala:211 -> JavaTypeInference',
+      port: `${b.driverHost} in-JVM`,
+      label: 'Encoders.bean(OrderNode)',
+      info: `${b.appEntryLabel}() evaluates static Encoders.bean(OrderNode.class) (Encoders.scala:211 -> JavaTypeInference.encoderFor, JavaTypeInference.scala:153-186) directly BEFORE spark.createDataset(...) is ever entered; introspecting readable bean properties with seenTypeSet={OrderNode} hits self-referential getParent(): OrderNode.`,
+      size: 'in-memory',
+      command: 'Encoders.bean(OrderNode.class) -> JavaTypeInference.encoderFor(OrderNode.class) // before spark.createDataset()',
+      fields: [
+        { name: 'beanClass', value: 'com.acme.OrderNode (cyclic OrderNode getParent())' },
+        { name: 'directHandoff', value: 'Encoders.scala:211 -> JavaTypeInference.encoderFor (SparkSession.createDataset never entered)' },
+        { name: 'cycleDetected', value: 'Introspector.getBeanInfo(OrderNode.class) -> getParent(): OrderNode' },
+      ],
+      senderState: 'Evaluating static Encoders.bean(OrderNode.class) before createDataset()',
+      receiverState: 'Detected circular class reference in seenTypeSet={OrderNode}',
+    });
+    b.addEvent({
+      stepId: sBean,
+      from: driverEncoder,
+      to: jvmApp,
       kind: 'local',
       channel: 'error',
-      protocol: 'Python Guard (_ensure_initialized)',
-      port: `${b.driverHost} OS`,
-      label: 'PySpark ValueError (2nd SC)',
-      info: 'orders.py calls SparkContext(conf) while first SparkContext is active; PySpark SparkContext._ensure_initialized raises ValueError ("Cannot run multiple SparkContexts at once...") on the Python side BEFORE invoking the JVM constructor.',
-      size: 'ValueError',
-      command: 'SparkContext._ensure_initialized() // raises ValueError before JVM SparkContext()',
+      protocol: 'ExecutionErrors.scala:181',
+      port: `${b.driverHost} in-JVM`,
+      label: 'CIRCULAR_CLASS_REFERENCE',
+      info: 'Throws SparkUnsupportedOperationException (errorClass="CIRCULAR_CLASS_REFERENCE", ExecutionErrors.scala:181-192) before spark.createDataset(...) is entered and before launching any stage (sibling errors: ENCODER_NOT_FOUND, BEAN_ENCODER_INTERFACE_NOT_SUPPORTED).',
+      size: 'UnsupportedOp',
+      command: 'throw ExecutionErrors.cannotHaveCircularReferencesInBeanClassError(OrderNode.class)',
       fields: [
-        { name: 'activeContext', value: 'SparkContext._active_spark_context != None' },
-        { name: 'jvmGuardNote', value: 'JVM SparkContext.assertNoOtherContextIsRunning also unconditionally rejects a 2nd JVM context (SPARK-2243)' },
+        { name: 'errorClass', value: 'CIRCULAR_CLASS_REFERENCE' },
+        { name: 'siblingErrors', value: 'ENCODER_NOT_FOUND, BEAN_ENCODER_INTERFACE_NOT_SUPPORTED' },
+        { name: 'stagesLaunched', value: '0' },
       ],
-      senderState: 'Rejected 2nd Python SparkContext before Py4J JVM construction',
-      receiverState: 'orders.py unwinding with ValueError (exit code 1)',
+      senderState: 'Rejected self-referential JavaBean on driver',
+      receiverState: `${b.appEntryLabel}() unwinding before spark.createDataset() or any stage launch`,
       isError: true,
     });
+    emitTerminalAppOutcome(b, state, {
+      origin: 'user-app-failure',
+      diagnostic: 'SparkUnsupportedOperationException [CIRCULAR_CLASS_REFERENCE]: Cannot have circular references in bean class OrderNode',
+      stopLiveExecutors: true,
+    });
+    return true;
+  }
+
+  if (fault === 'kryo-buffer-overflow') {
+    const sc = b.std('spark-context');
+    const driverSer = b.std('serializer-manager');
+    state.abortedByFault = true;
+    const pyHelperNote = b.isPySpark
+      ? ' In PySpark mode, this invokes an explicit JVM helper path because Python RDD.aggregateByKey (python/pyspark/core/rdd.py:3909-3919) clones zeroValue via copy.deepcopy instead of KryoSerializerInstance.serialize().'
+      : '';
+    const sKryoBuf = b.addStep({
+      id: 'sim-step-kryo-buffer-overflow',
+      title: 'Driver JVM PairRDDFunctions.aggregateByKey zeroValue (72 MiB) > 64m -> KRYO_BUFFER_OVERFLOW',
+      explanation:
+        `With spark.serializer=org.apache.spark.serializer.KryoSerializer and default spark.kryoserializer.buffer.max=64m, Driver JVM PairRDDFunctions.aggregateByKey (PairRDDFunctions.scala:155-165) calls bounded KryoSerializerInstance.serialize(zeroValue) on an oversized 72 MiB zeroValue (distinct from streamed shuffle partitions and SQL ShuffleExchangeExec, which uses UnsafeRowSerializer). KryoSerializer.scala:448-461 catches KryoException("Buffer overflow") and wraps it into SparkException (errorClass="KRYO_BUFFER_OVERFLOW") before launching the stage.${pyHelperNote}`,
+      category: 'sql-planning-aqe',
+      keyState: 'FAILED on Driver: SparkException (KRYO_BUFFER_OVERFLOW: 72 MiB > spark.kryoserializer.buffer.max=64m)',
+      command: 'PairRDDFunctions.aggregateByKey -> KryoSerializerInstance.serialize(zeroValue) -> KRYO_BUFFER_OVERFLOW',
+      detailsPassed: [
+        { name: 'callSite', value: 'JVM PairRDDFunctions.aggregateByKey (PairRDDFunctions.scala:155-165) bounded KryoSerializerInstance.serialize()' },
+        { name: 'spark.kryoserializer.buffer.max', value: '64m default (must be < 2048m)' },
+        { name: 'errorClass', value: 'KRYO_BUFFER_OVERFLOW (KryoSerializer.scala:448-461 wrapping KryoException: Buffer overflow)' },
+        ...(b.isPySpark
+          ? [{ name: 'pysparkDistinction', value: 'Invokes JVM helper; Python RDD.aggregateByKey (python/pyspark/core/rdd.py:3909-3919) uses copy.deepcopy instead of KryoSerializerInstance.serialize()' }]
+          : []),
+        { name: 'remediation', value: 'Raise spark.kryoserializer.buffer.max (< 2048m) or broadcast large lookup state instead of zeroValue' },
+      ],
+      deepDiveComponentId: 'serializer-manager',
+    });
     b.addEvent({
-      stepId: sMulti,
-      from: pyDriver,
+      stepId: sKryoBuf,
+      from: sc,
+      to: driverSer,
+      kind: 'local',
+      channel: 'internal',
+      protocol: 'PairRDDFunctions.aggregateByKey',
+      port: `${b.driverHost} in-JVM`,
+      label: 'serialize(zeroVal 72 MiB)',
+      info: `Driver JVM PairRDDFunctions.aggregateByKey (PairRDDFunctions.scala:155-165) invokes bounded KryoSerializerInstance.serialize(zeroValue) on a 72 MiB object exceeding default spark.kryoserializer.buffer.max (64m).${pyHelperNote}`,
+      size: '72.0 MiB',
+      command: 'val zeroBuffer = SparkEnv.get.serializer.newInstance().serialize(zeroValue) // 72 MiB > 64m',
+      fields: [
+        { name: 'objectSizeVsMax', value: '72 MiB > 64m (spark.kryoserializer.buffer.max)' },
+        { name: 'serializerPath', value: 'Bounded KryoSerializerInstance.serialize() on driver (SQL ShuffleExchangeExec uses UnsafeRowSerializer)' },
+        ...(b.isPySpark
+          ? [{ name: 'pythonRddNote', value: 'JVM helper path (Python RDD.aggregateByKey uses copy.deepcopy, python/pyspark/core/rdd.py:3909-3919)' }]
+          : []),
+      ],
+      senderState: 'Cloning oversized aggregateByKey zeroValue via Kryo',
+      receiverState: 'KryoOutput buffer reached 64 MiB ceiling',
+    });
+    b.addEvent({
+      stepId: sKryoBuf,
+      from: driverSer,
       to: sc,
-      channel: 'python',
-      protocol: 'Py4J Loopback -> sc.stop()',
-      port: b.isClient ? '127.0.0.1:44108' : '127.0.0.1:43122',
-      label: 'Stop live SparkContext #1',
-      info: 'orders.py exception teardown stops the live first SparkContext (noting JVM guard SparkContext.assertNoOtherContextIsRunning is unconditional with no override flag).',
-      size: '1.2 KB',
-      command: 'SparkContext.stop() // unwinding after ValueError (SPARK-2243)',
-      fields: [{ name: 'firstContextState', value: 'Shutting down cleanly' }],
-      senderState: 'Tearing down active SparkContext #1',
-      receiverState: 'Stopping scheduler backend & live executors',
+      kind: 'local',
+      channel: 'error',
+      protocol: 'KryoSerializer.scala:448',
+      port: `${b.driverHost} in-JVM`,
+      label: 'KRYO_BUFFER_OVERFLOW',
+      info: 'KryoSerializer.scala:448-461 catches KryoException("Buffer overflow") and wraps it into SparkException (errorClass="KRYO_BUFFER_OVERFLOW") citing spark.kryoserializer.buffer.max.',
+      size: 'SparkException',
+      command: 'catch e: KryoException("Buffer overflow") -> throw SparkException(errorClass="KRYO_BUFFER_OVERFLOW")',
+      fields: [
+        { name: 'errorClass', value: 'KRYO_BUFFER_OVERFLOW' },
+        { name: 'cause', value: 'com.esotericsoftware.kryo.KryoException: Buffer overflow' },
+        { name: 'sourceRef', value: 'KryoSerializer.scala:448-461; PairRDDFunctions.scala:155-165; python/pyspark/core/rdd.py:3909-3919' },
+      ],
+      senderState: 'Wrapped KryoException("Buffer overflow") in SparkException',
+      receiverState: `Driver aborted aggregateByKey in ${b.appEntryLabel}`,
+      isError: true,
     });
     emitTerminalAppOutcome(b, state, {
-      origin: 'user-python-app',
-      diagnostic: 'ValueError: Cannot run multiple SparkContexts at once (SPARK-2243)',
+      origin: 'user-app-failure',
+      diagnostic: 'SparkException [KRYO_BUFFER_OVERFLOW]: Buffer overflow exceeding spark.kryoserializer.buffer.max (64m)',
       stopLiveExecutors: true,
     });
     return true;
@@ -1675,7 +2436,7 @@ export function tryInjectPreWorkloadFault(
       isError: true,
     });
     emitTerminalAppOutcome(b, state, {
-      origin: 'user-python-app',
+      origin: 'user-app-failure',
       diagnostic: 'SparkException: Task not serializable (java.io.NotSerializableException)',
       stopLiveExecutors: true,
     });
@@ -1738,7 +2499,7 @@ export function tryInjectPreWorkloadFault(
       isError: true,
     });
     emitTerminalAppOutcome(b, state, {
-      origin: 'user-python-app',
+      origin: 'user-app-failure',
       diagnostic: 'Serialized task exceeded spark.rpc.message.maxSize (128 MiB)',
       stopLiveExecutors: true,
     });
@@ -1856,7 +2617,7 @@ export function tryInjectPreWorkloadFault(
       isError: true,
     });
     emitTerminalAppOutcome(b, state, {
-      origin: 'user-python-app',
+      origin: 'user-app-failure',
       diagnostic: 'Aborting TaskSet: all executors excluded on failure',
       stopLiveExecutors: true,
     });
@@ -2243,16 +3004,16 @@ export function tryInjectPreWorkloadFault(
       protocol: 'Spark Netty RPC (StatusUpdate)',
       port: b.driverRpc,
       label: 'Retries exhaust -> abort',
-      info: 'RPC retries exhaust and repeated task attempts fail with RpcTimeoutException; TaskSetManager aborts TaskSet and fails the active job in orders.py.',
+      info: `RPC retries exhaust and repeated task attempts fail with RpcTimeoutException; TaskSetManager aborts TaskSet and fails the active job in ${b.appEntryLabel}.`,
       size: '1.9 KB',
       command: 'StatusUpdate(FAILED, ExceptionFailure("RpcTimeoutException: 120s")) -> TaskSet aborted',
       fields: [{ name: 'jobOutcome', value: 'JobFailed(RpcTimeoutException)' }],
       senderState: 'Task attempts failed after RPC timeout exhaustion',
-      receiverState: 'TaskSet aborted; orders.py exiting 1',
+      receiverState: `TaskSet aborted; ${b.appEntryLabel} failing`,
       isError: true,
     });
     emitTerminalAppOutcome(b, state, {
-      origin: 'user-python-app',
+      origin: 'user-app-failure',
       diagnostic: 'org.apache.spark.rpc.RpcTimeoutException (120s) exhausted retries',
       stopLiveExecutors: true,
     });
@@ -2544,7 +3305,7 @@ export function tryInjectShuffleReduceFault(
       isError: true,
     });
     emitTerminalAppOutcome(b, state, {
-      origin: 'user-python-app',
+      origin: 'user-app-failure',
       diagnostic: 'Stage 1 has failed the maximum allowable number of times: 4',
       stopLiveExecutors: true,
     });
@@ -2952,7 +3713,7 @@ export function tryInjectBroadcastFault(
       isError: true,
     });
     emitTerminalAppOutcome(b, state, {
-      origin: 'user-python-app',
+      origin: 'user-app-failure',
       diagnostic: 'Cannot broadcast the table that is larger than 8GB (_LEGACY_ERROR_TEMP_2249)',
       stopLiveExecutors: true,
     });
@@ -3016,7 +3777,7 @@ export function tryInjectBroadcastFault(
       isError: true,
     });
     emitTerminalAppOutcome(b, state, {
-      origin: 'user-python-app',
+      origin: 'user-app-failure',
       diagnostic: 'Could not execute broadcast in 300 secs (spark.sql.broadcastTimeout)',
       stopLiveExecutors: true,
     });
@@ -3079,7 +3840,7 @@ export function tryInjectBroadcastFault(
       isError: true,
     });
     emitTerminalAppOutcome(b, state, {
-      origin: 'user-python-app',
+      origin: 'user-app-failure',
       diagnostic: 'Not enough memory to build and broadcast the table to all worker nodes (_LEGACY_ERROR_TEMP_2250)',
       stopLiveExecutors: true,
     });
@@ -3382,7 +4143,7 @@ export function tryInjectPythonUdfFault(
       isError: true,
     });
     emitTerminalAppOutcome(b, state, {
-      origin: 'user-python-app',
+      origin: 'user-app-failure',
       diagnostic: 'Bad data in pyspark.daemon standard output',
       stopLiveExecutors: true,
     });
@@ -3481,7 +4242,7 @@ export function tryInjectPythonUdfFault(
       isError: true,
     });
     emitTerminalAppOutcome(b, state, {
-      origin: 'user-python-app',
+      origin: 'user-app-failure',
       diagnostic: 'PYTHON_VERSION_MISMATCH (worker 3.10 vs driver 3.12)',
       stopLiveExecutors: true,
     });
@@ -3779,14 +4540,14 @@ export function injectTaskResultLostStep(
     port: retryBmPort,
     label: 'getRemoteBytes(taskres)',
     info: opts.inCollectStep
-      ? `After retry attempt 1 succeeds, Driver TaskResultGetter fetches clean TaskResultBlock (${sizeMiB} MiB${opts.totalMiB ? `; ${opts.totalMiB} MiB total <= 1 GiB` : ''}) from ${retryBmPort} and delivers result to Python collect().`
+      ? `After retry attempt 1 succeeds, Driver TaskResultGetter fetches clean TaskResultBlock (${sizeMiB} MiB${opts.totalMiB ? `; ${opts.totalMiB} MiB total <= 1 GiB` : ''}) from ${retryBmPort} for handoff to TaskScheduler / DAGScheduler before RDD.collect() concatenation.`
       : `After retry attempt 1 succeeds during ${stageContext}, Driver TaskResultGetter fetches clean TaskResultBlock (${sizeMiB} MiB) from ${retryBmPort} so the stage/action can finish cleanly.`,
     size: `${sizeMiB} MiB`,
     command: 'sparkEnv.blockManager.getRemoteBytes(TaskResultBlockId(retryTid))',
     fields: [{ name: 'retryAttempt', value: '1 SUCCEEDED' }],
     senderState: opts.inCollectStep
-      ? 'Result delivered to Python collect()'
-      : `Retry attempt 1 result delivered for ${stageContext}`,
+      ? 'Fetched retry TaskResultBlock; handing partition result to TaskScheduler / DAGScheduler'
+      : `Retry attempt 1 result fetched for ${stageContext}`,
     receiverState: 'TaskResultBlock removed after fetch',
   });
   if (opts.actionCompleteLabel) {
@@ -3848,7 +4609,7 @@ export function injectPostWorkloadMidRunFault(
         ? 'YARN NM kills Exec-1 (KILLED_EXCEEDED_PMEM=-104) -- charged to task failures'
         : 'YARN preempts Exec-1 (PREEMPTED=-102) -- NOT charged to task failures',
       explanation: isPmem
-        ? 'Exec-1 container exceeds physical memory limit (JVM heap + Python worker + native RSS). NodeManager terminates container via OS SIGKILL (137) and reports Hadoop ContainerExitStatus.KILLED_EXCEEDED_PMEM (-104); YarnAllocator marks exitCausedByApp=true, so TaskSetManager increments task failure count and retries on surviving/replacement executor.'
+        ? `Exec-1 container exceeds physical memory limit (${b.isPySpark ? 'JVM heap + Python worker + native RSS' : 'JVM heap + off-heap + native RSS'}). NodeManager terminates container via OS SIGKILL (137) and reports Hadoop ContainerExitStatus.KILLED_EXCEEDED_PMEM (-104); YarnAllocator marks exitCausedByApp=true, so TaskSetManager increments task failure count and retries on surviving/replacement executor.`
         : 'YARN CapacityScheduler preempts Exec-1 for queue sharing (ContainerExitStatus.PREEMPTED=-102). YarnAllocator marks exitCausedByApp=false, so TaskSetManager reschedules interrupted tasks WITHOUT charging spark.task.maxFailures.',
       category: 'yarn-lifecycle',
       keyState: isPmem
@@ -4945,4 +5706,373 @@ export function injectPostWorkloadMidRunFault(
       isError: true,
     });
   }
+}
+
+// =============================================================================
+// PHASE 10: Mid-Execution JVM / Kryo / Security Terminal Faults
+// =============================================================================
+export function injectKryoUnregisteredClassStep(
+  b: SimRunBuilder,
+  state: SimRuntimeState,
+  stageLabel: string,
+  failingExec: string,
+): void {
+  state.abortedByFault = true;
+  const execTaskAttempt = b.execTaskAttemptInstance(failingExec);
+  const execSer = b.execSerializerInstance(failingExec);
+  const tsm = b.std('task-set-manager');
+  const dag = b.std('dag-scheduler');
+  const { hostName } = b.instanceWorkerHost(failingExec);
+
+  const sKryo = b.addStep({
+    id: 'sim-step-kryo-unregistered',
+    title: 'Executor KryoSerializer rejects unregistered OrderEvent in Pair-RDD shuffle -> IllegalArgumentException (4/4)',
+    explanation:
+      `With spark.serializer=org.apache.spark.serializer.KryoSerializer and spark.kryo.registrationRequired=true, task closure serialization succeeded via SparkEnv.closureSerializer (always JavaSerializer -- NOT Kryo!). During ${stageLabel} on ${failingExec} (${hostName})${b.isPySpark ? ' (auxiliary JVM Pair-RDD helper executed alongside the PySpark job)' : ''}, Executor SerializerManager serializes an unregistered com.acme.OrderEvent DTO for ShuffledRDD[K, OrderEvent] (explicitly distinct from SQL ShuffleExchangeExec, ShuffleExchangeExec.scala:219-265, which ALWAYS uses UnsafeRowSerializer regardless of spark.serializer!). Kryo 4.0.3 throws java.lang.IllegalArgumentException: Class is not registered: com.acme.OrderEvent. Wrapped across the task serialization boundary, 4 deterministic failures exhaust spark.task.maxFailures (4) and TaskSetManager aborts the stage.`,
+    category: 'sql-planning-aqe',
+    keyState: 'ABORTED: Kryo 4.0.3 IllegalArgumentException (Class is not registered) on Pair-RDD ShuffledRDD[K, OrderEvent]',
+    command: 'ShuffledRDD[K, OrderEvent] -> KryoSerializer (registrationRequired=true) -> IllegalArgumentException("Class is not registered")',
+    detailsPassed: [
+      { name: 'spark.serializer', value: 'org.apache.spark.serializer.KryoSerializer' },
+      { name: 'spark.kryo.registrationRequired', value: 'true (default false)' },
+      { name: 'rddPath', value: 'JVM Pair-RDD shuffle: rdd.reduceByKey / ShuffledRDD[K, OrderEvent]' },
+      { name: 'sqlShuffleDistinction', value: 'SQL ShuffleExchangeExec (ShuffleExchangeExec.scala:219-265) explicitly uses UnsafeRowSerializer regardless of spark.serializer' },
+      { name: 'closureDistinction', value: 'Task closures always use SparkEnv.closureSerializer (JavaSerializer)' },
+      ...(b.isPySpark
+        ? [{ name: 'pysparkPath', value: 'Auxiliary JVM-side Pair-RDD helper path executed alongside the PySpark job' }]
+        : []),
+      { name: 'exception', value: 'java.lang.IllegalArgumentException: Class is not registered (Kryo 4.0.3; wrapped at task boundary)' },
+      { name: 'sourceRef', value: 'KryoSerializer.scala:90,143; Kryo.scala:24-27; SerializerManager.scala:85-107; ShuffleExchangeExec.scala:219-265' },
+    ],
+    deepDiveComponentId: 'serializer-manager',
+  });
+  b.addEvent({
+    stepId: sKryo,
+    from: execTaskAttempt,
+    to: execSer,
+    kind: 'local',
+    channel: 'internal',
+    protocol: 'KryoSerializer Pair-RDD',
+    port: `${hostName} in-JVM`,
+    label: 'Kryo Pair-RDD serialize',
+    info: `During ${stageLabel} on ${hostName}${b.isPySpark ? ' (auxiliary JVM Pair-RDD helper path)' : ''}, SortShuffleWriter uses dep.serializer (SortShuffleWriter.scala:64-85) and ShufflePartitionPairsWriter calls writeKey/writeValue (ShufflePartitionPairsWriter.scala:55-64) through KryoSerializer on unregistered DTO com.acme.OrderEvent in ShuffledRDD[K, OrderEvent] (SQL ShuffleExchangeExec uses UnsafeRowSerializer; closures use JavaSerializer).`,
+    size: 'in-memory',
+    command: 'SortShuffleWriter.write(dep.serializer) -> ShufflePartitionPairsWriter.writeKey/writeValue -> KryoSerializationStream.writeObject(OrderEvent)',
+    fields: [
+      { name: 'callChain', value: 'SortShuffleWriter (dep.serializer, SortShuffleWriter.scala:64-85) -> ShufflePartitionPairsWriter.writeKey/writeValue (ShufflePartitionPairsWriter.scala:55-64)' },
+      { name: 'dataClass', value: 'com.acme.OrderEvent (unregistered DTO in Pair-RDD shuffle)' },
+      { name: 'sqlShuffleSerializer', value: 'UnsafeRowSerializer (SQL ShuffleExchangeExec never uses Kryo)' },
+      { name: 'closureSerializer', value: 'JavaSerializer (unaffected by registrationRequired)' },
+    ],
+    senderState: 'Serializing Pair-RDD OrderEvent records on executor task thread',
+    receiverState: 'Checking Kryo registrationRequired=true table',
+  });
+  b.addEvent({
+    stepId: sKryo,
+    from: execSer,
+    to: execTaskAttempt,
+    kind: 'local',
+    channel: 'error',
+    protocol: 'Kryo 4.0.3 Guard',
+    port: `${hostName} in-JVM`,
+    label: 'IllegalArgumentException',
+    info: 'Kryo 4.0.3 throws java.lang.IllegalArgumentException: Class is not registered: com.acme.OrderEvent (wrapped on task boundary; fix via spark.kryo.classesToRegister or KryoRegistrator).',
+    size: 'IllegalArgExc',
+    command: 'throw new IllegalArgumentException("Class is not registered: com.acme.OrderEvent") // Kryo 4.0.3',
+    fields: [
+      { name: 'exception', value: 'java.lang.IllegalArgumentException: Class is not registered (Kryo 4.0.3)' },
+      { name: 'remediation', value: 'Add class to spark.kryo.classesToRegister or KryoRegistrator' },
+    ],
+    senderState: 'Rejected unregistered class under registrationRequired=true',
+    receiverState: 'Wrapped across task boundary; task attempt failed',
+    isError: true,
+  });
+  b.addEvent({
+    stepId: sKryo,
+    from: failingExec,
+    to: tsm,
+    channel: 'error',
+    protocol: 'Spark Netty RPC (StatusUpdate)',
+    port: b.driverRpc,
+    label: 'Task FAIL: Kryo (4/4)',
+    info: `Deterministic Kryo IllegalArgumentException fails partition ${state.targetPart} across 4 attempts (spark.task.maxFailures=4).`,
+    size: '2.2 KB',
+    command: `StatusUpdate(FAILED, ExceptionFailure("IllegalArgumentException: Class is not registered")) // 4/4`,
+    fields: [
+      { name: 'partitionIndex', value: String(state.targetPart) },
+      { name: 'numFailures', value: '4 / 4 (exhausted)' },
+    ],
+    senderState: '4th task attempt failed deterministically',
+    receiverState: 'TaskSetManager aborting TaskSet',
+    isError: true,
+  });
+  b.addEvent({
+    stepId: sKryo,
+    from: tsm,
+    to: dag,
+    kind: 'local',
+    channel: 'error',
+    protocol: 'In-JVM TaskSetFailed',
+    port: `${b.driverHost} in-JVM`,
+    label: 'abortStage -> JobFailed',
+    info: `TaskSetManager aborts stage and DAGScheduler fails ActiveJob back to ${b.appEntryLabel}.`,
+    size: 'in-memory',
+    command: 'dagScheduler.taskSetFailed(taskSet, "IllegalArgumentException: Class is not registered")',
+    fields: [{ name: 'jobOutcome', value: 'JobFailed(SparkException)' }],
+    senderState: 'TaskSet marked zombie',
+    receiverState: 'ActiveJob failed',
+    isError: true,
+  });
+  emitTerminalAppOutcome(b, state, {
+    origin: 'user-app-failure',
+    diagnostic: 'IllegalArgumentException: Class is not registered: com.acme.OrderEvent (Kryo 4.0.3)',
+    stopLiveExecutors: true,
+  });
+}
+
+export function injectScalaJavaUdfExceptionStep(
+  b: SimRunBuilder,
+  state: SimRuntimeState,
+  stageLabel: string,
+  failingExec: string,
+): void {
+  state.abortedByFault = true;
+  const execTaskAttempt = b.execTaskAttemptInstance(failingExec);
+  const execEncoder = b.execEncoderInstance(failingExec);
+  const tsm = b.std('task-set-manager');
+  const dag = b.std('dag-scheduler');
+  const { hostName } = b.instanceWorkerHost(failingExec);
+  const udfKind = b.isScala
+    ? 'ScalaUDF'
+    : b.isJava
+      ? 'Java UDF1<Double, Double>'
+      : 'Java UDF1 (spark.udf.registerJavaFunction)';
+
+  const sUdfFail = b.addStep({
+    id: 'sim-step-jvm-udf-exception',
+    title: `Executor ${udfKind} throws IllegalArgumentException -> FAILED_EXECUTE_UDF (4/4)`,
+    explanation:
+      `During ${stageLabel} on ${failingExec} (${hostName}), Executor JVM evaluates ${udfKind} directly on the JVM task thread (ZERO Python worker involved${b.isPySpark ? ' even in PySpark via spark.udf.registerJavaFunction' : ''}). On a deterministic bad input in partition ${state.targetPart}, user UDF code throws IllegalArgumentException. ScalaUDF.scala:1171 wraps it as SparkException (errorClass="FAILED_EXECUTE_UDF"). After 4 counted failures of the same task (spark.task.maxFailures=4), TaskSetManager aborts the stage and the unhandled exception escapes ${b.appEntryLabel}().`,
+    category: 'sql-planning-aqe',
+    keyState: 'ABORTED: SparkException (FAILED_EXECUTE_UDF) -- Stage aborted (4 counted failures of same task)',
+    command: 'ScalaUDF.scala:1171 -> SparkException(FAILED_EXECUTE_UDF) -> 4/4 task failures -> abortStage()',
+    detailsPassed: [
+      { name: 'udfRuntime', value: `${udfKind} on Executor JVM (0 Python workers)` },
+      { name: 'errorClass', value: 'FAILED_EXECUTE_UDF (SparkException wrapping IllegalArgumentException)' },
+      { name: 'spark.task.maxFailures', value: '4 (4 counted failures of same task)' },
+      { name: 'sourceRef', value: 'ScalaUDF.scala:1125-1175; ApplicationMaster.scala:775-785,911' },
+    ],
+    deepDiveComponentId: 'dataset-encoder-udf',
+  });
+  b.addEvent({
+    stepId: sUdfFail,
+    from: execTaskAttempt,
+    to: execEncoder,
+    kind: 'local',
+    channel: 'internal',
+    protocol: 'In-JVM ScalaUDF Eval',
+    port: `${hostName} in-JVM`,
+    label: b.isScala ? `Invoke ScalaUDF (p=${state.targetPart})` : `Invoke Java UDF1 (p=${state.targetPart})`,
+    info: `Executor JVM task thread invokes ${udfKind} on partition ${state.targetPart} directly in-JVM (NO Python worker involved).`,
+    size: 'in-memory',
+    command: b.isScala
+      ? 'ScalaUDF.eval(inputRow) // in-JVM task thread'
+      : 'UDF1.call(java.lang.Double) // in-JVM via ScalaUDF (0 Python workers)',
+    fields: [
+      { name: 'udfKind', value: udfKind },
+      { name: 'pythonWorkers', value: '0' },
+    ],
+    senderState: 'Evaluating JVM scalar UDF on task thread',
+    receiverState: 'Deterministic bad row encountered in user UDF',
+  });
+  b.addEvent({
+    stepId: sUdfFail,
+    from: execEncoder,
+    to: execTaskAttempt,
+    kind: 'local',
+    channel: 'error',
+    protocol: 'ScalaUDF.scala:1171',
+    port: `${hostName} in-JVM`,
+    label: 'FAILED_EXECUTE_UDF',
+    info: 'User UDF throws IllegalArgumentException; ScalaUDF.scala:1171 wraps it as SparkException (errorClass="FAILED_EXECUTE_UDF") on Executor JVM.',
+    size: 'SparkException',
+    command: 'throw QueryExecutionErrors.failedExecuteUserDefinedFunctionError(...) // FAILED_EXECUTE_UDF',
+    fields: [
+      { name: 'errorClass', value: 'FAILED_EXECUTE_UDF' },
+      { name: 'cause', value: 'java.lang.IllegalArgumentException: negative amount' },
+    ],
+    senderState: 'Wrapped user UDF exception in FAILED_EXECUTE_UDF',
+    receiverState: 'Failing task attempt on Executor JVM',
+    isError: true,
+  });
+  b.addEvent({
+    stepId: sUdfFail,
+    from: failingExec,
+    to: tsm,
+    channel: 'error',
+    protocol: 'Spark Netty RPC (StatusUpdate)',
+    port: b.driverRpc,
+    label: `Task p=${state.targetPart} FAIL (4/4)`,
+    info: `Partition ${state.targetPart} fails 4 counted attempts with SparkException [FAILED_EXECUTE_UDF] (spark.task.maxFailures=4).`,
+    size: '2.3 KB',
+    command: `StatusUpdate(FAILED, ExceptionFailure("SparkException [FAILED_EXECUTE_UDF]")) // 4/4`,
+    fields: [
+      { name: 'partitionIndex', value: String(state.targetPart) },
+      { name: 'numFailures', value: '4 / 4 (exhausted)' },
+    ],
+    senderState: '4th counted task attempt failed deterministically',
+    receiverState: 'TaskSetManager calling abort()',
+    isError: true,
+  });
+  b.addEvent({
+    stepId: sUdfFail,
+    from: tsm,
+    to: dag,
+    kind: 'local',
+    channel: 'error',
+    protocol: 'In-JVM TaskSetFailed',
+    port: `${b.driverHost} in-JVM`,
+    label: 'abortStage -> JobFailed',
+    info: `TaskSetManager aborts stage; unhandled SparkException [FAILED_EXECUTE_UDF] escapes ${b.appEntryLabel}().`,
+    size: 'in-memory',
+    command: 'dagScheduler.taskSetFailed(taskSet, "FAILED_EXECUTE_UDF (4/4 failures)")',
+    fields: [{ name: 'jobOutcome', value: 'JobFailed(SparkException[FAILED_EXECUTE_UDF])' }],
+    senderState: 'TaskSet marked zombie',
+    receiverState: 'ActiveJob failed',
+    isError: true,
+  });
+  emitTerminalAppOutcome(b, state, {
+    origin: 'user-app-failure',
+    diagnostic: `SparkException [FAILED_EXECUTE_UDF]: ${udfKind} threw IllegalArgumentException (4/4 failures)`,
+    stopLiveExecutors: true,
+  });
+}
+
+export function injectDelegationTokenExpiredStep(
+  b: SimRunBuilder,
+  state: SimRuntimeState,
+  stageLabel: string,
+  failingExec: string,
+): void {
+  state.abortedByFault = true;
+  const dtm = b.std('delegation-token-manager');
+  const nn = b.std('hdfs-namenode');
+  const tsm = b.std('task-set-manager');
+  const dag = b.std('dag-scheduler');
+
+  const sTok = b.addStep({
+    id: 'sim-step-delegation-token-expired',
+    title: 'Expired HDFS delegation token fails fresh NameNode :8020 SASL IPC setup -> SecretManager$InvalidToken',
+    explanation:
+      `In a long-running YARN job, Hadoop 3.4.1 delegation token lifetime elapsed (24h renewal interval / 7-day max lifetime defaults, hdfs-default.xml:1458-1471) without Spark HadoopDelegationTokenManager (normally scheduling renewal at 0.75 * (earliestProviderRenewalTime - now), retrying via spark.security.credentials.retryWait, HadoopDelegationTokenManager.scala:274-313) acquiring fresh tokens. Per Hadoop Client.java:764-800, an existing authenticated IPC connection is reused without re-checking the token on every metadata call; however, during ${stageLabel}, ${failingExec} opens a fresh NameNode :8020 IPC connection / reconnect for a pending getBlockLocations/create metadata RPC (explicitly distinct from DataNode :9866 per-block access tokens!). During SASL token authentication BEFORE the pending metadata RPC executes, NameNode invokes AbstractDelegationTokenSecretManager.retrievePassword (AbstractDelegationTokenSecretManager.java:528-551) and rejects the expired token with SecretManager$InvalidToken, failing the task and aborting the job.`,
+    category: 'yarn-lifecycle',
+    keyState: 'FAILED: Fresh NameNode :8020 SASL IPC auth -> SecretManager$InvalidToken before metadata RPC (NOT DataNode block token)',
+    command: 'Hadoop Client.setupIOstreams() SASL auth (nn01:8020) -> AbstractDelegationTokenSecretManager.retrievePassword() -> SecretManager$InvalidToken',
+    detailsPassed: [
+      { name: 'hadoopDefaults', value: 'Hadoop 3.4.1 (hdfs-default.xml:1458-1471): 24h renewal interval / 7d max lifetime' },
+      { name: 'sparkRenewalFormula', value: '0.75 * (earliestProviderRenewalTime - now); retry spark.security.credentials.retryWait' },
+      { name: 'saslIpcAuth', value: 'Hadoop Client.java:764-800 authenticates delegation token on fresh SASL IPC connection setup (existing connections reuse auth) BEFORE pending getBlockLocations/create RPC executes' },
+      { name: 'nnVsDnBoundary', value: 'HDFS NameNode :8020 validates delegation tokens during SASL IPC auth; DataNode :9866 validates per-block access tokens' },
+      { name: 'exception', value: 'RemoteException(org.apache.hadoop.security.token.SecretManager$InvalidToken) via AbstractDelegationTokenSecretManager.retrievePassword' },
+      { name: 'sourceRef', value: 'HadoopDelegationTokenManager.scala:274-313; Hadoop Client.java:764-800; AbstractDelegationTokenSecretManager.java:528-551; hdfs-default.xml:1458-1471' },
+    ],
+    deepDiveComponentId: 'delegation-token-manager',
+  });
+  b.addEvent({
+    stepId: sTok,
+    from: dtm,
+    to: dtm,
+    kind: 'local',
+    channel: 'error',
+    protocol: 'HadoopDelegationTokenManager',
+    port: `${b.driverHost} in-JVM`,
+    label: 'No fresh token (0.75x)',
+    info: 'HadoopDelegationTokenManager (0.75 * (earliestProviderRenewalTime - now); retry spark.security.credentials.retryWait) did not acquire fresh tokens before the 24h renewal / 7d max lifetime default elapsed.',
+    size: 'Token expired',
+    command: 'HadoopDelegationTokenManager.scheduleRenewal() // 0.75 * (earliestProviderRenewalTime - now) unrenewed',
+    fields: [
+      { name: 'renewalFormula', value: '0.75 * (earliestProviderRenewalTime - now)' },
+      { name: 'retryConfig', value: 'spark.security.credentials.retryWait' },
+    ],
+    senderState: 'No fresh HDFS_DELEGATION_TOKEN pushed via UpdateDelegationTokens',
+    receiverState: 'Executor UGI still holds expired launch delegation token',
+    isError: true,
+  });
+  b.addEvent({
+    stepId: sTok,
+    from: failingExec,
+    to: nn,
+    channel: 'yarn',
+    protocol: 'Hadoop SASL IPC Setup',
+    port: 'nn01:8020',
+    label: 'New NN IPC SASL auth',
+    info: `${failingExec} opens a fresh HDFS NameNode :8020 IPC connection / reconnect (Client.java:764-800; existing authenticated connections are reused without re-checking the token) for a pending getBlockLocations/create metadata RPC, sending the expired HDFS_DELEGATION_TOKEN during SASL handshake BEFORE the metadata RPC executes (NOT a DataNode :9866 per-block access token!).`,
+    size: '1.1 KB',
+    command: 'Client.setupIOstreams() -> SASL token auth (nn01:8020) // before pending getBlockLocations/create RPC',
+    fields: [
+      { name: 'rpcTarget', value: 'HDFS NameNode nn01:8020 (fresh IPC connection / reconnect)' },
+      { name: 'authPhase', value: 'SASL IPC connection setup BEFORE pending getBlockLocations/create RPC executes' },
+      { name: 'datanodeDistinction', value: 'DataNode :9866 validates per-block access tokens, NOT delegation tokens' },
+    ],
+    senderState: 'Opening fresh NameNode :8020 SASL IPC connection for pending metadata RPC',
+    receiverState: 'Authenticating HDFS_DELEGATION_TOKEN in SASL IPC setup',
+  });
+  b.addEvent({
+    stepId: sTok,
+    from: nn,
+    to: failingExec,
+    channel: 'error',
+    protocol: 'Hadoop SASL / InvalidToken',
+    port: 'nn01:8020',
+    label: 'SecretManager$InvalidToken',
+    info: 'During SASL IPC connection authentication BEFORE the pending getBlockLocations/create metadata RPC executes, NameNode :8020 calls AbstractDelegationTokenSecretManager.retrievePassword (AbstractDelegationTokenSecretManager.java:528-551) and rejects the expired token with RemoteException(org.apache.hadoop.security.token.SecretManager$InvalidToken: token is expired / cannot be found in cache).',
+    size: 'InvalidToken',
+    command: 'AbstractDelegationTokenSecretManager.retrievePassword() -> RemoteException(SecretManager$InvalidToken)',
+    fields: [
+      { name: 'exception', value: 'SecretManager$InvalidToken (NameNode :8020 SASL IPC auth)' },
+      { name: 'sourceRef', value: 'AbstractDelegationTokenSecretManager.java:528-551; Client.java:764-800' },
+      { name: 'notDataNodeBlockToken', value: 'Delegation token SASL auth failure on NameNode :8020, not DataNode block token' },
+    ],
+    senderState: 'NameNode SASL auth rejected expired delegation token before metadata RPC',
+    receiverState: 'Fresh IPC connection failed before getBlockLocations/create could execute',
+    isError: true,
+  });
+  b.addEvent({
+    stepId: sTok,
+    from: failingExec,
+    to: tsm,
+    channel: 'error',
+    protocol: 'Spark Netty RPC (StatusUpdate)',
+    port: b.driverRpc,
+    label: 'Task FAIL: InvalidToken',
+    info: `${failingExec} reports ExceptionFailure(SecretManager$InvalidToken) across attempts; TaskSetManager aborts stage.`,
+    size: '2.0 KB',
+    command: 'StatusUpdate(FAILED, ExceptionFailure("SecretManager$InvalidToken")) // retries exhausted',
+    fields: [{ name: 'numFailures', value: '4 / 4 (all executors hold expired token)' }],
+    senderState: 'Task attempts failed on NameNode RPC auth',
+    receiverState: 'TaskSetManager aborting TaskSet',
+    isError: true,
+  });
+  b.addEvent({
+    stepId: sTok,
+    from: tsm,
+    to: dag,
+    kind: 'local',
+    channel: 'error',
+    protocol: 'In-JVM TaskSetFailed',
+    port: `${b.driverHost} in-JVM`,
+    label: 'abortStage -> JobFailed',
+    info: `TaskSetManager aborts stage and DAGScheduler fails ActiveJob back to ${b.appEntryLabel}.`,
+    size: 'in-memory',
+    command: 'dagScheduler.taskSetFailed(taskSet, "SecretManager$InvalidToken")',
+    fields: [{ name: 'jobOutcome', value: 'JobFailed(InvalidToken)' }],
+    senderState: 'TaskSet marked zombie',
+    receiverState: 'ActiveJob failed',
+    isError: true,
+  });
+  emitTerminalAppOutcome(b, state, {
+    origin: 'user-app-failure',
+    diagnostic: 'RemoteException(SecretManager$InvalidToken): HDFS delegation token expired on NameNode :8020 RPC',
+    stopLiveExecutors: true,
+  });
 }

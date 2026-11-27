@@ -13,11 +13,21 @@ import type {
   ChannelKind,
   ComponentId,
   HostZoneId,
+  SparkLanguage,
   SubsystemId,
 } from '../data/types';
+import {
+  computeClusterCardSize,
+  resolveMapRouteEndpoints,
+  type ResolvedMapRouteEndpoints,
+} from '../engine/mapGeometry';
 import { buildEdgeCurve } from '../playback';
 
+export { computeClusterCardSize, resolveMapRouteEndpoints };
+export type { ResolvedMapRouteEndpoints };
+
 export type ClusterMapCanvasProps = RunCanvasProps & {
+  activeLanguage?: SparkLanguage;
   zoom?: number;
   onZoomChange?: (z: number) => void;
 };
@@ -40,10 +50,16 @@ interface MapRoute {
   to: ComponentId;
   isPeerTransfer: boolean;
   isLocalOnly: boolean;
+  isCrossCatalogLocal: boolean;
+  runtimeHostZone: HostZoneId;
   frameIndices: number[];
   curve: ReturnType<typeof buildEdgeCurve>;
   arrowEnd: [number, number];
   arrowAngle: number;
+}
+
+function routeKeyForResolved(r: ResolvedMapRouteEndpoints): string {
+  return `${r.from}::${r.to}${r.isPeerTransfer ? '::peer' : r.isLocalOnly ? '::local' : ''}`;
 }
 
 function clamp(v: number, min: number, max: number): number {
@@ -81,12 +97,24 @@ function eventColor(ev: RunEvent): string {
   return ev.isError ? 'var(--ch-error)' : CHANNEL_META[ev.channel].cssVar;
 }
 
-function isPeerSameComponentEvent(ev: RunEvent): boolean {
-  return ev.fromComponent === ev.toComponent && ev.fromInstance !== ev.toInstance;
-}
-
-function isLocalSelfEvent(ev: RunEvent): boolean {
-  return ev.kind === 'local' && ev.fromInstance === ev.toInstance;
+function componentLanguageCornerBadge(
+  langs: readonly SparkLanguage[] | undefined,
+): { label: string; color: string; width: number } | null {
+  if (!langs || langs.length === 0 || langs.length >= 3) return null;
+  if (langs.length === 1) {
+    if (langs[0] === 'pyspark') {
+      return { label: 'PY', color: 'var(--ch-python)', width: 22 };
+    }
+    if (langs[0] === 'scala') {
+      return { label: 'SCALA', color: 'var(--ch-data)', width: 38 };
+    }
+    return { label: 'JAVA', color: 'var(--ch-rpc)', width: 32 };
+  }
+  if (langs.includes('scala') && langs.includes('java')) {
+    return { label: 'JVM', color: 'var(--ch-yarn)', width: 28 };
+  }
+  const label = langs.map((l) => l.slice(0, 2).toUpperCase()).join('/');
+  return { label, color: 'var(--accent)', width: Math.max(28, label.length * 6 + 8) };
 }
 
 /**
@@ -243,6 +271,7 @@ export default function ClusterMapCanvas({
   selectedComponentId,
   onSelectComponent,
   onSelectEvent,
+  activeLanguage = 'pyspark',
   zoom,
   onZoomChange,
 }: ClusterMapCanvasProps) {
@@ -281,47 +310,31 @@ export default function ClusterMapCanvas({
   };
 
   // Compute safe card dimensions from actual clusterPos spacings so cards never overlap
-  const { cardW, cardH } = useMemo(() => {
-    let minSameRowDx = 190;
-    let minSameColDy = 60;
-    for (let i = 0; i < COMPONENT_LIST.length; i++) {
-      const a = COMPONENT_LIST[i].clusterPos;
-      for (let j = i + 1; j < COMPONENT_LIST.length; j++) {
-        const b = COMPONENT_LIST[j].clusterPos;
-        const dx = Math.abs(a[0] - b[0]);
-        const dy = Math.abs(a[1] - b[1]);
-        if (dy < 38 && dx > 4) {
-          minSameRowDx = Math.min(minSameRowDx, dx);
-        }
-        if (dx < 140 && dy > 4) {
-          minSameColDy = Math.min(minSameColDy, dy);
-        }
-      }
-    }
-    return {
-      cardW: clamp(Math.floor(minSameRowDx - 14), 132, 166),
-      cardH: clamp(Math.floor(minSameColDy - 10), 36, 44),
-    };
-  }, []);
+  const { cardW, cardH } = useMemo(() => computeClusterCardSize(COMPONENT_LIST), []);
 
   const participantSet = useMemo(() => {
     const set = new Set<ComponentId>();
     if (projection.visibleFrames.length > 0) {
       for (const frame of projection.visibleFrames) {
-        if (COMPONENTS[frame.event.fromComponent]) set.add(frame.event.fromComponent);
-        if (COMPONENTS[frame.event.toComponent]) set.add(frame.event.toComponent);
+        const ev = frame.event;
+        if (!COMPONENTS[ev.fromComponent] || !COMPONENTS[ev.toComponent]) continue;
+        const resolved = resolveMapRouteEndpoints(ev, run.instances);
+        if (COMPONENTS[resolved.from]) set.add(resolved.from);
+        if (COMPONENTS[resolved.to]) set.add(resolved.to);
       }
     } else {
       for (const ev of run.events) {
-        if (COMPONENTS[ev.fromComponent]) set.add(ev.fromComponent);
-        if (COMPONENTS[ev.toComponent]) set.add(ev.toComponent);
+        if (!COMPONENTS[ev.fromComponent] || !COMPONENTS[ev.toComponent]) continue;
+        const resolved = resolveMapRouteEndpoints(ev, run.instances);
+        if (COMPONENTS[resolved.from]) set.add(resolved.from);
+        if (COMPONENTS[resolved.to]) set.add(resolved.to);
       }
     }
     if (run.componentId && COMPONENTS[run.componentId]) {
       set.add(run.componentId);
     }
     return set;
-  }, [projection.visibleFrames, run.events, run.componentId]);
+  }, [projection.visibleFrames, run.events, run.instances, run.componentId]);
 
   const activeFrameIndex = activeEventId
     ? projection.frameIndexByEventId.get(activeEventId) ?? -1
@@ -331,27 +344,48 @@ export default function ClusterMapCanvas({
       ? projection.visibleFrames[activeFrameIndex]
       : null;
   const activeEvent = activeFrame?.event ?? null;
-  const activeIsPeerTransfer = activeEvent ? isPeerSameComponentEvent(activeEvent) : false;
-  const activeIsLocalSelf = activeEvent ? isLocalSelfEvent(activeEvent) : false;
+  const activeResolved = useMemo(
+    () =>
+      activeEvent && COMPONENTS[activeEvent.fromComponent] && COMPONENTS[activeEvent.toComponent]
+        ? resolveMapRouteEndpoints(activeEvent, run.instances)
+        : null,
+    [activeEvent, run.instances],
+  );
+  const activeIsPeerTransfer = activeResolved?.isPeerTransfer ?? false;
+  const activeIsLocalSelf = activeResolved?.isLocalOnly ?? false;
 
   const { routes, routeByKey } = useMemo(() => {
     const grouped = new Map<
       string,
-      { from: ComponentId; to: ComponentId; isPeerTransfer: boolean; indices: number[] }
+      {
+        from: ComponentId;
+        to: ComponentId;
+        isPeerTransfer: boolean;
+        isLocalOnly: boolean;
+        isCrossCatalogLocal: boolean;
+        runtimeHostZone: HostZoneId;
+        indices: number[];
+      }
     >();
     projection.visibleFrames.forEach((frame, index) => {
       const ev = frame.event;
       if (!COMPONENTS[ev.fromComponent] || !COMPONENTS[ev.toComponent]) return;
-      const peer = isPeerSameComponentEvent(ev);
-      const key = `${ev.fromComponent}::${ev.toComponent}${peer ? '::peer' : ''}`;
+      const resolved = resolveMapRouteEndpoints(ev, run.instances);
+      const key = routeKeyForResolved(resolved);
       const existing = grouped.get(key);
       if (existing) {
         existing.indices.push(index);
+        existing.isLocalOnly = existing.isLocalOnly && resolved.isLocalOnly;
+        existing.isCrossCatalogLocal =
+          existing.isCrossCatalogLocal || resolved.isCrossCatalogLocal;
       } else {
         grouped.set(key, {
-          from: ev.fromComponent,
-          to: ev.toComponent,
-          isPeerTransfer: peer,
+          from: resolved.from,
+          to: resolved.to,
+          isPeerTransfer: resolved.isPeerTransfer,
+          isLocalOnly: resolved.isLocalOnly,
+          isCrossCatalogLocal: resolved.isCrossCatalogLocal,
+          runtimeHostZone: resolved.runtimeHostZone,
           indices: [index],
         });
       }
@@ -366,13 +400,7 @@ export default function ClusterMapCanvas({
       const fromPos = COMPONENTS[item.from].clusterPos;
       const toPos = COMPONENTS[item.to].clusterPos;
       const isSelf = item.from === item.to;
-      const isLocalOnly =
-        isSelf &&
-        !item.isPeerTransfer &&
-        item.indices.every((idx) => {
-          const ev = projection.visibleFrames[idx]?.event;
-          return ev ? isLocalSelfEvent(ev) : false;
-        });
+      const isLocalOnly = isSelf && !item.isPeerTransfer && item.isLocalOnly;
       const hasReverse = !isSelf && grouped.has(`${item.to}::${item.from}`);
 
       let curve: ReturnType<typeof buildEdgeCurve>;
@@ -395,6 +423,8 @@ export default function ClusterMapCanvas({
         to: item.to,
         isPeerTransfer: item.isPeerTransfer,
         isLocalOnly,
+        isCrossCatalogLocal: item.isCrossCatalogLocal,
+        runtimeHostZone: item.runtimeHostZone,
         frameIndices: item.indices,
         curve,
         arrowEnd: pEnd,
@@ -405,27 +435,28 @@ export default function ClusterMapCanvas({
     }
 
     return { routes: list, routeByKey: byKey };
-  }, [projection.visibleFrames, cardW, cardH]);
+  }, [projection.visibleFrames, run.instances, cardW, cardH]);
 
-  const activeRouteKey = activeEvent
-    ? `${activeEvent.fromComponent}::${activeEvent.toComponent}${activeIsPeerTransfer ? '::peer' : ''}`
-    : null;
+  const activeRouteKey = activeResolved ? routeKeyForResolved(activeResolved) : null;
   const activeRoute = activeRouteKey ? routeByKey.get(activeRouteKey) ?? null : null;
   const effectiveProgress = reducedMotion ? 1 : clamp(progress, 0, 1);
   const activeColor = activeEvent ? eventColor(activeEvent) : 'var(--accent)';
 
   const packetState = useMemo(() => {
-    if (!activeEvent || !activeRoute) return null;
+    if (!activeEvent || !activeRoute || !activeResolved) return null;
     const pos = activeRoute.curve.sample(effectiveProgress);
     const trailPts = activeRoute.curve.trail(effectiveProgress, 28);
     const trailStr = trailPts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
 
-    const peerTransfer = isPeerSameComponentEvent(activeEvent);
-    const localSelf = isLocalSelfEvent(activeEvent);
+    const peerTransfer = activeResolved.isPeerTransfer;
+    const localSelf = activeResolved.isLocalOnly;
+    const crossCatalogLocal = activeResolved.isCrossCatalogLocal;
+    const fromInst = run.instances[activeEvent.fromInstance];
+    const toInst = run.instances[activeEvent.toInstance];
 
     const peerPrefix = peerTransfer
       ? activeEvent.peerTag ||
-        `${run.instances[activeEvent.fromInstance]?.shortLabel ?? activeEvent.fromInstance} -> ${run.instances[activeEvent.toInstance]?.shortLabel ?? activeEvent.toInstance}`
+        `${fromInst?.shortLabel ?? activeEvent.fromInstance} -> ${toInst?.shortLabel ?? activeEvent.toInstance}`
       : null;
 
     const channelTag = peerTransfer
@@ -436,17 +467,29 @@ export default function ClusterMapCanvas({
         ? 'LOCAL'
         : CHANNEL_META[activeEvent.channel].short.toUpperCase();
 
+    const otherInst =
+      activeEvent.fromComponent === activeResolved.from ? toInst : fromInst;
+    const crossLocalHost = activeResolved.runtimeHostLabel;
+    const crossLocalNote = otherInst?.shortLabel
+      ? `${otherInst.shortLabel}: ${activeEvent.label}`
+      : activeEvent.label;
+
     const rawLabel = peerPrefix
       ? `${peerPrefix} \u00B7 ${activeEvent.label}`
-      : localSelf
-        ? `LOCAL \u00B7 ${activeEvent.label}`
-        : activeEvent.label;
-    const labelText = truncateText(rawLabel, peerPrefix ? 48 : 38);
+      : crossCatalogLocal
+        ? `LOCAL @ ${crossLocalHost} \u00B7 ${crossLocalNote}`
+        : localSelf
+          ? `LOCAL \u00B7 ${activeEvent.label}`
+          : activeEvent.label;
+    const labelText = truncateText(
+      rawLabel,
+      crossCatalogLocal ? 60 : peerPrefix ? 48 : 38,
+    );
     const pillH = 30;
     const tagW = channelTag.length * 7 + 16;
     const textW = labelText.length * 7.4 + 22;
     const pillW = localSelf
-      ? clamp(labelText.length * 7.4 + 38, 160, 440)
+      ? clamp(labelText.length * 7.4 + 38, 160, crossCatalogLocal ? 520 : 440)
       : clamp(tagW + textW + 12, 160, 520);
     const preferBelow = pos[1] < 80;
     const rawY = preferBelow ? pos[1] + 24 : pos[1] - pillH - 20;
@@ -458,6 +501,10 @@ export default function ClusterMapCanvas({
       trailStr,
       peerTransfer,
       localSelf,
+      crossCatalogLocal,
+      runtimeHostZone: activeResolved.runtimeHostZone,
+      runtimeHostLabel: activeResolved.runtimeHostLabel,
+      runtimeProcessLabel: activeResolved.runtimeProcessLabel,
       channelTag,
       labelText,
       tagW,
@@ -466,7 +513,7 @@ export default function ClusterMapCanvas({
       pillX,
       pillY,
     };
-  }, [activeEvent, activeRoute, effectiveProgress, run.instances]);
+  }, [activeEvent, activeRoute, activeResolved, effectiveProgress, run.instances]);
 
   const vw = MASTER_CANVAS.width / effectiveZoom;
   const vh = MASTER_CANVAS.height / effectiveZoom;
@@ -692,7 +739,7 @@ export default function ClusterMapCanvas({
         viewBox={`${vx.toFixed(1)} ${vy.toFixed(1)} ${vw.toFixed(1)} ${vh.toFixed(1)}`}
         preserveAspectRatio="xMidYMid meet"
         role="group"
-        aria-label={`All-${COMPONENT_LIST.length} PySpark-on-YARN cluster architecture map for ${run.name}`}
+        aria-label={`All-${COMPONENT_LIST.length} Spark-on-YARN cluster architecture map for ${run.name}`}
         data-event-id={activeEventId ?? ''}
         data-progress={progress}
         onPointerDown={handlePointerDown}
@@ -717,8 +764,14 @@ export default function ClusterMapCanvas({
             .cluster-node {
               cursor: pointer;
               outline: none;
-              opacity: 0.44;
+              opacity: 0.6;
               transition: opacity 150ms ease;
+            }
+            .cluster-node.map-node-lang-dim {
+              opacity: 0.44;
+            }
+            .cluster-node.map-node-lang-dim .sv-map-card {
+              stroke-dasharray: 4 3;
             }
             .cluster-node.is-participant,
             .cluster-node.is-selected,
@@ -914,6 +967,8 @@ export default function ClusterMapCanvas({
                 key={route.key}
                 className={route.isPeerTransfer ? 'sv-map-peer-arc' : undefined}
                 data-peer-transfer={route.isPeerTransfer ? 'true' : undefined}
+                data-cross-catalog-local={route.isCrossCatalogLocal ? 'true' : undefined}
+                data-runtime-host={route.runtimeHostZone}
               >
                 <path
                   d={route.curve.path}
@@ -956,8 +1011,8 @@ export default function ClusterMapCanvas({
             const isParticipant = participantSet.has(spec.id);
             const isFocal = run.componentId === spec.id;
             const isSelected = selectedComponentId === spec.id;
-            const isSender = activeEvent?.fromComponent === spec.id;
-            const isReceiver = activeEvent?.toComponent === spec.id;
+            const isSender = activeResolved?.from === spec.id;
+            const isReceiver = activeResolved?.to === spec.id;
             const isActiveEndpoint = isSender || isReceiver;
             const accent = subsystemAccent(spec.subsystem);
             const subline = spec.port ? spec.port : SUBSYSTEM_META[spec.subsystem].short;
@@ -979,12 +1034,29 @@ export default function ClusterMapCanvas({
                 ? 24
                 : Math.max(38, Math.ceil(endpointBadgeText.length * 6 + 10));
 
+            const isInactiveForLanguage = Boolean(
+              activeLanguage &&
+                spec.languages &&
+                !spec.languages.includes(activeLanguage),
+            );
+            const isLangDimmed = isInactiveForLanguage && !isParticipant;
+            const langBadge = componentLanguageCornerBadge(spec.languages);
+            const langBadgeRightOccupied = isActiveEndpoint
+              ? endpointBadgeW + 8
+              : isFocal
+                ? 46
+                : 4;
+            const langBadgeX = langBadge
+              ? x + cardW - langBadgeRightOccupied - langBadge.width
+              : 0;
+
             const nodeClasses = [
               'cluster-node',
               isParticipant ? 'is-participant' : '',
               isSelected ? 'is-selected' : '',
               isFocal ? 'is-focal' : '',
               isActiveEndpoint ? 'is-active' : '',
+              isLangDimmed ? 'map-node-lang-dim' : '',
             ]
               .filter(Boolean)
               .join(' ');
@@ -993,6 +1065,7 @@ export default function ClusterMapCanvas({
               <g
                 key={spec.id}
                 className={nodeClasses}
+                data-lang-inactive={isInactiveForLanguage ? 'true' : undefined}
                 role="button"
                 tabIndex={0}
                 aria-label={`${spec.name}${spec.port ? ` (${spec.port})` : ''}`}
@@ -1000,7 +1073,11 @@ export default function ClusterMapCanvas({
                 onKeyDown={handleNodeKey(spec.id)}
               >
                 <title>
-                  {`${spec.name} \u00B7 ${SUBSYSTEM_META[spec.subsystem].label}${spec.port ? ` (${spec.port})` : ''}`}
+                  {`${spec.name} | ${SUBSYSTEM_META[spec.subsystem].label}${spec.port ? ` (${spec.port})` : ''}${
+                    isInactiveForLanguage
+                      ? ` [${langBadge?.label ?? 'Other'} only - inactive in ${activeLanguage} mode]`
+                      : ''
+                  }`}
                 </title>
 
                 {/* Active endpoint pulse halo */}
@@ -1090,6 +1167,36 @@ export default function ClusterMapCanvas({
                 >
                   {truncateText(subline, maxSubChars)}
                 </text>
+
+                {/* Corner language badge for language-specific nodes */}
+                {langBadge && (
+                  <g
+                    className="sv-map-lang-badge"
+                    transform={`translate(${langBadgeX}, ${y - 7})`}
+                  >
+                    <rect
+                      x="0"
+                      y="0"
+                      width={langBadge.width}
+                      height="13"
+                      rx="2.5"
+                      fill="var(--panel)"
+                      stroke={langBadge.color}
+                      strokeWidth="1"
+                    />
+                    <text
+                      x={langBadge.width / 2}
+                      y="9.4"
+                      textAnchor="middle"
+                      fill={langBadge.color}
+                      fontSize="7.8"
+                      fontWeight="700"
+                      fontFamily="var(--font-mono, 'IBM Plex Mono', ui-monospace, monospace)"
+                    >
+                      {langBadge.label}
+                    </text>
+                  </g>
+                )}
 
                 {/* Focal / active corner badge */}
                 {isActiveEndpoint ? (
@@ -1223,13 +1330,19 @@ export default function ClusterMapCanvas({
           <g
             className="sv-map-packet"
             data-peer-transfer={packetState.peerTransfer ? 'true' : undefined}
+            data-cross-catalog-local={packetState.crossCatalogLocal ? 'true' : undefined}
+            data-runtime-host={packetState.runtimeHostZone}
             role="button"
             tabIndex={0}
             aria-label={`Active packet #${activeFrameIndex + 1}: ${packetState.labelText}`}
             onClick={() => handleHopClick(activeEvent.id)}
             onKeyDown={handleHopKey(activeEvent.id)}
           >
-            <title>{`#${activeFrameIndex + 1} ${activeEvent.protocol} \u00B7 ${packetState.labelText}`}</title>
+            <title>
+              {packetState.crossCatalogLocal
+                ? `#${activeFrameIndex + 1} ${activeEvent.protocol} @ ${packetState.runtimeHostLabel}${packetState.runtimeProcessLabel ? ` (${packetState.runtimeProcessLabel})` : ''} \u00B7 ${packetState.labelText}`
+                : `#${activeFrameIndex + 1} ${activeEvent.protocol} \u00B7 ${packetState.labelText}`}
+            </title>
             <circle
               className={reducedMotion ? undefined : 'sv-map-pulse'}
               cx={packetState.pos[0]}

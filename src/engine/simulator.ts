@@ -10,9 +10,16 @@ import type {
 import type { ChannelKind, ComponentId, HostZoneId, TraceField } from '../data/types.ts';
 import { isLocalPort } from './adaptTrace.ts';
 import {
+  CLIENT_HOST_DRIVER_COMPONENTS as CLIENT_HOST_COMPONENTS,
+  validateEventLocality,
+} from './hostPlacement.ts';
+import {
   emitTerminalAppOutcome,
+  injectDelegationTokenExpiredStep,
   injectExecutorStartupFault,
+  injectKryoUnregisteredClassStep,
   injectPostWorkloadMidRunFault,
+  injectScalaJavaUdfExceptionStep,
   injectTaskResultLostStep,
   injectTaskSpillOomStep,
   injectTorrentPieceCorruptStep,
@@ -29,36 +36,16 @@ import {
   JOB_TYPE_MAP,
   validateSimulationConfig,
   type SimulationConfig,
+  type SparkLanguage,
 } from './simulatorTypes.ts';
 
-const CLIENT_HOST_COMPONENTS = new Set<ComponentId>([
-  'spark-driver',
+const PYTHON_ONLY_COMPONENTS: ReadonlySet<ComponentId> = new Set<ComponentId>([
   'python-driver',
   'py4j-gateway',
-  'spark-session',
-  'spark-context',
-  'spark-env',
-  'dag-scheduler',
-  'task-scheduler',
-  'task-set-manager',
-  'driver-scheduler-backend',
-  'yarn-scheduler-backend',
-  'task-result-getter',
-  'rpc-env',
-  'sql-planner',
-  'adaptive-query-execution',
-  'broadcast-exchange',
-  'executor-allocation-manager',
-  'executor-monitor',
-  'heartbeat-receiver',
-  'block-manager-master',
-  'map-output-tracker-master',
-  'broadcast-manager',
-  'output-commit-coordinator',
-  'listener-bus',
-  'event-log',
-  'spark-ui',
-  'metrics-system',
+  'python-udf-operator',
+  'python-worker-factory',
+  'python-worker',
+  'python-runner',
 ]);
 
 export interface SimRunMeta {
@@ -100,7 +87,7 @@ function clampExecutors(n: number): number {
 
 export function resolveValidSimulationConfig(input: SimulationConfig): SimulationConfig {
   let cfg: SimulationConfig = { ...input, numExecutors: clampExecutors(input.numExecutors) };
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 12; i++) {
     const check = validateSimulationConfig(cfg);
     if (check.valid) return cfg;
     const patch = check.blockers[0]?.suggestedPatch;
@@ -155,10 +142,21 @@ export class SimRunBuilder {
   private readonly stepIds = new Set<string>();
   private eventSeq = 0;
   private readonly registeredAmIds = new Set<string>();
+  private activeDriverAttempt = 1;
   private readonly nextExecNumByAttempt = new Map<number, number>();
   private readonly nextContainerSeqByAttempt = new Map<number, number>();
   private readonly execContainerByKey = new Map<string, string>();
   readonly isClient: boolean;
+  readonly language: SparkLanguage;
+  readonly isPySpark: boolean;
+  readonly isScala: boolean;
+  readonly isJava: boolean;
+  readonly isJvmApp: boolean;
+  readonly langDisplay: string;
+  readonly appArtifact: string;
+  readonly mainClass: string;
+  readonly appMainClass: string;
+  readonly appEntryLabel: string;
   readonly driverHost: string;
   readonly driverRpc: string;
   readonly driverBmPort: string;
@@ -167,10 +165,56 @@ export class SimRunBuilder {
   constructor(cfg: SimulationConfig) {
     this.cfg = cfg;
     this.isClient = cfg.deployMode === 'client';
+    this.language = cfg.language;
+    this.isPySpark = cfg.language === 'pyspark';
+    this.isScala = cfg.language === 'scala';
+    this.isJava = cfg.language === 'java';
+    this.isJvmApp = cfg.language === 'scala' || cfg.language === 'java';
+    this.langDisplay =
+      cfg.language === 'pyspark' ? 'PySpark' : cfg.language === 'scala' ? 'Scala' : 'Java';
+    this.appArtifact =
+      cfg.language === 'pyspark'
+        ? 'orders.py'
+        : cfg.language === 'scala'
+          ? 'orders-assembly.jar'
+          : 'orders-java.jar';
+    this.mainClass =
+      cfg.language === 'pyspark'
+        ? 'org.apache.spark.deploy.PythonRunner'
+        : cfg.fault === 'class-not-found-jar'
+          ? cfg.language === 'java'
+            ? 'com.acme.MissingOrdersJavaJob'
+            : 'com.acme.MissingOrdersJob'
+          : cfg.language === 'scala'
+            ? 'com.acme.OrdersJob'
+            : 'com.acme.OrdersJavaJob';
+    this.appMainClass = this.mainClass;
+    this.appEntryLabel =
+      cfg.language === 'pyspark'
+        ? 'orders.py'
+        : cfg.fault === 'class-not-found-jar'
+          ? cfg.language === 'java'
+            ? 'MissingOrdersJavaJob.main'
+            : 'MissingOrdersJob.main'
+          : cfg.language === 'scala'
+            ? 'OrdersJob.main'
+            : 'OrdersJavaJob.main';
     this.driverHost = this.isClient ? 'edge-01' : 'driver-1';
     this.driverRpc = `${this.driverHost}:41000`;
     this.driverBmPort = `${this.driverHost}:41001`;
     this.driverUiUrl = `http://${this.driverHost}:4040`;
+  }
+
+  submitCommand(extraFlags = ''): string {
+    const base = `spark-submit --master yarn --deploy-mode ${this.cfg.deployMode}${extraFlags}`;
+    if (this.isPySpark) {
+      return `${base} --num-executors ${this.cfg.numExecutors} --executor-cores ${this.cfg.executorCores} orders.py`;
+    }
+    return `${base} --class ${this.appMainClass} --num-executors ${this.cfg.numExecutors} --executor-cores ${this.cfg.executorCores} ${this.appArtifact}`;
+  }
+
+  userAppInstance(): string {
+    return this.isPySpark ? this.std('python-driver') : this.std('jvm-user-app');
   }
 
   isAmRegistered(amId?: string): boolean {
@@ -178,6 +222,9 @@ export class SimRunBuilder {
   }
 
   resetForAttempt(attempt: number): void {
+    if (!this.isClient) {
+      this.activeDriverAttempt = attempt;
+    }
     this.nextExecNumByAttempt.set(attempt, 1);
     this.nextContainerSeqByAttempt.set(attempt, 2);
   }
@@ -201,6 +248,11 @@ export class SimRunBuilder {
   }
 
   ensureInstance(id: string, spec: Omit<RuntimeInstance, 'id'>): string {
+    if (this.isJvmApp && PYTHON_ONLY_COMPONENTS.has(spec.componentId)) {
+      throw new Error(
+        `Python-only component "${spec.componentId}" is forbidden in ${this.cfg.language} runs (instance "${id}")`,
+      );
+    }
     if (!this.instances[id]) {
       this.instances[id] = { id, ...spec };
     }
@@ -208,8 +260,27 @@ export class SimRunBuilder {
   }
 
   std(compId: ComponentId): string {
-    if (this.instances[compId]) return compId;
     const meta = COMPONENTS[compId];
+    const isLaterClusterAttempt =
+      !this.isClient && this.activeDriverAttempt > 1 && meta.hostZone === 'driver-jvm';
+    const id = isLaterClusterAttempt ? `${compId}-a${this.activeDriverAttempt}` : compId;
+    if (this.instances[id]) return id;
+    if (isLaterClusterAttempt) {
+      const attempt = this.activeDriverAttempt;
+      return this.ensureInstance(id, {
+        componentId: compId,
+        label: `${meta.name} (Attempt ${attempt})`,
+        shortLabel: `${meta.shortName} A${attempt}`,
+        hostZone: 'driver-jvm',
+        hostLabel: `driver-1 (Attempt ${attempt})`,
+        processId:
+          compId === 'python-driver'
+            ? `Python Driver Attempt ${attempt}`
+            : `AM JVM Attempt ${attempt}`,
+        containerId: `container_e0${attempt}_000001`,
+        attemptNumber: attempt,
+      });
+    }
     const hostZone: HostZoneId =
       this.isClient && CLIENT_HOST_COMPONENTS.has(compId) ? 'submit-host' : meta.hostZone;
     const hostLabel =
@@ -226,7 +297,7 @@ export class SimRunBuilder {
                 : hostZone === 'worker-node-a'
                   ? 'worker-a'
                   : 'worker-b';
-    return this.ensureInstance(compId, {
+    return this.ensureInstance(id, {
       componentId: compId,
       label: meta.name,
       shortLabel: meta.shortName,
@@ -240,21 +311,24 @@ export class SimRunBuilder {
   }
 
   workerStd(compId: ComponentId, hostZone: 'worker-node-a' | 'worker-node-b'): string {
-    const existing = this.instances[compId];
-    if (existing && existing.hostZone === hostZone) return compId;
+    const attempt = this.activeDriverAttempt;
+    const baseId = attempt > 1 ? `${compId}-a${attempt}` : compId;
+    const existing = this.instances[baseId];
+    if (existing && existing.hostZone === hostZone) return baseId;
     const id = existing
-      ? `${compId}-${hostZone === 'worker-node-a' ? 'a' : 'b'}`
-      : compId;
+      ? `${baseId}-${hostZone === 'worker-node-a' ? 'a' : 'b'}`
+      : baseId;
     if (this.instances[id]) return id;
     const meta = COMPONENTS[compId];
     const hostLabel = hostZone === 'worker-node-a' ? 'worker-a' : 'worker-b';
     return this.ensureInstance(id, {
       componentId: compId,
-      label: meta.name,
-      shortLabel: meta.shortName,
+      label: attempt > 1 ? `${meta.name} (Attempt ${attempt})` : meta.name,
+      shortLabel: attempt > 1 ? `${meta.shortName} A${attempt}` : meta.shortName,
       hostZone,
       hostLabel,
       processId: meta.process,
+      ...(attempt > 1 ? { attemptNumber: attempt } : {}),
     });
   }
 
@@ -411,24 +485,135 @@ export class SimRunBuilder {
   }
 
   driverBmInstance(): string {
-    return this.ensureInstance('driver-bm', {
+    const attempt = !this.isClient && this.activeDriverAttempt > 1 ? this.activeDriverAttempt : 1;
+    const id = attempt > 1 ? `driver-bm-a${attempt}` : 'driver-bm';
+    return this.ensureInstance(id, {
       componentId: 'block-manager',
-      label: 'Driver BlockManager',
-      shortLabel: 'Driver BM',
+      label: attempt > 1 ? `Driver BlockManager (Attempt ${attempt})` : 'Driver BlockManager',
+      shortLabel: attempt > 1 ? `Driver BM A${attempt}` : 'Driver BM',
       hostZone: this.isClient ? 'submit-host' : 'driver-jvm',
       hostLabel: this.driverBmPort,
-      processId: this.isClient ? 'Client Driver JVM' : 'AM / Driver JVM',
+      processId: this.isClient
+        ? 'Client Driver JVM'
+        : attempt > 1
+          ? `AM JVM Attempt ${attempt}`
+          : 'AM / Driver JVM',
+      ...(attempt > 1
+        ? { containerId: `container_e0${attempt}_000001`, attemptNumber: attempt }
+        : {}),
     });
   }
 
   driverCommitInstance(): string {
-    return this.ensureInstance('driver-commit', {
+    const attempt = !this.isClient && this.activeDriverAttempt > 1 ? this.activeDriverAttempt : 1;
+    const id = attempt > 1 ? `driver-commit-a${attempt}` : 'driver-commit';
+    return this.ensureInstance(id, {
       componentId: 'file-commit-protocol',
-      label: 'Driver FileCommitProtocol',
-      shortLabel: 'Driver Commit',
+      label: attempt > 1 ? `Driver FileCommitProtocol (Attempt ${attempt})` : 'Driver FileCommitProtocol',
+      shortLabel: attempt > 1 ? `Driver Commit A${attempt}` : 'Driver Commit',
       hostZone: this.isClient ? 'submit-host' : 'driver-jvm',
       hostLabel: this.driverHost,
-      processId: this.isClient ? 'Client Driver JVM' : 'AM / Driver JVM',
+      processId: this.isClient
+        ? 'Client Driver JVM'
+        : attempt > 1
+          ? `AM JVM Attempt ${attempt}`
+          : 'AM / Driver JVM',
+      ...(attempt > 1
+        ? { containerId: `container_e0${attempt}_000001`, attemptNumber: attempt }
+        : {}),
+    });
+  }
+
+  driverEncoderInstance(): string {
+    const attempt = !this.isClient && this.activeDriverAttempt > 1 ? this.activeDriverAttempt : 1;
+    const id = attempt > 1 ? `driver-encoder-a${attempt}` : 'driver-encoder';
+    const baseLabel = this.isJava
+      ? 'JavaTypeInference & UDF1 (Driver)'
+      : this.isScala
+        ? 'ExpressionEncoder & ScalaUDF (Driver)'
+        : 'Java UDF Registration (Driver)';
+    return this.ensureInstance(id, {
+      componentId: 'dataset-encoder-udf',
+      label: attempt > 1 ? `${baseLabel} A${attempt}` : baseLabel,
+      shortLabel: attempt > 1 ? `Driver Enc A${attempt}` : 'Driver Encoder',
+      hostZone: this.isClient ? 'submit-host' : 'driver-jvm',
+      hostLabel: this.driverHost,
+      processId: this.isClient
+        ? 'Client Driver JVM'
+        : attempt > 1
+          ? `AM JVM Attempt ${attempt}`
+          : 'AM / Driver JVM',
+      ...(attempt > 1
+        ? { containerId: `container_e0${attempt}_000001`, attemptNumber: attempt }
+        : {}),
+    });
+  }
+
+  execEncoderInstance(execId: string): string {
+    const execInst = this.instances[execId];
+    const execNum = execInst?.executorNumber ?? 1;
+    const attempt = execInst?.attemptNumber ?? 1;
+    const hostZone: 'worker-node-a' | 'worker-node-b' =
+      execInst?.hostZone === 'worker-node-b' ? 'worker-node-b' : 'worker-node-a';
+    const hostName = hostZone === 'worker-node-a' ? 'worker-a' : 'worker-b';
+    const id = `${execId}/dataset-encoder-udf`;
+    const roleLabel = this.isJava
+      ? 'BeanEncoder & UDF1'
+      : this.isScala
+        ? 'ExpressionEncoder & ScalaUDF'
+        : 'Java UDF1 (registerJavaFunction)';
+    return this.ensureInstance(id, {
+      componentId: 'dataset-encoder-udf',
+      label: `${roleLabel} (Exec-${execNum})`,
+      shortLabel: `Exec-${execNum} UDF`,
+      hostZone,
+      hostLabel: hostName,
+      processId: execInst?.processId ?? `Executor ${execNum} JVM`,
+      ...(execInst?.containerId ? { containerId: execInst.containerId } : {}),
+      executorNumber: execNum,
+      ...(attempt > 1 ? { attemptNumber: attempt } : {}),
+    });
+  }
+
+  execSerializerInstance(execId: string): string {
+    const execInst = this.instances[execId];
+    const execNum = execInst?.executorNumber ?? 1;
+    const attempt = execInst?.attemptNumber ?? 1;
+    const hostZone: 'worker-node-a' | 'worker-node-b' =
+      execInst?.hostZone === 'worker-node-b' ? 'worker-node-b' : 'worker-node-a';
+    const hostName = hostZone === 'worker-node-a' ? 'worker-a' : 'worker-b';
+    const id = `${execId}/serializer-manager`;
+    return this.ensureInstance(id, {
+      componentId: 'serializer-manager',
+      label: `SerializerManager (Exec-${execNum})`,
+      shortLabel: `Exec-${execNum} SerMgr`,
+      hostZone,
+      hostLabel: hostName,
+      processId: execInst?.processId ?? `Executor ${execNum} JVM`,
+      ...(execInst?.containerId ? { containerId: execInst.containerId } : {}),
+      executorNumber: execNum,
+      ...(attempt > 1 ? { attemptNumber: attempt } : {}),
+    });
+  }
+
+  execTaskAttemptInstance(execId: string): string {
+    const execInst = this.instances[execId];
+    const execNum = execInst?.executorNumber ?? 1;
+    const attempt = execInst?.attemptNumber ?? 1;
+    const hostZone: 'worker-node-a' | 'worker-node-b' =
+      execInst?.hostZone === 'worker-node-b' ? 'worker-node-b' : 'worker-node-a';
+    const hostName = hostZone === 'worker-node-a' ? 'worker-a' : 'worker-b';
+    const id = `${execId}/task-attempt`;
+    return this.ensureInstance(id, {
+      componentId: 'task-attempt',
+      label: `TaskAttempt (Exec-${execNum})`,
+      shortLabel: `Exec-${execNum} Task`,
+      hostZone,
+      hostLabel: hostName,
+      processId: execInst?.processId ?? `Executor ${execNum} JVM`,
+      ...(execInst?.containerId ? { containerId: execInst.containerId } : {}),
+      executorNumber: execNum,
+      ...(attempt > 1 ? { attemptNumber: attempt } : {}),
     });
   }
 
@@ -508,13 +693,21 @@ export class SimRunBuilder {
       (isLocalPort(opts.port) || (opts.from === opts.to && opts.channel === 'internal')
         ? 'local'
         : 'wire');
-    if (
-      fromInst.hostZone !== toInst.hostZone &&
-      (derivedKind === 'local' || isLocalPort(opts.port))
-    ) {
-      throw new Error(
-        `Cross-host local event forbidden: ${opts.from} (${fromInst.hostZone}) -> ${opts.to} (${toInst.hostZone}) via port "${opts.port}"`,
-      );
+    const localityViolation = validateEventLocality(
+      {
+        id,
+        kind: derivedKind,
+        channel: opts.channel,
+        port: opts.port,
+        protocol: opts.protocol,
+        fromInstance: opts.from,
+        toInstance: opts.to,
+        command: opts.command,
+      },
+      this.instances,
+    );
+    if (localityViolation) {
+      throw new Error(localityViolation);
     }
     const isRegisterAmEvent =
       fromInst.componentId === 'application-master' &&
@@ -650,6 +843,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
 
   const runId = [
     'sim',
+    cfg.language,
     cfg.jobType,
     cfg.dataProfile,
     cfg.deployMode,
@@ -660,13 +854,13 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     cfg.fault,
   ].join('-');
 
-  const runName = `Simulated: ${job.short} (${cfg.numExecutors}x${cfg.executorCores}c, ${cfg.deployMode})`;
+  const runName = `Simulated (${b.langDisplay}): ${job.short} (${cfg.numExecutors}x${cfg.executorCores}c, ${cfg.deployMode})`;
   const runSubtitle =
     cfg.fault === 'none'
-      ? `${job.actionSink} | ${cfg.numPartitions} parts (~${idealWavesPerStage} ideal wave${idealWavesPerStage > 1 ? 's' : ''}/stage)`
-      : `Fault: ${fault.short} on ${job.short} (${cfg.deployMode}, ${cfg.numExecutors} execs)`;
+      ? `${b.langDisplay} | ${job.actionSink} | ${cfg.numPartitions} parts (~${idealWavesPerStage} ideal wave${idealWavesPerStage > 1 ? 's' : ''}/stage)`
+      : `Fault (${b.langDisplay}): ${fault.short} on ${job.short} (${cfg.deployMode}, ${cfg.numExecutors} execs)`;
   const runSummary =
-    `${job.summary} Configured with ${cfg.numExecutors} ${cfg.dynamicAllocation ? 'initial ' : ''}executor(s) x ${cfg.executorCores} core(s) (${totalSlots} slots; ideal ${idealWavesPerStage} wave(s)/stage for ${cfg.numPartitions} partitions under fixed capacity), ESS ${cfg.externalShuffleService ? 'ON (:7337)' : 'OFF'}, AQE ${cfg.aqeEnabled ? 'ON' : 'OFF'}.${cfg.deployMode === 'client' ? ' Driver runs outside YARN on edge-01.' : ''}`;
+    `[${b.langDisplay}] ${job.summary} Configured with ${cfg.numExecutors} ${cfg.dynamicAllocation ? 'initial ' : ''}executor(s) x ${cfg.executorCores} core(s) (${totalSlots} slots; ideal ${idealWavesPerStage} wave(s)/stage for ${cfg.numPartitions} partitions under fixed capacity), ESS ${cfg.externalShuffleService ? 'ON (:7337)' : 'OFF'}, AQE ${cfg.aqeEnabled ? 'ON' : 'OFF'}.${cfg.deployMode === 'client' ? ' Driver runs outside YARN on edge-01.' : ''}`;
 
   const runMeta: SimRunMeta = {
     runId,
@@ -692,7 +886,6 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
   // MACRO STEP 1: Submit & Stage (+ Expandable Staging Sub-Steps)
   // =========================================================================
   const am = b.std('application-master');
-  const pyDriver = b.std('python-driver');
   let amNmInstanceId: string | null = null;
 
   if (cfg.deployMode === 'cluster') {
@@ -700,17 +893,26 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     const amNm = b.amNmInstance();
     amNmInstanceId = amNm;
     const amCont = b.amContainerInstance(1);
+    const submitCmd = b.submitCommand();
 
     const sSubmit = b.addStep({
       id: 'sim-step-submit',
       title: 'Submit application, stage files to HDFS & start AM container',
-      explanation:
-        `spark-submit stages orders.py and __spark_conf__.zip to HDFS .sparkStaging/, submits ApplicationMaster to RM :8032, and RM launches AM Attempt 1 on driver-1. Expand for staging & localization sub-steps.`,
+      explanation: b.isPySpark
+        ? `spark-submit stages orders.py and __spark_conf__.zip to HDFS .sparkStaging/, submits ApplicationMaster to RM :8032, and RM launches AM Attempt 1 on driver-1. Expand for staging & localization sub-steps.`
+        : `spark-submit stages ${b.appArtifact} (YARN localized symlink __app__.jar; local: URIs bypass HDFS upload) and __spark_conf__.zip to HDFS .sparkStaging/, submits ApplicationMaster (--jar ${b.appArtifact} --class ${b.appMainClass}) to RM :8032, and RM launches AM Attempt 1 on driver-1 with zero Python artifacts.`,
       category: 'yarn-lifecycle',
       keyState: 'AM container_e01_000001 booting on driver-1',
-      command: `spark-submit --master yarn --deploy-mode cluster --num-executors ${cfg.numExecutors} --executor-cores ${cfg.executorCores} orders.py`,
+      command: submitCmd,
       detailsPassed: [
+        { name: 'language', value: b.langDisplay },
         { name: 'deployMode', value: 'cluster' },
+        ...(b.isJvmApp
+          ? [
+              { name: 'userClass', value: b.appMainClass },
+              { name: 'userJarArg', value: `${b.appArtifact} (localized symlink __app__.jar; local: bypasses HDFS upload)` },
+            ]
+          : []),
         { name: 'numExecutors', value: String(cfg.numExecutors) },
         { name: 'executorCores', value: String(cfg.executorCores) },
       ],
@@ -725,12 +927,15 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'In-JVM SparkApplication',
       port: 'edge-01 in-JVM',
       label: 'YarnClusterApplication',
-      info: 'spark-submit hands parsed YARN configs and orders.py to yarn.Client.',
+      info: b.isPySpark
+        ? 'spark-submit hands parsed YARN configs and orders.py to yarn.Client.'
+        : `spark-submit hands parsed YARN configs, --class ${b.appMainClass}, and ${b.appArtifact} (isPython=false) to yarn.Client.`,
       size: 'in-memory',
       command: 'SparkSubmit.runMain(childArgs, sparkConf, "YarnClusterApplication")',
       fields: [
         { name: 'master', value: 'yarn' },
         { name: 'deployMode', value: 'cluster' },
+        { name: 'spark.yarn.isPython', value: String(b.isPySpark) },
       ],
       senderState: 'Parsed CLI flags',
       receiverState: 'Staging files & submitting AM to RM',
@@ -743,12 +948,19 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'Hadoop RPC (ApplicationClientProtocol)',
       port: 'rm01:8032',
       label: 'submitApplication(AM)',
-      info: 'yarn.Client stages archives to HDFS and submits AM ContainerLaunchContext to RM :8032.',
+      info: b.isPySpark
+        ? 'yarn.Client stages archives to HDFS and submits AM ContainerLaunchContext to RM :8032.'
+        : `yarn.Client stages ${b.appArtifact} to HDFS .sparkStaging/ and submits AM ContainerLaunchContext (--jar ${b.appArtifact} --class ${b.appMainClass}; localized symlink __app__.jar) to RM :8032.`,
       size: '14.4 KB',
-      command: 'yarnClient.submitApplication(appContext)',
+      command: b.isPySpark
+        ? 'yarnClient.submitApplication(appContext)'
+        : `yarnClient.submitApplication(appContext[ApplicationMaster --jar ${b.appArtifact} --class ${b.appMainClass}])`,
       fields: [
         { name: 'amClass', value: 'ApplicationMaster' },
-        { name: 'userClass', value: 'deploy.PythonRunner' },
+        { name: 'userClass', value: b.isPySpark ? 'deploy.PythonRunner' : b.appMainClass },
+        ...(b.isJvmApp
+          ? [{ name: 'userJarArg', value: `--jar ${b.appArtifact} (localized symlink __app__.jar)` }]
+          : []),
       ],
       senderState: 'Monitoring RM app report',
       receiverState: 'App ACCEPTED; launching AM on driver-1',
@@ -773,12 +985,23 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     const s1a = b.addStep({
       id: 'sim-step-submit-a',
       parentId: sSubmit,
-      title: 'yarn.Client stages orders.py & __spark_conf__.zip to HDFS .sparkStaging/',
-      explanation: 'Client.prepareLocalResources() uploads orders.py, pyspark.zip, py4j.zip, and __spark_conf__.zip to HDFS so NMs can localize them.',
+      title: b.isPySpark
+        ? 'yarn.Client stages orders.py & __spark_conf__.zip to HDFS .sparkStaging/'
+        : `yarn.Client stages ${b.appArtifact} (__app__.jar) & __spark_conf__.zip to HDFS .sparkStaging/`,
+      explanation: b.isPySpark
+        ? 'Client.prepareLocalResources() uploads orders.py, pyspark.zip, py4j.zip, and __spark_conf__.zip to HDFS so NMs can localize them.'
+        : `Client.prepareLocalResources() registers ${b.appArtifact} (NameNode :8020 metadata, localized container symlink __app__.jar; local: URIs bypass HDFS upload) and __spark_conf__.zip in HDFS .sparkStaging/ with zero Python archives.`,
       category: 'staging-localization',
       keyState: 'HDFS .sparkStaging/ populated for localization',
-      command: 'Client.prepareLocalResources(stagingDirPath, pySparkArchives)',
-      detailsPassed: [{ name: 'stagingDir', value: 'hdfs:///user/app/.sparkStaging/application_1740_0051' }],
+      command: b.isPySpark
+        ? 'Client.prepareLocalResources(stagingDirPath, pySparkArchives)'
+        : `Client.prepareLocalResources(stagingDirPath, ${b.appArtifact}) // symlink __app__.jar`,
+      detailsPassed: [
+        { name: 'stagingDir', value: 'hdfs:///user/app/.sparkStaging/application_1740_0051' },
+        ...(b.isJvmApp
+          ? [{ name: 'localBypassNote', value: 'local:/path/' + b.appArtifact + ' skips HDFS upload' }]
+          : []),
+      ],
       deepDiveComponentId: 'yarn-client',
     });
     b.addEvent({
@@ -789,10 +1012,21 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'Hadoop RPC (ClientProtocol)',
       port: 'nn01:8020',
       label: 'Stage .sparkStaging/*',
-      info: 'Uploads orders.py, pyspark.zip, and __spark_conf__.zip to HDFS staging directory.',
-      size: '18.2 MiB',
-      command: 'Client.prepareLocalResources(stagingDir, pySparkArchives)',
-      fields: [{ name: 'files', value: 'orders.py, pyspark.zip, __spark_conf__.zip' }],
+      info: b.isPySpark
+        ? 'Uploads orders.py, pyspark.zip, and __spark_conf__.zip to HDFS staging directory.'
+        : `Creates HDFS .sparkStaging/ metadata on NameNode :8020 for ${b.appArtifact} (YARN localized symlink __app__.jar; local: URIs bypass HDFS upload) and __spark_conf__.zip.`,
+      size: b.isPySpark ? '18.2 MiB' : '24.6 MiB',
+      command: b.isPySpark
+        ? 'Client.prepareLocalResources(stagingDir, pySparkArchives)'
+        : `Client.prepareLocalResources(stagingDir, ${b.appArtifact}) // symlink __app__.jar`,
+      fields: [
+        {
+          name: 'files',
+          value: b.isPySpark
+            ? 'orders.py, pyspark.zip, __spark_conf__.zip'
+            : `${b.appArtifact} (symlink __app__.jar), __spark_conf__.zip`,
+        },
+      ],
       senderState: 'LocalResource map built',
       receiverState: 'Staged files registered in HDFS namespace',
     });
@@ -800,7 +1034,9 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       id: 'sim-step-submit-b',
       parentId: sSubmit,
       title: 'RM submits AM container -> driver-1 NM localizes & boots AM JVM',
-      explanation: 'RM calls startContainers on driver-1 NM, NM downloads .sparkStaging/ files, sets cgroups, and starts ApplicationMaster.main().',
+      explanation: b.isPySpark
+        ? 'RM calls startContainers on driver-1 NM, NM downloads .sparkStaging/ files, sets cgroups, and starts ApplicationMaster.main().'
+        : `RM calls startContainers on driver-1 NM, NM downloads ${b.appArtifact} & __spark_conf__.zip, launch_container.sh creates symlink __app__.jar, sets cgroups, and starts ApplicationMaster.main(--jar ${b.appArtifact} --class ${b.appMainClass}).`,
       category: 'yarn-lifecycle',
       keyState: 'AM Attempt 1 running in container_e01_000001',
       command: 'cmProxy.startContainers(amCtx) -> ApplicationMaster.main()',
@@ -815,9 +1051,13 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'Hadoop RPC (ApplicationClientProtocol)',
       port: 'rm01:8032',
       label: 'submitApplication(AM)',
-      info: 'Submits AM ApplicationSubmissionContext to RM :8032.',
+      info: b.isPySpark
+        ? 'Submits AM ApplicationSubmissionContext to RM :8032.'
+        : `Submits AM ApplicationSubmissionContext (--jar ${b.appArtifact} --class ${b.appMainClass}) to RM :8032.`,
       size: '14.4 KB',
-      command: 'yarnClient.submitApplication(appContext)',
+      command: b.isPySpark
+        ? 'yarnClient.submitApplication(appContext)'
+        : `yarnClient.submitApplication(appContext[--jar ${b.appArtifact} --class ${b.appMainClass}])`,
       fields: [{ name: 'queue', value: 'default' }],
       senderState: 'Polling ApplicationReport',
       receiverState: 'Allocated container_e01_000001',
@@ -846,8 +1086,10 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'HDFS Localization Fetch',
       port: 'nn01:8020',
       label: 'Localize AM archives',
-      info: 'driver-1 NM downloads staged archives into container_e01_000001 working directory.',
-      size: '18.2 MiB',
+      info: b.isPySpark
+        ? 'driver-1 NM downloads staged archives into container_e01_000001 working directory.'
+        : `driver-1 NM downloads ${b.appArtifact} & __spark_conf__.zip; container launch script symlinks __app__.jar in container_e01_000001 working directory.`,
+      size: b.isPySpark ? '18.2 MiB' : '24.6 MiB',
       command: 'ResourceLocalizationService.localize(localResources)',
       fields: [{ name: 'state', value: 'LOCALIZING -> LOCALIZED' }],
       senderState: 'Working directory populated',
@@ -895,322 +1137,623 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     }
 
     // =========================================================================
-    // MACRO STEP 2 (Cluster): AM Launches Python Driver & SparkContext
+    // MACRO STEP 2 (Cluster): AM Launches User Driver & SparkContext
     // =========================================================================
-    const py4j = b.std('py4j-gateway');
     const sc = b.std('spark-context');
     const session = b.std('spark-session');
     const sparkEnv = b.std('spark-env');
     const listenerBus = b.std('listener-bus');
     const sparkUi = b.std('spark-ui');
-    const sDriver = b.addStep({
-      id: 'sim-step-driver',
-      title: 'AM launches Python driver, Py4J & SparkContext (:41000)',
-      explanation:
-        'ApplicationMaster spawns deploy.PythonRunner -> Py4JServer -> python3 orders.py; orders.py creates SparkContext first (binding :41000, :41001, SparkUI :4040), resolves sparkContextPromise, and wraps SparkSession. Expand for full internal handoffs.',
-      category: 'driver-python-bridge',
-      keyState: 'Driver live on driver-1:41000 | SparkUI :4040 | AM unblocked',
-      command: 'ApplicationMaster.runDriver() -> PythonRunner -> SparkContext.getOrCreate()',
-      detailsPassed: [
-        { name: 'driverRpc', value: 'driver-1:41000' },
-        { name: 'py4jPort', value: '43122 (127.0.0.1 loopback)' },
-        { name: 'sparkUi', value: 'http://driver-1:4040' },
-      ],
-      deepDiveComponentId: 'application-master',
-      isMacro: true,
-    });
-    b.addEvent({
-      stepId: sDriver,
-      from: am,
-      to: pyDriver,
-      kind: 'local',
-      channel: 'python',
-      protocol: 'ProcessBuilder + Py4J',
-      port: 'driver-1 OS',
-      label: 'Spawn orders.py',
-      info: 'AM Driver thread starts Py4JServer on 127.0.0.1:43122 and forks python3 orders.py.',
-      size: 'OS fork/exec',
-      command: 'PythonRunner.main(Array("orders.py", ""))',
-      fields: [{ name: 'PYSPARK_GATEWAY_PORT', value: '43122' }],
-      senderState: 'AM waiting on sparkContextPromise',
-      receiverState: 'orders.py calling SparkSession.builder.getOrCreate()',
-    });
-    b.addEvent({
-      stepId: sDriver,
-      from: pyDriver,
-      to: sc,
-      channel: 'python',
-      protocol: 'Py4J Loopback -> JVM SC',
-      port: '127.0.0.1:43122',
-      label: 'Init SparkContext :41000',
-      info: 'orders.py initializes SparkContext over Py4J, binding NettyRpcEnv (:41000) & SparkUI (:4040) and resolving sparkContextPromise.',
-      size: '2.1 KB',
-      command: 'SparkContext.getOrCreate(conf) -> ApplicationMaster.sparkContextInitialized(sc)',
-      fields: [
-        { name: 'spark.driver.port', value: '41000' },
-        { name: 'spark.ui.port', value: '4040' },
-      ],
-      senderState: 'Received SparkSession proxy handle',
-      receiverState: 'SparkContext & AM unblocked for RM registration',
-    });
 
-    // Sub-steps of Macro Step 2 (correct SparkContext-before-SparkSession & UI-before-postStartHook order!)
-    const s2a = b.addStep({
-      id: 'sim-step-driver-a',
-      parentId: sDriver,
-      title: 'PythonRunner starts Py4JServer (:43122) & spawns orders.py',
-      explanation: 'AM Driver thread invokes deploy.PythonRunner, starts loopback Py4JServer with 256-bit secret, and spawns python3 orders.py.',
-      category: 'driver-python-bridge',
-      keyState: 'Py4JServer listening on 127.0.0.1:43122; orders.py running',
-      command: 'new Py4JServer(conf).start() -> new ProcessBuilder("python3", "orders.py").start()',
-      detailsPassed: [{ name: 'PYSPARK_GATEWAY_PORT', value: '43122' }],
-      deepDiveComponentId: 'py4j-gateway',
-    });
-    b.addEvent({
-      stepId: s2a,
-      from: am,
-      to: py4j,
-      kind: 'local',
-      channel: 'python',
-      protocol: 'Py4JServer Loopback Bind',
-      port: 'driver-1 in-JVM',
-      label: 'Start Py4JServer :43122',
-      info: 'PythonRunner binds loopback Py4JServer with random 256-bit PYSPARK_GATEWAY_SECRET.',
-      size: 'socket bind',
-      command: 'gatewayServer = Some(new Py4JServer(sparkConf))',
-      fields: [{ name: 'port', value: '43122' }],
-      senderState: 'Passing gateway env vars to ProcessBuilder',
-      receiverState: 'Listening on 127.0.0.1:43122',
-    });
-    b.addEvent({
-      stepId: s2a,
-      from: py4j,
-      to: pyDriver,
-      kind: 'local',
-      channel: 'python',
-      protocol: 'ProcessBuilder + env',
-      port: 'driver-1 OS',
-      label: 'Fork python3 orders.py',
-      info: 'Python subprocess launches with PYTHONPATH and gateway credentials.',
-      size: 'OS fork/exec',
-      command: 'builder.start() // python3 orders.py',
-      fields: [{ name: 'PYTHONUNBUFFERED', value: 'YES' }],
-      senderState: 'Waiting for auth handshake',
-      receiverState: 'Executing orders.py top-level code',
-    });
+    if (b.isPySpark) {
+      const pyDriver = b.std('python-driver');
+      const py4j = b.std('py4j-gateway');
+      const sDriver = b.addStep({
+        id: 'sim-step-driver',
+        title: 'AM launches Python driver, Py4J & SparkContext (:41000)',
+        explanation:
+          'ApplicationMaster spawns deploy.PythonRunner -> Py4JServer -> python3 orders.py; orders.py creates SparkContext first (binding :41000, :41001, SparkUI :4040), resolves sparkContextPromise, and wraps SparkSession. Expand for full internal handoffs.',
+        category: 'driver-python-bridge',
+        keyState: 'Driver live on driver-1:41000 | SparkUI :4040 | AM unblocked',
+        command: 'ApplicationMaster.runDriver() -> PythonRunner -> SparkContext.getOrCreate()',
+        detailsPassed: [
+          { name: 'driverRpc', value: 'driver-1:41000' },
+          { name: 'py4jPort', value: '43122 (127.0.0.1 loopback)' },
+          { name: 'sparkUi', value: 'http://driver-1:4040' },
+        ],
+        deepDiveComponentId: 'application-master',
+        isMacro: true,
+      });
+      b.addEvent({
+        stepId: sDriver,
+        from: am,
+        to: pyDriver,
+        kind: 'local',
+        channel: 'python',
+        protocol: 'ProcessBuilder + Py4J',
+        port: 'driver-1 OS',
+        label: 'Spawn orders.py',
+        info: 'AM Driver thread starts Py4JServer on 127.0.0.1:43122 and forks python3 orders.py.',
+        size: 'OS fork/exec',
+        command: 'PythonRunner.main(Array("orders.py", ""))',
+        fields: [{ name: 'PYSPARK_GATEWAY_PORT', value: '43122' }],
+        senderState: 'AM waiting on sparkContextPromise',
+        receiverState: 'orders.py calling SparkSession.builder.getOrCreate()',
+      });
+      b.addEvent({
+        stepId: sDriver,
+        from: pyDriver,
+        to: sc,
+        channel: 'python',
+        protocol: 'Py4J Loopback -> JVM SC',
+        port: '127.0.0.1:43122',
+        label: 'Init SparkContext :41000',
+        info: 'orders.py initializes SparkContext over Py4J, binding NettyRpcEnv (:41000) & SparkUI (:4040) and resolving sparkContextPromise.',
+        size: '2.1 KB',
+        command: 'SparkContext.getOrCreate(conf) -> ApplicationMaster.sparkContextInitialized(sc)',
+        fields: [
+          { name: 'spark.driver.port', value: '41000' },
+          { name: 'spark.ui.port', value: '4040' },
+        ],
+        senderState: 'Received SparkSession proxy handle',
+        receiverState: 'SparkContext & AM unblocked for RM registration',
+      });
 
-    const s2b = b.addStep({
-      id: 'sim-step-driver-b',
-      parentId: sDriver,
-      title: 'SparkContext binds SparkEnv (:41000), ListenerBus & SparkUI (:4040), then signals AM',
-      explanation: 'Classic PySpark constructs SparkContext BEFORE SparkSession: SparkEnv binds NettyRpcEnv :41000 & BM :41001, LiveListenerBus & SparkUI :4040 start, then YarnClusterScheduler.postStartHook fulfills sparkContextPromise before SparkSession wraps SparkContext.',
-      category: 'heartbeats-metrics',
-      keyState: 'SparkContext, SparkUI :4040, and SparkSession ready; AM unblocked',
-      command: 'SparkContext.getOrCreate() -> SparkEnv -> SparkUI -> postStartHook() -> new SparkSession(sc)',
-      detailsPassed: [
-        { name: 'rpcPort', value: '41000' },
-        { name: 'uiPort', value: '4040' },
-      ],
-      deepDiveComponentId: 'spark-context',
-    });
-    b.addEvent({
-      stepId: s2b,
-      from: pyDriver,
-      to: sc,
-      categoryOverride: 'driver-python-bridge',
-      channel: 'python',
-      protocol: 'Py4J Loopback TCP',
-      port: '127.0.0.1:43122',
-      label: 'SparkContext.getOrCreate',
-      info: 'PySpark obtains/creates JVM SparkContext BEFORE wrapping it in SparkSession.',
-      size: '2.1 KB',
-      command: 'JavaSparkContext(jconf)',
-      fields: [{ name: 'order', value: 'SparkContext first, then SparkSession' }],
-      senderState: 'Awaiting JVM SparkContext',
-      receiverState: 'Initializing SparkEnv and schedulers',
-    });
-    b.addEvent({
-      stepId: s2b,
-      from: sc,
-      to: sparkEnv,
-      kind: 'local',
-      categoryOverride: 'driver-python-bridge',
-      channel: 'internal',
-      protocol: 'In-JVM SparkEnv Init',
-      port: 'driver-1 in-JVM',
-      label: 'Bind RPC :41000 & BM',
-      info: 'SparkEnv.createDriverEnv binds NettyRpcEnv on :41000 and driver BlockManager on :41001.',
-      size: 'in-memory',
-      command: 'SparkEnv.createDriverEnv(conf, false, listenerBus)',
-      fields: [
-        { name: 'rpc', value: 'driver-1:41000' },
-        { name: 'bm', value: 'driver-1:41001' },
-      ],
-      senderState: 'Driver RPC & BlockManager bound',
-      receiverState: 'All driver RpcEndpoints active',
-    });
-    b.addEvent({
-      stepId: s2b,
-      from: sc,
-      to: listenerBus,
-      kind: 'local',
-      channel: 'internal',
-      protocol: 'In-JVM Observability',
-      port: 'driver-1 in-JVM',
-      label: 'Start ListenerBus + UI',
-      info: 'LiveListenerBus and Jetty SparkUI (:4040) bind before postStartHook signals AM.',
-      size: 'in-memory',
-      command: 'listenerBus.start(); SparkUI.create(Some(this), ...)',
-      fields: [{ name: 'uiUrl', value: 'http://driver-1:4040' }],
-      senderState: 'UI bound on :4040',
-      receiverState: 'Event queues running',
-    });
-    b.addEvent({
-      stepId: s2b,
-      from: sc,
-      to: sparkUi,
-      kind: 'local',
-      channel: 'internal',
-      protocol: 'Jetty Bind',
-      port: 'driver-1 in-JVM',
-      label: 'Bind SparkUI :4040',
-      info: 'SparkUI binds :4040 so AM can advertise trackingUrl to RM.',
-      size: 'in-memory',
-      command: 'ui.bind() // http://driver-1:4040',
-      fields: [{ name: 'webUrl', value: 'http://driver-1:4040' }],
-      senderState: 'UI ready',
-      receiverState: 'Serving live status store',
-    });
-    b.addEvent({
-      stepId: s2b,
-      from: sc,
-      to: am,
-      kind: 'local',
-      categoryOverride: 'yarn-lifecycle',
-      channel: 'internal',
-      protocol: 'YarnClusterScheduler.postStartHook',
-      port: 'driver-1 in-JVM',
-      label: 'Resolve scPromise',
-      info: 'postStartHook signals ApplicationMaster.sparkContextInitialized(sc), unblocking registerAM().',
-      size: 'in-memory',
-      command: 'ApplicationMaster.sparkContextInitialized(sc)',
-      fields: [{ name: 'driverPort', value: '41000' }],
-      senderState: 'Returning active SparkContext to SparkSession',
-      receiverState: 'AM unblocked for RM registration',
-    });
-    b.addEvent({
-      stepId: s2b,
-      from: sc,
-      to: session,
-      kind: 'local',
-      categoryOverride: 'driver-python-bridge',
-      channel: 'internal',
-      protocol: 'In-JVM SparkSession Wrap',
-      port: 'driver-1 in-JVM',
-      label: 'new SparkSession(sc)',
-      info: 'SparkSession wraps the live SparkContext and returns proxy handle to Python.',
-      size: 'in-memory',
-      command: 'new SparkSession(sc)',
-      fields: [{ name: 'sharedState', value: 'Bound to active SparkContext' }],
-      senderState: 'SparkContext active',
-      receiverState: 'SparkSession ready for SQL/DataFrame calls',
-    });
+      const s2a = b.addStep({
+        id: 'sim-step-driver-a',
+        parentId: sDriver,
+        title: 'PythonRunner starts Py4JServer (:43122) & spawns orders.py',
+        explanation: 'AM Driver thread invokes deploy.PythonRunner, starts loopback Py4JServer with 256-bit secret, and spawns python3 orders.py.',
+        category: 'driver-python-bridge',
+        keyState: 'Py4JServer listening on 127.0.0.1:43122; orders.py running',
+        command: 'new Py4JServer(conf).start() -> new ProcessBuilder("python3", "orders.py").start()',
+        detailsPassed: [{ name: 'PYSPARK_GATEWAY_PORT', value: '43122' }],
+        deepDiveComponentId: 'py4j-gateway',
+      });
+      b.addEvent({
+        stepId: s2a,
+        from: am,
+        to: py4j,
+        kind: 'local',
+        channel: 'python',
+        protocol: 'Py4JServer Loopback Bind',
+        port: 'driver-1 in-JVM',
+        label: 'Start Py4JServer :43122',
+        info: 'PythonRunner binds loopback Py4JServer with random 256-bit PYSPARK_GATEWAY_SECRET.',
+        size: 'socket bind',
+        command: 'gatewayServer = Some(new Py4JServer(sparkConf))',
+        fields: [{ name: 'port', value: '43122' }],
+        senderState: 'Passing gateway env vars to ProcessBuilder',
+        receiverState: 'Listening on 127.0.0.1:43122',
+      });
+      b.addEvent({
+        stepId: s2a,
+        from: py4j,
+        to: pyDriver,
+        kind: 'local',
+        channel: 'python',
+        protocol: 'ProcessBuilder + env',
+        port: 'driver-1 OS',
+        label: 'Fork python3 orders.py',
+        info: 'Python subprocess launches with PYTHONPATH and gateway credentials.',
+        size: 'OS fork/exec',
+        command: 'builder.start() // python3 orders.py',
+        fields: [{ name: 'PYTHONUNBUFFERED', value: 'YES' }],
+        senderState: 'Waiting for auth handshake',
+        receiverState: 'Executing orders.py top-level code',
+      });
+
+      const s2b = b.addStep({
+        id: 'sim-step-driver-b',
+        parentId: sDriver,
+        title: 'SparkContext binds SparkEnv (:41000), ListenerBus & SparkUI (:4040), then signals AM',
+        explanation: 'Classic PySpark constructs SparkContext BEFORE SparkSession: SparkEnv binds NettyRpcEnv :41000 & BM :41001, LiveListenerBus & SparkUI :4040 start, then YarnClusterScheduler.postStartHook fulfills sparkContextPromise before SparkSession wraps SparkContext.',
+        category: 'heartbeats-metrics',
+        keyState: 'SparkContext, SparkUI :4040, and SparkSession ready; AM unblocked',
+        command: 'SparkContext.getOrCreate() -> SparkEnv -> SparkUI -> postStartHook() -> new SparkSession(sc)',
+        detailsPassed: [
+          { name: 'rpcPort', value: '41000' },
+          { name: 'uiPort', value: '4040' },
+        ],
+        deepDiveComponentId: 'spark-context',
+      });
+      b.addEvent({
+        stepId: s2b,
+        from: pyDriver,
+        to: sc,
+        categoryOverride: 'driver-python-bridge',
+        channel: 'python',
+        protocol: 'Py4J Loopback TCP',
+        port: '127.0.0.1:43122',
+        label: 'SparkContext.getOrCreate',
+        info: 'PySpark obtains/creates JVM SparkContext BEFORE wrapping it in SparkSession.',
+        size: '2.1 KB',
+        command: 'JavaSparkContext(jconf)',
+        fields: [{ name: 'order', value: 'SparkContext first, then SparkSession' }],
+        senderState: 'Awaiting JVM SparkContext',
+        receiverState: 'Initializing SparkEnv and schedulers',
+      });
+      b.addEvent({
+        stepId: s2b,
+        from: sc,
+        to: sparkEnv,
+        kind: 'local',
+        categoryOverride: 'driver-python-bridge',
+        channel: 'internal',
+        protocol: 'In-JVM SparkEnv Init',
+        port: 'driver-1 in-JVM',
+        label: 'Bind RPC :41000 & BM',
+        info: 'SparkEnv.createDriverEnv binds NettyRpcEnv on :41000 and driver BlockManager on :41001.',
+        size: 'in-memory',
+        command: 'SparkEnv.createDriverEnv(conf, false, listenerBus)',
+        fields: [
+          { name: 'rpc', value: 'driver-1:41000' },
+          { name: 'bm', value: 'driver-1:41001' },
+        ],
+        senderState: 'Driver RPC & BlockManager bound',
+        receiverState: 'All driver RpcEndpoints active',
+      });
+      b.addEvent({
+        stepId: s2b,
+        from: sc,
+        to: listenerBus,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM Observability',
+        port: 'driver-1 in-JVM',
+        label: 'Start ListenerBus + UI',
+        info: 'LiveListenerBus and Jetty SparkUI (:4040) bind before postStartHook signals AM.',
+        size: 'in-memory',
+        command: 'listenerBus.start(); SparkUI.create(Some(this), ...)',
+        fields: [{ name: 'uiUrl', value: 'http://driver-1:4040' }],
+        senderState: 'UI bound on :4040',
+        receiverState: 'Event queues running',
+      });
+      b.addEvent({
+        stepId: s2b,
+        from: sc,
+        to: sparkUi,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'Jetty Bind',
+        port: 'driver-1 in-JVM',
+        label: 'Bind SparkUI :4040',
+        info: 'SparkUI binds :4040 so AM can advertise trackingUrl to RM.',
+        size: 'in-memory',
+        command: 'ui.bind() // http://driver-1:4040',
+        fields: [{ name: 'webUrl', value: 'http://driver-1:4040' }],
+        senderState: 'UI ready',
+        receiverState: 'Serving live status store',
+      });
+      b.addEvent({
+        stepId: s2b,
+        from: sc,
+        to: am,
+        kind: 'local',
+        categoryOverride: 'yarn-lifecycle',
+        channel: 'internal',
+        protocol: 'YarnClusterScheduler.postStartHook',
+        port: 'driver-1 in-JVM',
+        label: 'Resolve scPromise',
+        info: 'postStartHook signals ApplicationMaster.sparkContextInitialized(sc), unblocking registerAM().',
+        size: 'in-memory',
+        command: 'ApplicationMaster.sparkContextInitialized(sc)',
+        fields: [{ name: 'driverPort', value: '41000' }],
+        senderState: 'Returning active SparkContext to SparkSession',
+        receiverState: 'AM unblocked for RM registration',
+      });
+      b.addEvent({
+        stepId: s2b,
+        from: sc,
+        to: session,
+        kind: 'local',
+        categoryOverride: 'driver-python-bridge',
+        channel: 'internal',
+        protocol: 'In-JVM SparkSession Wrap',
+        port: 'driver-1 in-JVM',
+        label: 'new SparkSession(sc)',
+        info: 'SparkSession wraps the live SparkContext and returns proxy handle to Python.',
+        size: 'in-memory',
+        command: 'new SparkSession(sc)',
+        fields: [{ name: 'sharedState', value: 'Bound to active SparkContext' }],
+        senderState: 'SparkContext active',
+        receiverState: 'SparkSession ready for SQL/DataFrame calls',
+      });
+    } else {
+      // Pure-JVM Cluster Mode Startup (Scala / Java): ZERO Python, ZERO Py4J, ZERO ProcessBuilder!
+      const jvmApp = b.std('jvm-user-app');
+      const sDriver = b.addStep({
+        id: 'sim-step-driver',
+        title: `AM reflects ${b.appEntryLabel}() in-JVM & initializes SparkContext (:41000)`,
+        explanation:
+          `ApplicationMaster.startUserApplication() builds MutableURLClassLoader (or ChildFirstURLClassLoader when spark.driver.userClassPathFirst=true) over localized __app__.jar, loads ${b.appMainClass}, and invokes static main(args) directly in-JVM on driver-1 (ZERO ProcessBuilder, ZERO Py4J). ${b.appEntryLabel}() calls SparkSession.builder.getOrCreate() -> SparkContext (:41000, :4040) -> YarnClusterScheduler.postStartHook() fulfills sparkContextPromise and pauses the user thread until AM registers on :8030, creates YarnAllocator, and resumes the driver thread.`,
+        category: 'driver-python-bridge',
+        keyState: `Pure-JVM Driver live on driver-1:41000 | SparkUI :4040 | 0 Python processes`,
+        command: `ApplicationMaster.startUserApplication() -> ${b.appMainClass}.main(args) -> SparkSession.builder.getOrCreate()`,
+        detailsPassed: [
+          { name: 'userClass', value: b.appMainClass },
+          { name: 'classLoader', value: 'MutableURLClassLoader (ChildFirstURLClassLoader if spark.driver.userClassPathFirst=true)' },
+          { name: 'driverRpc', value: 'driver-1:41000' },
+          { name: 'sparkUi', value: 'http://driver-1:4040' },
+        ],
+        deepDiveComponentId: 'jvm-user-app',
+        isMacro: true,
+      });
+      b.addEvent({
+        stepId: sDriver,
+        from: am,
+        to: jvmApp,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM Reflection main()',
+        port: 'driver-1 in-JVM',
+        label: b.isScala ? 'Reflect OrdersJob.main' : 'Reflect OrdersJavaJob',
+        info: `AM creates MutableURLClassLoader (or ChildFirstURLClassLoader if spark.driver.userClassPathFirst=true) over __app__.jar and invokes ${b.appMainClass}.main(args) directly in-JVM on Driver thread (ZERO ProcessBuilder, ZERO py4j-gateway).`,
+        size: 'in-memory',
+        command: `userClassLoader.loadClass("${b.appMainClass}").getMethod("main", String[].class).invoke(null, args)`,
+        fields: [
+          { name: 'classLoader', value: 'MutableURLClassLoader (ChildFirst if spark.driver.userClassPathFirst=true)' },
+          { name: 'pythonProcesses', value: '0 (pure JVM in-process launch)' },
+        ],
+        senderState: 'AM awaiting sparkContextPromise',
+        receiverState: `${b.appEntryLabel}() calling SparkSession.builder.getOrCreate()`,
+      });
+      b.addEvent({
+        stepId: sDriver,
+        from: jvmApp,
+        to: sc,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM SparkSession -> SC',
+        port: 'driver-1 in-JVM',
+        label: 'Init SparkContext :41000',
+        info: `${b.appEntryLabel}() calls SparkSession.builder.getOrCreate() -> SparkContext (:41000, SparkUI :4040); YarnClusterScheduler.postStartHook() fulfills sparkContextPromise & pauses user thread until AM registers on :8030 and creates YarnAllocator.`,
+        size: 'in-memory',
+        command: 'SparkSession.builder().getOrCreate() -> SparkContext -> postStartHook() (pause user thread)',
+        fields: [
+          { name: 'spark.driver.port', value: '41000' },
+          { name: 'spark.ui.port', value: '4040' },
+          { name: 'postStartHook', value: 'Fulfills sparkContextPromise & pauses user thread until AM resumeDriver()' },
+        ],
+        senderState: 'User Driver thread paused awaiting AM registration + resumeDriver()',
+        receiverState: 'SparkContext live; AM unblocked for RM :8030 registration',
+      });
+
+      const s2a = b.addStep({
+        id: 'sim-step-driver-a',
+        parentId: sDriver,
+        title: `AM builds MutableURLClassLoader over __app__.jar & invokes ${b.appEntryLabel}()`,
+        explanation: `ApplicationMaster.startUserApplication() loads ${b.appMainClass} via MutableURLClassLoader (or ChildFirstURLClassLoader when spark.driver.userClassPathFirst=true) and invokes static main(args) directly on the AM JVM Driver thread with ZERO ProcessBuilder and ZERO Py4J.`,
+        category: 'driver-python-bridge',
+        keyState: `Driver thread executing ${b.appEntryLabel}() directly inside AM JVM`,
+        command: `userClassLoader.loadClass("${b.appMainClass}").getMethod("main", String[].class).invoke(null, args)`,
+        detailsPassed: [
+          { name: 'classLoader', value: 'MutableURLClassLoader (or ChildFirstURLClassLoader)' },
+          { name: 'pythonOverhead', value: '0 (pure JVM)' },
+        ],
+        deepDiveComponentId: 'jvm-user-app',
+      });
+      b.addEvent({
+        stepId: s2a,
+        from: am,
+        to: jvmApp,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM ClassLoader Invoke',
+        port: 'driver-1 in-JVM',
+        label: b.isScala ? 'Invoke OrdersJob.main()' : 'Invoke OrdersJavaJob()',
+        info: `AM reflects ${b.appMainClass}.main(args) directly in-JVM on driver-1 (no subprocess, no Py4J loopback socket).`,
+        size: 'in-memory',
+        command: `mainMethod.invoke(null, userArgs) // ${b.appMainClass}`,
+        fields: [{ name: 'thread', value: 'Driver (non-daemon AM JVM thread)' }],
+        senderState: 'Waiting on sparkContextPromise (100s)',
+        receiverState: `Running ${b.appEntryLabel}() in-JVM`,
+      });
+
+      const s2b = b.addStep({
+        id: 'sim-step-driver-b',
+        parentId: sDriver,
+        title: 'SparkContext binds SparkEnv (:41000), ListenerBus & SparkUI (:4040), postStartHook pauses user thread',
+        explanation: `${b.appEntryLabel}() calls SparkSession.builder.getOrCreate() -> SparkContext.getOrCreate() (SparkSession.scala:1057-1069): SparkEnv binds NettyRpcEnv :41000 & BM :41001, LiveListenerBus & SparkUI :4040 start, then YarnClusterScheduler.postStartHook() calls ApplicationMaster.sparkContextInitialized(sc) (ApplicationMaster.scala:405-418) to fulfill sparkContextPromise and pause the user thread BEFORE new SparkSession(sc) runs.`,
+        category: 'heartbeats-metrics',
+        keyState: 'SparkContext & SparkUI :4040 bound; user thread paused before new SparkSession(sc) until AM resumeDriver()',
+        command: 'SparkSession.builder.getOrCreate() -> SparkContext.getOrCreate() -> postStartHook() (pause)',
+        detailsPassed: [
+          { name: 'rpcPort', value: '41000' },
+          { name: 'uiPort', value: '4040' },
+          { name: 'sessionOrder', value: 'new SparkSession(sc) runs ONLY AFTER AM registerAM(:8030) + createAllocator() + resumeDriver()' },
+        ],
+        deepDiveComponentId: 'spark-context',
+      });
+      b.addEvent({
+        stepId: s2b,
+        from: jvmApp,
+        to: sc,
+        kind: 'local',
+        categoryOverride: 'driver-python-bridge',
+        channel: 'internal',
+        protocol: 'In-JVM SparkSession -> SC',
+        port: 'driver-1 in-JVM',
+        label: 'SparkSession -> SC init',
+        info: `${b.appEntryLabel}() invokes SparkSession.builder.getOrCreate() -> SparkContext.getOrCreate() (SparkSession.scala:1057-1069) directly in-JVM.`,
+        size: 'in-memory',
+        command: 'SparkSession.builder().appName("Orders").getOrCreate() -> SparkContext.getOrCreate()',
+        fields: [{ name: 'api', value: `${b.langDisplay} native JVM` }],
+        senderState: 'Constructing SparkContext inside SparkSession.builder.getOrCreate()',
+        receiverState: 'Initializing SparkEnv and schedulers',
+      });
+      b.addEvent({
+        stepId: s2b,
+        from: sc,
+        to: sparkEnv,
+        kind: 'local',
+        categoryOverride: 'driver-python-bridge',
+        channel: 'internal',
+        protocol: 'In-JVM SparkEnv Init',
+        port: 'driver-1 in-JVM',
+        label: 'Bind RPC :41000 & BM',
+        info: 'SparkEnv.createDriverEnv binds NettyRpcEnv on :41000 and driver BlockManager on :41001.',
+        size: 'in-memory',
+        command: 'SparkEnv.createDriverEnv(conf, false, listenerBus)',
+        fields: [
+          { name: 'rpc', value: 'driver-1:41000' },
+          { name: 'bm', value: 'driver-1:41001' },
+        ],
+        senderState: 'Driver RPC & BlockManager bound',
+        receiverState: 'All driver RpcEndpoints active',
+      });
+      b.addEvent({
+        stepId: s2b,
+        from: sc,
+        to: listenerBus,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM Observability',
+        port: 'driver-1 in-JVM',
+        label: 'Start ListenerBus + UI',
+        info: 'LiveListenerBus and Jetty SparkUI (:4040) bind before postStartHook signals AM.',
+        size: 'in-memory',
+        command: 'listenerBus.start(); SparkUI.create(Some(this), ...)',
+        fields: [{ name: 'uiUrl', value: 'http://driver-1:4040' }],
+        senderState: 'UI bound on :4040',
+        receiverState: 'Event queues running',
+      });
+      b.addEvent({
+        stepId: s2b,
+        from: sc,
+        to: sparkUi,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'Jetty Bind',
+        port: 'driver-1 in-JVM',
+        label: 'Bind SparkUI :4040',
+        info: 'SparkUI binds :4040 so AM can advertise trackingUrl to RM.',
+        size: 'in-memory',
+        command: 'ui.bind() // http://driver-1:4040',
+        fields: [{ name: 'webUrl', value: 'http://driver-1:4040' }],
+        senderState: 'UI ready',
+        receiverState: 'Serving live status store',
+      });
+      b.addEvent({
+        stepId: s2b,
+        from: sc,
+        to: am,
+        kind: 'local',
+        categoryOverride: 'yarn-lifecycle',
+        channel: 'internal',
+        protocol: 'YarnClusterScheduler.postStartHook',
+        port: 'driver-1 in-JVM',
+        label: 'postStartHook (pause)',
+        info: 'postStartHook calls ApplicationMaster.sparkContextInitialized(sc) (ApplicationMaster.scala:405-418), fulfilling sparkContextPromise AND pausing the user Driver thread inside SparkContext.getOrCreate() BEFORE new SparkSession(sc) is constructed.',
+        size: 'in-memory',
+        command: 'ApplicationMaster.sparkContextInitialized(sc) // sparkContextPromise.wait()',
+        fields: [
+          { name: 'driverPort', value: '41000' },
+          { name: 'userThreadState', value: 'Paused until AM registerAM(:8030) + createAllocator() + resumeDriver()' },
+        ],
+        senderState: 'User Driver thread paused before new SparkSession(sc)',
+        receiverState: 'AM unblocked for RM :8030 registration',
+      });
+    }
   } else {
     // CLIENT MODE STARTUP: Driver boots on edge-01 BEFORE YARN AM
     const sc = b.std('spark-context');
     const yarnBackend = b.std('yarn-scheduler-backend');
-    const sClientBoot = b.addStep({
-      id: 'sim-step-client-boot',
-      title: 'Client driver starts on edge-01:41000 BEFORE YARN submits AM',
-      explanation:
-        'In client mode, spark-submit runs PythonRunner and orders.py directly on edge-01. SparkContext binds edge-01:41000 first, then YarnClientSchedulerBackend submits ExecutorLauncher (--arg edge-01:41000) to RM :8032.',
-      category: 'driver-python-bridge',
-      keyState: 'Driver live on edge-01:41000 | Client-mode AM ExecutorLauncher launched',
-      command: `spark-submit --master yarn --deploy-mode client --num-executors ${cfg.numExecutors} orders.py`,
-      detailsPassed: [
-        { name: 'driverHost', value: 'edge-01 (external submit host)' },
-        { name: 'driverRpcPort', value: '41000' },
-        { name: 'amMainClass', value: 'ExecutorLauncher --arg edge-01:41000' },
-      ],
-      deepDiveComponentId: 'yarn-scheduler-backend',
-    });
-    b.addEvent({
-      stepId: sClientBoot,
-      from: submit,
-      to: pyDriver,
-      kind: 'local',
-      channel: 'python',
-      protocol: 'ProcessBuilder (edge-01)',
-      port: 'edge-01 OS',
-      label: 'Run orders.py locally',
-      info: 'spark-submit starts local PythonRunner and orders.py on edge-01.',
-      size: 'OS fork/exec',
-      command: 'PythonRunner.main(Array("orders.py", ""))',
-      fields: [{ name: 'PYSPARK_GATEWAY_PORT', value: '44108' }],
-      senderState: 'Hosting driver JVM on edge-01',
-      receiverState: 'Creating local SparkContext',
-    });
-    b.addEvent({
-      stepId: sClientBoot,
-      from: pyDriver,
-      to: sc,
-      channel: 'python',
-      protocol: 'Py4J Loopback TCP',
-      port: '127.0.0.1:44108',
-      label: 'Bind edge-01:41000',
-      info: 'SparkContext binds NettyRpcEnv on edge-01:41000 before contacting YARN.',
-      size: '2.0 KB',
-      command: 'SparkContext.getOrCreate(conf) // spark.driver.host=edge-01',
-      fields: [{ name: 'advertised', value: 'edge-01:41000' }],
-      senderState: 'Awaiting YARN application RUNNING',
-      receiverState: 'Starting YarnClientSchedulerBackend',
-    });
-    b.addEvent({
-      stepId: sClientBoot,
-      from: yarnBackend,
-      to: yClient,
-      kind: 'local',
-      channel: 'internal',
-      protocol: 'In-JVM yarn.Client',
-      port: 'edge-01 in-JVM',
-      label: 'Submit ExecutorLauncher',
-      info: 'YarnClientSchedulerBackend passes --arg edge-01:41000 to yarn.Client.',
-      size: 'in-memory',
-      command: 'new Client(Array("--arg", "edge-01:41000"), conf).submitApplication()',
-      fields: [{ name: 'arg0', value: 'edge-01:41000' }],
-      senderState: 'Waiting in waitForApplication()',
-      receiverState: 'Submitting lightweight AM to RM :8032',
-    });
-    b.addEvent({
-      stepId: sClientBoot,
-      from: yClient,
-      to: rm,
-      channel: 'yarn',
-      protocol: 'Hadoop RPC (ApplicationClientProtocol)',
-      port: 'rm01:8032',
-      label: 'submitApplication(AM)',
-      info: 'RM accepts ExecutorLauncher AM and boots it on a cluster container.',
-      size: '13.2 KB',
-      command: 'yarnClient.submitApplication(appContext[ExecutorLauncher])',
-      fields: [{ name: 'amClass', value: 'ExecutorLauncher' }],
-      senderState: 'Monitoring RM app state',
-      receiverState: 'Launching AM container',
-    });
-    b.addEvent({
-      stepId: sClientBoot,
-      from: rm,
-      to: am,
-      channel: 'yarn',
-      protocol: 'Hadoop RPC (AM Launch)',
-      port: 'driver-1:dynamic',
-      label: 'Boot ExecutorLauncher',
-      info: 'RM launches lightweight AM (ExecutorLauncher) without the user Python driver.',
-      size: '14.0 KB',
-      command: 'ApplicationMaster.runExecutorLauncher()',
-      fields: [{ name: 'driverArg', value: 'edge-01:41000' }],
-      senderState: 'AM container started',
-      receiverState: 'AM registering port=-1, creating YarnAllocator, then dialing edge-01:41000',
-    });
+    if (b.isPySpark) {
+      const pyDriver = b.std('python-driver');
+      const sClientBoot = b.addStep({
+        id: 'sim-step-client-boot',
+        title: 'Client driver starts on edge-01:41000 BEFORE YARN submits AM',
+        explanation:
+          'In client mode, spark-submit runs PythonRunner and orders.py directly on edge-01. SparkContext binds edge-01:41000 first, then YarnClientSchedulerBackend submits ExecutorLauncher (--arg edge-01:41000) to RM :8032.',
+        category: 'driver-python-bridge',
+        keyState: 'Driver live on edge-01:41000 | Client-mode AM ExecutorLauncher launched',
+        command: `spark-submit --master yarn --deploy-mode client --num-executors ${cfg.numExecutors} orders.py`,
+        detailsPassed: [
+          { name: 'driverHost', value: 'edge-01 (external submit host)' },
+          { name: 'driverRpcPort', value: '41000' },
+          { name: 'amMainClass', value: 'ExecutorLauncher --arg edge-01:41000' },
+        ],
+        deepDiveComponentId: 'yarn-scheduler-backend',
+      });
+      b.addEvent({
+        stepId: sClientBoot,
+        from: submit,
+        to: pyDriver,
+        kind: 'local',
+        channel: 'python',
+        protocol: 'ProcessBuilder (edge-01)',
+        port: 'edge-01 OS',
+        label: 'Run orders.py locally',
+        info: 'spark-submit starts local PythonRunner and orders.py on edge-01.',
+        size: 'OS fork/exec',
+        command: 'PythonRunner.main(Array("orders.py", ""))',
+        fields: [{ name: 'PYSPARK_GATEWAY_PORT', value: '44108' }],
+        senderState: 'Hosting driver JVM on edge-01',
+        receiverState: 'Creating local SparkContext',
+      });
+      b.addEvent({
+        stepId: sClientBoot,
+        from: pyDriver,
+        to: sc,
+        channel: 'python',
+        protocol: 'Py4J Loopback TCP',
+        port: '127.0.0.1:44108',
+        label: 'Bind edge-01:41000',
+        info: 'SparkContext binds NettyRpcEnv on edge-01:41000 before contacting YARN.',
+        size: '2.0 KB',
+        command: 'SparkContext.getOrCreate(conf) // spark.driver.host=edge-01',
+        fields: [{ name: 'advertised', value: 'edge-01:41000' }],
+        senderState: 'Awaiting YARN application RUNNING',
+        receiverState: 'Starting YarnClientSchedulerBackend',
+      });
+      b.addEvent({
+        stepId: sClientBoot,
+        from: yarnBackend,
+        to: yClient,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM yarn.Client',
+        port: 'edge-01 in-JVM',
+        label: 'Submit ExecutorLauncher',
+        info: 'YarnClientSchedulerBackend passes --arg edge-01:41000 to yarn.Client.',
+        size: 'in-memory',
+        command: 'new Client(Array("--arg", "edge-01:41000"), conf).submitApplication()',
+        fields: [{ name: 'arg0', value: 'edge-01:41000' }],
+        senderState: 'Waiting in waitForApplication()',
+        receiverState: 'Submitting lightweight AM to RM :8032',
+      });
+      b.addEvent({
+        stepId: sClientBoot,
+        from: yClient,
+        to: rm,
+        channel: 'yarn',
+        protocol: 'Hadoop RPC (ApplicationClientProtocol)',
+        port: 'rm01:8032',
+        label: 'submitApplication(AM)',
+        info: 'RM accepts ExecutorLauncher AM and boots it on a cluster container.',
+        size: '13.2 KB',
+        command: 'yarnClient.submitApplication(appContext[ExecutorLauncher])',
+        fields: [{ name: 'amClass', value: 'ExecutorLauncher' }],
+        senderState: 'Monitoring RM app state',
+        receiverState: 'Launching AM container',
+      });
+      b.addEvent({
+        stepId: sClientBoot,
+        from: rm,
+        to: am,
+        channel: 'yarn',
+        protocol: 'Hadoop RPC (AM Launch)',
+        port: 'driver-1:dynamic',
+        label: 'Boot ExecutorLauncher',
+        info: 'RM launches lightweight AM (ExecutorLauncher) without the user Python driver.',
+        size: '14.0 KB',
+        command: 'ApplicationMaster.runExecutorLauncher()',
+        fields: [{ name: 'driverArg', value: 'edge-01:41000' }],
+        senderState: 'AM container started',
+        receiverState: 'AM registering port=-1, creating YarnAllocator, then dialing edge-01:41000',
+      });
+    } else {
+      // Pure-JVM Client Mode Startup (Scala / Java): JavaMainApplication.start() on edge-01 in-JVM
+      const jvmApp = b.std('jvm-user-app');
+      const sClientBoot = b.addStep({
+        id: 'sim-step-client-boot',
+        title: `Client ${b.langDisplay} driver starts on edge-01:41000 BEFORE YARN submits AM`,
+        explanation:
+          `In client mode, spark-submit invokes JavaMainApplication.start() directly in-JVM on edge-01 (ZERO PythonRunner, ZERO Py4J), calling ${b.appMainClass}.main(). SparkSession/SparkContext binds edge-01:41000 first, then YarnClientSchedulerBackend submits lightweight ExecutorLauncher AM (--arg edge-01:41000) to RM :8032.`,
+        category: 'driver-python-bridge',
+        keyState: `Pure-JVM client driver live on edge-01:41000 | ExecutorLauncher AM launched`,
+        command: b.submitCommand(),
+        detailsPassed: [
+          { name: 'language', value: b.langDisplay },
+          { name: 'clientLauncher', value: `JavaMainApplication.start() -> ${b.appMainClass}.main()` },
+          { name: 'driverHost', value: 'edge-01 (external submit host)' },
+          { name: 'amMainClass', value: 'ExecutorLauncher --arg edge-01:41000' },
+        ],
+        deepDiveComponentId: 'yarn-scheduler-backend',
+      });
+      b.addEvent({
+        stepId: sClientBoot,
+        from: submit,
+        to: jvmApp,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM JavaMainApplication',
+        port: 'edge-01 in-JVM',
+        label: b.isScala ? 'JavaMainApp -> OrdersJob' : 'JavaMainApp -> JavaJob',
+        info: `spark-submit invokes JavaMainApplication.start() directly in-JVM on edge-01 -> ${b.appMainClass}.main() (ZERO python-driver, ZERO py4j-gateway).`,
+        size: 'in-memory',
+        command: `JavaMainApplication.start(args, sparkConf) -> ${b.appMainClass}.main(args)`,
+        fields: [
+          { name: 'userClass', value: b.appMainClass },
+          { name: 'pythonProcesses', value: '0' },
+        ],
+        senderState: 'Hosting pure-JVM client driver on edge-01',
+        receiverState: 'Creating local SparkSession / SparkContext',
+      });
+      b.addEvent({
+        stepId: sClientBoot,
+        from: jvmApp,
+        to: sc,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM SparkSession -> SC',
+        port: 'edge-01 in-JVM',
+        label: 'Bind edge-01:41000',
+        info: `${b.appEntryLabel}() creates SparkSession/SparkContext in-JVM, binding NettyRpcEnv on edge-01:41000 before contacting YARN.`,
+        size: 'in-memory',
+        command: 'SparkSession.builder().getOrCreate() // spark.driver.host=edge-01',
+        fields: [{ name: 'advertised', value: 'edge-01:41000' }],
+        senderState: 'Awaiting YARN application RUNNING',
+        receiverState: 'Starting YarnClientSchedulerBackend',
+      });
+      b.addEvent({
+        stepId: sClientBoot,
+        from: yarnBackend,
+        to: yClient,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM yarn.Client',
+        port: 'edge-01 in-JVM',
+        label: 'Submit ExecutorLauncher',
+        info: 'YarnClientSchedulerBackend passes --arg edge-01:41000 to yarn.Client.',
+        size: 'in-memory',
+        command: 'new Client(Array("--arg", "edge-01:41000"), conf).submitApplication()',
+        fields: [{ name: 'arg0', value: 'edge-01:41000' }],
+        senderState: 'Waiting in waitForApplication()',
+        receiverState: 'Submitting lightweight AM to RM :8032',
+      });
+      b.addEvent({
+        stepId: sClientBoot,
+        from: yClient,
+        to: rm,
+        channel: 'yarn',
+        protocol: 'Hadoop RPC (ApplicationClientProtocol)',
+        port: 'rm01:8032',
+        label: 'submitApplication(AM)',
+        info: 'RM accepts ExecutorLauncher AM and boots it on a cluster container.',
+        size: '13.2 KB',
+        command: 'yarnClient.submitApplication(appContext[ExecutorLauncher])',
+        fields: [{ name: 'amClass', value: 'ExecutorLauncher' }],
+        senderState: 'Monitoring RM app state',
+        receiverState: 'Launching AM container',
+      });
+      b.addEvent({
+        stepId: sClientBoot,
+        from: rm,
+        to: am,
+        channel: 'yarn',
+        protocol: 'Hadoop RPC (AM Launch)',
+        port: 'driver-1:dynamic',
+        label: 'Boot ExecutorLauncher',
+        info: `RM launches lightweight AM (ExecutorLauncher) without the user ${b.langDisplay} driver.`,
+        size: '14.0 KB',
+        command: 'ApplicationMaster.runExecutorLauncher()',
+        fields: [{ name: 'driverArg', value: 'edge-01:41000' }],
+        senderState: 'AM container started',
+        receiverState: 'AM registering port=-1, creating YarnAllocator, then dialing edge-01:41000',
+      });
+    }
   }
 
   // =========================================================================
@@ -1427,6 +1970,87 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       senderState: 'Linked to external client driver',
       receiverState: 'Driver stored AM endpoint reference',
     });
+    if (b.isJava) {
+      const jvmApp = b.std('jvm-user-app');
+      const sc = b.std('spark-context');
+      b.addEvent({
+        stepId: s3a,
+        from: jvmApp,
+        to: sc,
+        kind: 'local',
+        categoryOverride: 'driver-python-bridge',
+        channel: 'internal',
+        protocol: 'In-JVM JavaSparkContext Wrap',
+        port: 'edge-01 in-JVM',
+        label: 'JavaSparkContext.fromSC',
+        info: 'AFTER AM registers on :8030 and waitForApplication() returns, OrdersJavaJob.main() optionally wraps the SAME single SparkContext via JavaSparkContext.fromSparkContext(spark.sparkContext()) (zero duplicate SparkContext or SparkEnv).',
+        size: 'in-memory',
+        command: 'JavaSparkContext jsc = JavaSparkContext.fromSparkContext(spark.sparkContext())',
+        fields: [{ name: 'singleContextRule', value: 'Wraps existing SparkContext AFTER AM registration' }],
+        senderState: 'Java RDD adapter wrapping active SparkContext',
+        receiverState: 'Single SparkContext shared across SparkSession & JavaSparkContext',
+      });
+    }
+  } else if (b.isJvmApp) {
+    const jvmApp = b.std('jvm-user-app');
+    const sc = b.std('spark-context');
+    const session = b.std('spark-session');
+    b.addEvent({
+      stepId: s3a,
+      from: am,
+      to: jvmApp,
+      kind: 'local',
+      categoryOverride: 'yarn-lifecycle',
+      channel: 'internal',
+      protocol: 'In-JVM AM.resumeDriver',
+      port: 'driver-1 in-JVM',
+      label: 'resumeDriver() unblocks',
+      info: `After registering with RM :8030 and creating YarnAllocator, AM calls resumeDriver() (ApplicationMaster.scala:405-418, sparkContextPromise.notify()) to unblock the user thread inside SparkContext.getOrCreate() for ${b.appEntryLabel}().`,
+      size: 'in-memory',
+      command: 'ApplicationMaster.resumeDriver() // sparkContextPromise.notify()',
+      fields: [{ name: 'order', value: 'registerAM(:8030) -> createAllocator() -> resumeDriver()' }],
+      senderState: 'Resumed user Driver thread',
+      receiverState: 'SparkContext.getOrCreate() returning to SparkSession.builder.getOrCreate()',
+    });
+    b.addEvent({
+      stepId: s3a,
+      from: sc,
+      to: session,
+      kind: 'local',
+      categoryOverride: 'driver-python-bridge',
+      channel: 'internal',
+      protocol: 'In-JVM SparkSession Wrap',
+      port: 'driver-1 in-JVM',
+      label: 'new SparkSession(sc)',
+      info: `ONLY AFTER AM.resumeDriver() unblocks the user thread does SparkSession.builder.getOrCreate() construct new SparkSession(sc) (SparkSession.scala:1057-1069) and return it to ${b.appEntryLabel}().`,
+      size: 'in-memory',
+      command: 'new SparkSession(sc) // SparkSession.scala:1057-1069 (after AM.resumeDriver())',
+      fields: [
+        { name: 'sharedState', value: 'Bound to active SparkContext after resumeDriver()' },
+        { name: 'order', value: 'registerAM(:8030) -> createAllocator() -> resumeDriver() -> new SparkSession(sc)' },
+      ],
+      senderState: 'SparkContext active; user thread resumed',
+      receiverState: `SparkSession returned to ${b.appEntryLabel}()`,
+    });
+    if (b.isJava) {
+      b.addEvent({
+        stepId: s3a,
+        from: jvmApp,
+        to: sc,
+        kind: 'local',
+        categoryOverride: 'driver-python-bridge',
+        channel: 'internal',
+        protocol: 'In-JVM JavaSparkContext Wrap',
+        port: 'driver-1 in-JVM',
+        label: 'JavaSparkContext.fromSC',
+        info: 'AFTER AM registers on :8030, calls resumeDriver(), and new SparkSession(sc) returns, OrdersJavaJob.main() optionally wraps the SAME single SparkContext via JavaSparkContext.fromSparkContext(spark.sparkContext()) (NEVER before AM registration; zero duplicate SparkContext).',
+        size: 'in-memory',
+        command: 'JavaSparkContext jsc = JavaSparkContext.fromSparkContext(spark.sparkContext())',
+        fields: [{ name: 'singleContextRule', value: 'Wraps existing SparkContext AFTER AM registration, resumeDriver() & new SparkSession(sc)' }],
+        senderState: 'Java RDD adapter wrapping active SparkContext',
+        receiverState: 'Single SparkContext shared across SparkSession & JavaSparkContext',
+      });
+    }
   }
   b.addEvent({
     stepId: s3a,
@@ -1635,15 +2259,16 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     });
     const sCrash = b.addStep({
       id: 'sim-step-am-crash',
-      title: 'Cluster AM Attempt 1 SIGKILL (137); YARN spawns Attempt 2 rerunning orders.py',
+      title: `Cluster AM Attempt 1 SIGKILL (137); YARN spawns Attempt 2 rerunning ${b.appEntryLabel}`,
       explanation:
-        'AM Attempt 1 container dies with SIGKILL (exit 137) before reporting SUCCEEDED. SIGKILL terminates the AM JVM immediately with ZERO JVM shutdown hooks; driver-1 NodeManager reports ContainerStatus(exitStatus=137) to RM on :8031. Because the SIGKILLed Attempt 1 AM JVM never ran its ShutdownHookManager cleanup hook (and YARN RM never deletes Spark user-owned .sparkStaging/<appId>), staged archives remain intact on HDFS while RM cleans up Attempt 1 executor containers and launches AM Attempt 2 (container_e02_000001) via driver-1 NodeManager (am-nm). The fresh driver reruns orders.py from line 1.',
+        `AM Attempt 1 container dies with SIGKILL (exit 137) before reporting SUCCEEDED. SIGKILL terminates the AM JVM immediately with ZERO JVM shutdown hooks; driver-1 NodeManager reports ContainerStatus(exitStatus=137) to RM on :8031. Because the SIGKILLed Attempt 1 AM JVM never ran its ShutdownHookManager cleanup hook (and YARN RM never deletes Spark user-owned .sparkStaging/<appId>), staged archives remain intact on HDFS while RM cleans up Attempt 1 executor containers and launches AM Attempt 2 (container_e02_000001) via driver-1 NodeManager (am-nm). The fresh driver reruns ${b.appEntryLabel} from ${b.isPySpark ? 'line 1' : 'its JVM main() entry point (zero Python processes)'}.`,
       category: 'yarn-lifecycle',
       keyState: 'Attempt 1 LOST (NM->RM :8031 exit 137) -> Attempt 2 launched via am-nm (fresh driver)',
       command: 'NM nodeHeartbeat(container_e01_000001, exitStatus=137) -> RM AMLauncher -> am-nm startContainers(container_e02_000001)',
       detailsPassed: [
         { name: 'failedAttempt', value: 'appattempt_1740_0051_000001 (SIGKILL 137; 0 JVM shutdown hooks)' },
         { name: 'newAttempt', value: 'appattempt_1740_0051_000002 (container_e02_000001 via am-nm)' },
+        { name: 'reEntryPoint', value: b.appEntryLabel },
         {
           name: 'stagingDirIntact',
           value: '.sparkStaging/<appId> remains on HDFS because SIGKILLed Attempt 1 AM never ran its ShutdownHookManager cleanup hook',
@@ -1700,15 +2325,16 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'ContainerExecutor + cgroups',
       port: 'driver-1 OS',
       label: 'Launch AM Attempt 2',
-      info: 'driver-1 NodeManager (am-nm) launches container_e02_000001 OS process on driver-1 and boots Attempt 2 ApplicationMaster JVM rerunning orders.py from line 1.',
+      info: `driver-1 NodeManager (am-nm) launches container_e02_000001 OS process on driver-1 and boots Attempt 2 ApplicationMaster JVM rerunning ${b.appEntryLabel} from ${b.isPySpark ? 'line 1' : 'entry point (zero Python processes)'}.`,
       size: 'OS exec',
-      command: 'ContainerExecutor.launchContainer(container_e02_000001) -> ApplicationMaster.main()',
+      command: `ContainerExecutor.launchContainer(container_e02_000001) -> ApplicationMaster.main() -> ${b.appEntryLabel}`,
       fields: [
         { name: 'containerId', value: 'container_e02_000001' },
         { name: 'attemptNumber', value: '2' },
+        { name: 'entryPoint', value: b.appEntryLabel },
       ],
       senderState: 'Monitoring AM Attempt 2 container_e02_000001',
-      receiverState: 'New AM Attempt 2 JVM starting orders.py from line 1',
+      receiverState: `New AM Attempt 2 JVM starting ${b.appEntryLabel}`,
     });
     b.addEvent({
       stepId: sCrash,
@@ -1718,11 +2344,11 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'Hadoop RPC (ApplicationMasterProtocol)',
       port: 'rm01:8030',
       label: 'Register AM Attempt 2',
-      info: 'Attempt 2 re-initializes SparkContext, registers with RM on :8030, instantiates Attempt-2 YarnAllocator, and acquires fresh executors.',
+      info: `Attempt 2 re-initializes SparkContext inside ${b.appEntryLabel}, registers with RM on :8030, instantiates Attempt-2 YarnAllocator, and acquires fresh executors.`,
       size: '1.6 KB',
       command: 'amClient.register("driver-1", 41000, conf, "http://driver-1:4040")',
       fields: [{ name: 'attempt', value: '2 (fresh SparkContext & YarnAllocator)' }],
-      senderState: 'Re-executing orders.py from entry point',
+      senderState: `Re-executing ${b.appEntryLabel} from entry point`,
       receiverState: 'RM marks Attempt 2 RUNNING',
     });
     activeAm = am2;
@@ -1849,7 +2475,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       id: 'sim-step-client-disc',
       title: 'External driver on edge-01 dies; AM detects onDisconnected',
       explanation:
-        'The submit-host driver disappears without sending Shutdown(code). Client-mode AMEndpoint.onDisconnected() fires on the client-outbound RPC channel: with default spark.yarn.am.clientModeTreatDisconnectAsFailed=false it reports SUCCEEDED (EXIT_SUCCESS=0); with =true it reports FAILED (EXIT_DISCONNECTED=17). YARN cannot recreate the external Python driver.',
+        `The submit-host driver disappears without sending Shutdown(code). Client-mode AMEndpoint.onDisconnected() fires on the client-outbound RPC channel: with default spark.yarn.am.clientModeTreatDisconnectAsFailed=false it reports SUCCEEDED (EXIT_SUCCESS=0); with =true it reports FAILED (EXIT_DISCONNECTED=17). YARN cannot recreate the external ${b.langDisplay} driver.`,
       category: 'yarn-lifecycle',
       keyState: 'Client driver lost | EXIT_DISCONNECTED=17 (if strict) or SUCCEEDED/0 (default)',
       command: 'AMEndpoint.onDisconnected(edge-01:41000) -> finish(FAILED, EXIT_DISCONNECTED=17)',
@@ -1935,7 +2561,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
   tryInjectPreWorkloadFault(b, state);
 
   // =========================================================================
-  // WORKLOAD EXECUTION STEPS (ALL 7 JOB TYPES)
+  // WORKLOAD EXECUTION STEPS (ALL 8 JOB TYPES)
   // =========================================================================
   const producerExec = state.liveExecs[0];
   const producerBm = state.liveBms[0];
@@ -1944,6 +2570,10 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
   const producerBmPort = b.instanceHostLabel(producerBm);
   const isSpillOom = cfg.fault === 'task-spill-oom';
   const isTaskResultLost = cfg.fault === 'task-result-lost';
+  const isMidExecTaskAbort =
+    cfg.fault === 'task-exception' ||
+    cfg.fault === 'scala-java-udf-exception' ||
+    cfg.fault === 'delegation-token-expired';
   let taskResultLostHandled = false;
   const targetScale =
     cfg.dynamicAllocation && cfg.numPartitions > totalSlots
@@ -2117,6 +2747,11 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     state.abortedByFault = true;
     const tsm = b.std('task-set-manager');
     const dag = b.std('dag-scheduler');
+    const excName = b.isPySpark
+      ? 'Python/SQL ValueError'
+      : b.isScala
+        ? 'Scala/SQL IllegalArgumentException'
+        : 'Java/SQL IllegalArgumentException';
     const sTaskFail = b.addStep({
       id: 'sim-step-task-exception',
       title: `Partition ${targetPart} fails 4 deterministic attempts -> TaskSetManager aborts job`,
@@ -2138,9 +2773,9 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'Spark Netty RPC (StatusUpdate)',
       port: b.driverRpc,
       label: `Task p=${targetPart} FAIL (4/4)`,
-      info: `Attempt 3 for partition ${targetPart} raises deterministic Python/SQL ValueError; numFailures(${targetPart}) reaches 4.`,
+      info: `Attempt 3 for partition ${targetPart} raises deterministic ${excName}; numFailures(${targetPart}) reaches 4.`,
       size: '2.4 KB stack',
-      command: `StatusUpdate(taskId=${40 + targetPart}, FAILED, ExceptionFailure("ValueError: bad record"))`,
+      command: `StatusUpdate(taskId=${40 + targetPart}, FAILED, ExceptionFailure("${excName}: bad record"))`,
       fields: [
         { name: 'partitionIndex', value: String(targetPart) },
         { name: 'numFailures', value: '4 / 4 (exhausted)' },
@@ -2159,7 +2794,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       protocol: 'In-JVM TaskSetFailed',
       port: `${b.driverHost} in-JVM`,
       label: 'abortStage -> JobFailed',
-      info: 'TaskSetManager aborts the TaskSet and DAGScheduler fails the active job back to orders.py.',
+      info: `TaskSetManager aborts the TaskSet and DAGScheduler fails the active job back to ${b.appEntryLabel}.`,
       size: 'in-memory',
       command: `dagScheduler.taskSetFailed(taskSet, "Task ${targetPart} failed 4 times")`,
       fields: [{ name: 'jobOutcome', value: 'JobFailed(SparkException)' }],
@@ -2168,23 +2803,98 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       isError: true,
     });
     emitTerminalAppOutcome(b, state, {
-      origin: 'user-python-app',
+      origin: 'user-app-failure',
       diagnostic: `Job aborted due to stage failure: Task ${targetPart} failed 4 times (spark.task.maxFailures=4)`,
       stopLiveExecutors: true,
     });
   };
 
-  if (!state.abortedByFault && cfg.jobType === 'narrow-filter') {
+  const emitMidExecTaskAbort = (stageLabel: string, failingExec: string) => {
+    if (cfg.fault === 'task-exception') {
+      emitTaskExceptionStep(stageLabel, failingExec);
+    } else if (cfg.fault === 'scala-java-udf-exception') {
+      injectScalaJavaUdfExceptionStep(b, state, stageLabel, failingExec);
+    } else if (cfg.fault === 'delegation-token-expired') {
+      injectDelegationTokenExpiredStep(b, state, stageLabel, failingExec);
+    }
+  };
+
+  if (!state.abortedByFault && cfg.fault === 'kryo-unregistered-class') {
+    const sc = b.std('spark-context');
+    const dag = b.std('dag-scheduler');
+    const sKryoSubmit = b.addStep({
+      id: 'sim-step-kryo-rdd-submit',
+      title: `Submit JVM Pair-RDD shuffle (rdd.reduceByKey / ShuffledRDD[K, OrderEvent]): ${cfg.numPartitions} map tasks`,
+      explanation: `${b.isPySpark ? 'Alongside the PySpark job, the driver invokes an auxiliary JVM-side Pair-RDD helper executing rdd.reduceByKey (ShuffledRDD[K, OrderEvent])' : `${b.appEntryLabel}() executes a JVM Pair-RDD shuffle (rdd.reduceByKey / ShuffledRDD[K, OrderEvent])`} with spark.serializer=org.apache.spark.serializer.KryoSerializer and spark.kryo.registrationRequired=true. SQL ShuffleExchangeExec (ShuffleExchangeExec.scala:219-265) explicitly uses UnsafeRowSerializer regardless of spark.serializer, and task closures always use JavaSerializer; this Pair-RDD ShuffleDependency uses KryoSerializer for com.acme.OrderEvent values.`,
+      category: 'sql-planning-aqe',
+      keyState: `Pair-RDD ShuffleMapStage 0 submitted (${cfg.numPartitions} map tasks; KryoSerializer on ShuffledRDD[K, OrderEvent])`,
+      command: 'rdd.reduceByKey(_ + _) -> ShuffledRDD[K, OrderEvent] -> DAGScheduler.submitStage(ShuffleMapStage 0)',
+      detailsPassed: [
+        { name: 'rddPath', value: 'JVM Pair-RDD shuffle: rdd.reduceByKey / ShuffledRDD[K, OrderEvent]' },
+        { name: 'sqlShuffleDistinction', value: 'SQL ShuffleExchangeExec (ShuffleExchangeExec.scala:219-265) uses UnsafeRowSerializer, NEVER KryoSerializer' },
+        { name: 'closureSerializer', value: 'SparkEnv.closureSerializer (always JavaSerializer)' },
+        ...(b.isPySpark
+          ? [{ name: 'pysparkPath', value: 'Auxiliary JVM-side Pair-RDD helper executed alongside the PySpark job' }]
+          : []),
+      ],
+      deepDiveComponentId: 'serializer-manager',
+    });
+    b.addEvent({
+      stepId: sKryoSubmit,
+      from: sc,
+      to: dag,
+      kind: 'local',
+      channel: 'internal',
+      protocol: 'In-JVM Pair-RDD Shuffle',
+      port: `${b.driverHost} in-JVM`,
+      label: 'Submit ShuffledRDD (Kryo)',
+      info: `${b.isPySpark ? 'Auxiliary JVM Pair-RDD helper submits' : 'Driver submits'} ShuffleMapStage 0 for rdd.reduceByKey / ShuffledRDD[K, OrderEvent] using KryoSerializer (SQL ShuffleExchangeExec uses UnsafeRowSerializer, not Kryo).`,
+      size: 'in-memory',
+      command: 'DAGScheduler.submitStage(ShuffleMapStage 0[ShuffledRDD[K, OrderEvent]])',
+      fields: [
+        { name: 'serializer', value: 'KryoSerializer (registrationRequired=true)' },
+        { name: 'sqlShuffleNote', value: 'SQL ShuffleExchangeExec explicitly uses UnsafeRowSerializer' },
+      ],
+      senderState: 'Pair-RDD ShuffleDependency created',
+      receiverState: 'Submitting ShuffleMapStage 0 tasks',
+    });
+    b.addEvent({
+      stepId: sKryoSubmit,
+      from: state.schedBackend,
+      to: producerExec,
+      channel: 'rpc',
+      protocol: 'Spark Netty RPC',
+      port: b.driverRpc,
+      label: `LaunchTask (${cfg.numPartitions} maps)`,
+      info: `Driver dispatches ShuffleMapTask wave for ShuffledRDD[K, OrderEvent] (task closures serialized cleanly via JavaSerializer).`,
+      size: '2.2 KB',
+      command: `executorEndpoint.send(LaunchTask(ShuffleMapTask[ShuffledRDD[K, OrderEvent]]))`,
+      fields: [
+        { name: 'partitions', value: String(cfg.numPartitions) },
+        { name: 'closureSerializer', value: 'JavaSerializer (unaffected by registrationRequired)' },
+      ],
+      senderState: 'Pair-RDD ShuffleMapTasks dispatched',
+      receiverState: 'Serializing com.acme.OrderEvent via Executor SerializerManager',
+    });
+    if (willScaleUp) {
+      emitDynamicAllocationScaleUp();
+    }
+    injectKryoUnregisteredClassStep(
+      b,
+      state,
+      'JVM Pair-RDD ShuffleMapStage (rdd.reduceByKey / ShuffledRDD[K, OrderEvent])',
+      producerExec,
+    );
+  } else if (!state.abortedByFault && cfg.jobType === 'narrow-filter') {
     const sqlPlanner = b.std('sql-planner');
     const dag = b.std('dag-scheduler');
-    const isTaskFail = cfg.fault === 'task-exception';
     const sNarrow = b.addStep({
       id: 'sim-step-narrow',
       title: `Narrow Filter Stage: ${cfg.numPartitions} tasks across ${cfg.numExecutors} exec(s) (0 shuffles)`,
       explanation: `Catalyst pushes status='PAID' down to Parquet scan. DAGScheduler creates ONE ResultStage (0 shuffles) with ${cfg.numPartitions} tasks (~${idealWavesPerStage} ideal wave(s) across ${totalSlots} initial slots).`,
       category: 'sql-planning-aqe',
-      keyState: isTaskFail
-        ? `ResultStage 0 submitted (${cfg.numPartitions} tasks); partition ${targetPart} hits corrupt record`
+      keyState: isMidExecTaskAbort
+        ? `ResultStage 0 submitted (${cfg.numPartitions} tasks); executor encounters mid-stage failure`
         : `1 ResultStage | 0 ShuffleDependencies | ${cfg.numPartitions} tasks (~${idealWavesPerStage} ideal waves)`,
       command: job.actionSink,
       detailsPassed: [
@@ -2237,8 +2947,8 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     if (isSpillOom) {
       injectTaskSpillOomStep(b, state);
     }
-    if (isTaskFail) {
-      emitTaskExceptionStep('ResultStage 0', producerExec);
+    if (isMidExecTaskAbort) {
+      emitMidExecTaskAbort('ResultStage 0', producerExec);
     } else if (willScaleUp || isSpillOom) {
       const dn = b.std('hdfs-datanode');
       const sNarrowRun = b.addStep({
@@ -2321,11 +3031,10 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
     const isSkewJoin = cfg.jobType === 'sort-merge-skew';
     const isSkewedProfile = cfg.dataProfile === 'skewed';
     const aqeSplits = isSkewJoin && cfg.aqeEnabled && isSkewedProfile;
-    const isTaskFail = cfg.fault === 'task-exception';
     const sqlPlanner = b.std('sql-planner');
     const dag = b.std('dag-scheduler');
 
-    if (willScaleUp || isTaskFail || isSpillOom) {
+    if (willScaleUp || isMidExecTaskAbort || isSpillOom) {
       const sMapSubmit = b.addStep({
         id: 'sim-step-map-submit',
         title: isSkewJoin
@@ -2385,8 +3094,8 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       }
     }
 
-    if (isTaskFail) {
-      emitTaskExceptionStep('ShuffleMapStage 0', producerExec);
+    if (isMidExecTaskAbort) {
+      emitMidExecTaskAbort('ShuffleMapStage 0', producerExec);
     } else {
       const motm = b.std('map-output-tracker-master');
       const shuffleWriter = b.workerStd('shuffle-writer', producerZone);
@@ -2729,7 +3438,6 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       const bcastEx = b.std('broadcast-exchange');
       const bcastMgr = b.std('broadcast-manager');
       const driverBm = b.driverBmInstance();
-      const isTaskFail = cfg.fault === 'task-exception';
       const isTorrentCorrupt = cfg.fault === 'torrent-piece-corrupt';
 
       const sBcast = b.addStep({
@@ -2806,7 +3514,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         });
       }
 
-      if (!willScaleUp && !isTaskFail && !isTorrentCorrupt && !isSpillOom) {
+      if (!willScaleUp && !isMidExecTaskAbort && !isTorrentCorrupt && !isSpillOom) {
         const probeConsumer = getConsumerPair();
         const bhj = b.workerStd('broadcast-hash-join', probeConsumer.hostZone);
         b.addEvent({
@@ -2938,10 +3646,10 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         );
       }
 
-      if (willScaleUp || isTaskFail || isTorrentCorrupt || isSpillOom) {
+      if (willScaleUp || isMidExecTaskAbort || isTorrentCorrupt || isSpillOom) {
         const sqlPlanner = b.std('sql-planner');
         const dag = b.std('dag-scheduler');
-        if (willScaleUp || isTaskFail || isSpillOom) {
+        if (willScaleUp || isMidExecTaskAbort || isSpillOom) {
           const sBhjSubmit = b.addStep({
             id: 'sim-step-bhj-submit',
             title: `Submit streamed fact-table BroadcastHashJoin stage (${cfg.numPartitions} tasks)`,
@@ -2990,8 +3698,8 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
             injectTaskSpillOomStep(b, state);
           }
         }
-        if (isTaskFail) {
-          emitTaskExceptionStep('BroadcastHashJoin ResultStage', producerExec);
+        if (isMidExecTaskAbort) {
+          emitMidExecTaskAbort('BroadcastHashJoin ResultStage', producerExec);
         } else {
           const probeConsumer = getConsumerPair();
           const bhj = b.workerStd('broadcast-hash-join', probeConsumer.hostZone);
@@ -3034,8 +3742,9 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
   } else if (!state.abortedByFault && cfg.jobType === 'python-udf') {
     const isArrow = cfg.pythonUdfMode === 'arrow';
     const isTaskFail = cfg.fault === 'task-exception';
+    const isOtherMidAbort = isMidExecTaskAbort && !isTaskFail;
 
-    if (willScaleUp || isTaskFail || isSpillOom) {
+    if (willScaleUp || isMidExecTaskAbort || isSpillOom) {
       const sqlPlanner = b.std('sql-planner');
       const dag = b.std('dag-scheduler');
       const sUdfSubmit = b.addStep({
@@ -3077,7 +3786,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         command: 'executorEndpoint.send(LaunchTask(serializedTask))',
         fields: [{ name: 'slots', value: String(totalSlots) }],
         senderState: 'Initial UDF wave running',
-        receiverState: 'Checking out local Python worker',
+        receiverState: isOtherMidAbort ? 'Executing task on Executor JVM' : 'Checking out local Python worker',
       });
       if (willScaleUp) {
         emitDynamicAllocationScaleUp();
@@ -3087,113 +3796,362 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       }
     }
 
-    const udfConsumer = getConsumerPair();
-    const udfOp = b.workerStd('python-udf-operator', udfConsumer.hostZone);
-    const pyFactory = b.workerStd('python-worker-factory', udfConsumer.hostZone);
-    const pyRunner = b.workerStd('python-runner', udfConsumer.hostZone);
-    const pyWorker =
-      cfg.fault === 'python-daemon-stdout-corrupt'
-        ? undefined
-        : b.workerStd('python-worker', udfConsumer.hostZone);
-    const pyCtx = { isArrow, udfConsumer, udfOp, pyFactory, pyRunner, pyWorker };
-
-    const isPreBatchPyFault =
-      cfg.fault === 'python-daemon-stdout-corrupt' || cfg.fault === 'python-version-mismatch';
-
-    if (isPreBatchPyFault) {
-      tryInjectPythonUdfFault(b, state, pyCtx);
+    if (isOtherMidAbort) {
+      emitMidExecTaskAbort('EvalPythonExec ResultStage', producerExec);
     } else {
-      const activePyWorker = pyWorker!;
-      const sUdf = b.addStep({
-        id: 'sim-step-udf',
-        title: `Executor (${udfConsumer.hostName}) ${isArrow ? 'ArrowEvalPythonExec' : 'BatchEvalPythonExec'} <-> Python worker`,
-        explanation: `Catalyst ExtractPythonUDFs isolates score_udf into ${isArrow ? 'ArrowEvalPythonExec (Arrow columnar IPC batches)' : 'BatchEvalPythonExec (pickled row batches)'}. ${udfConsumer.consumerExec} on ${udfConsumer.hostName} acquires a local worker via PythonWorkerFactory (pyspark.daemon fork/reuse) and BasePythonRunner interleaves reads/writes via ReaderInputStream (non-blocking NIO selector in Spark dada2a6).`,
-        category: 'python-worker-ipc',
-        keyState: isTaskFail
-          ? `Python worker on ${udfConsumer.hostName} hits corrupt row in partition ${targetPart}`
-          : `Python UDF evaluated in local worker on ${udfConsumer.hostName} (${isArrow ? 'Arrow IPC' : 'CPickle'})`,
-        command: isArrow ? 'ArrowEvalPythonExec -> ReaderInputStream <-> worker.py' : 'BatchEvalPythonExec -> ReaderInputStream <-> worker.py',
-        detailsPassed: [
-          { name: 'operator', value: isArrow ? 'ArrowEvalPythonExec' : 'BatchEvalPythonExec' },
-          { name: 'workerHost', value: udfConsumer.hostName },
-          { name: 'ioEngine', value: 'BasePythonRunner ReaderInputStream (NIO Selector)' },
-          { name: 'reusePolicy', value: 'spark.python.use.daemon=true, worker.reuse=true' },
-        ],
-        deepDiveComponentId: 'python-runner',
-      });
-      b.addEvent({
-        stepId: sUdf,
-        from: udfOp,
-        to: pyFactory,
-        kind: 'local',
-        channel: 'internal',
-        protocol: 'In-JVM Pool Checkout',
-        port: `${udfConsumer.hostName} in-JVM`,
-        label: 'createThroughDaemon()',
-        info: `Operator on ${udfConsumer.hostName} checks idle worker pool or connects to pyspark.daemon to fork a local Python worker.`,
-        size: 'in-memory',
-        command: 'PythonWorkerFactory.createThroughDaemon()',
-        fields: [
-          { name: 'host', value: udfConsumer.hostName },
-          { name: 'reuse', value: 'FIFO idle pool' },
-        ],
-        senderState: 'Acquired local worker SocketChannel',
-        receiverState: 'Checked out worker PID 18422',
-      });
-      b.addEvent({
-        stepId: sUdf,
-        from: pyRunner,
-        to: activePyWorker,
-        channel: 'python',
-        protocol: isArrow ? 'Local Socket (Arrow IPC)' : 'Local Socket (CPickle)',
-        port: '127.0.0.1:ephemeral',
-        label: isArrow ? 'Stream Arrow batch' : 'Stream pickled batch',
-        info: `BasePythonRunner ReaderInputStream on ${udfConsumer.hostName} sends UDF & ${isArrow ? 'Arrow RecordBatches' : 'pickled batches'} over the local socket.`,
-        size: isArrow ? '256 KiB Arrow' : '128 KiB pickle',
-        command: 'ReaderInputStream (non-blocking Selector) -> worker.main()',
-        fields: [{ name: 'format', value: isArrow ? 'Arrow IPC' : 'BatchedSerializer(CPickle)' }],
-        senderState: 'Interleaving writes & reads on task thread',
-        receiverState: 'Running score_udf in Python process',
-      });
-      if (isTaskFail) {
-        emitTaskExceptionStep('EvalPythonExec ResultStage', udfConsumer.consumerExec);
-      } else if (tryInjectPythonUdfFault(b, state, pyCtx) === 'none') {
+      const udfConsumer = getConsumerPair();
+      const udfOp = b.workerStd('python-udf-operator', udfConsumer.hostZone);
+      const pyFactory = b.workerStd('python-worker-factory', udfConsumer.hostZone);
+      const pyRunner = b.workerStd('python-runner', udfConsumer.hostZone);
+      const pyWorker =
+        cfg.fault === 'python-daemon-stdout-corrupt'
+          ? undefined
+          : b.workerStd('python-worker', udfConsumer.hostZone);
+      const pyCtx = { isArrow, udfConsumer, udfOp, pyFactory, pyRunner, pyWorker };
+
+      const isPreBatchPyFault =
+        cfg.fault === 'python-daemon-stdout-corrupt' || cfg.fault === 'python-version-mismatch';
+
+      if (isPreBatchPyFault) {
+        tryInjectPythonUdfFault(b, state, pyCtx);
+      } else {
+        const activePyWorker = pyWorker!;
+        const sUdf = b.addStep({
+          id: 'sim-step-udf',
+          title: `Executor (${udfConsumer.hostName}) ${isArrow ? 'ArrowEvalPythonExec' : 'BatchEvalPythonExec'} <-> Python worker`,
+          explanation: `Catalyst ExtractPythonUDFs isolates score_udf into ${isArrow ? 'ArrowEvalPythonExec (Arrow columnar IPC batches)' : 'BatchEvalPythonExec (pickled row batches)'}. ${udfConsumer.consumerExec} on ${udfConsumer.hostName} acquires a local worker via PythonWorkerFactory (pyspark.daemon fork/reuse) and BasePythonRunner interleaves reads/writes via ReaderInputStream (non-blocking NIO selector in Spark dada2a6).`,
+          category: 'python-worker-ipc',
+          keyState: isTaskFail
+            ? `Python worker on ${udfConsumer.hostName} hits corrupt row in partition ${targetPart}`
+            : `Python UDF evaluated in local worker on ${udfConsumer.hostName} (${isArrow ? 'Arrow IPC' : 'CPickle'})`,
+          command: isArrow ? 'ArrowEvalPythonExec -> ReaderInputStream <-> worker.py' : 'BatchEvalPythonExec -> ReaderInputStream <-> worker.py',
+          detailsPassed: [
+            { name: 'operator', value: isArrow ? 'ArrowEvalPythonExec' : 'BatchEvalPythonExec' },
+            { name: 'workerHost', value: udfConsumer.hostName },
+            { name: 'ioEngine', value: 'BasePythonRunner ReaderInputStream (NIO Selector)' },
+            { name: 'reusePolicy', value: 'spark.python.use.daemon=true, worker.reuse=true' },
+          ],
+          deepDiveComponentId: 'python-runner',
+        });
         b.addEvent({
           stepId: sUdf,
-          from: activePyWorker,
-          to: pyRunner,
+          from: udfOp,
+          to: pyFactory,
+          kind: 'local',
+          channel: 'internal',
+          protocol: 'In-JVM Pool Checkout',
+          port: `${udfConsumer.hostName} in-JVM`,
+          label: 'createThroughDaemon()',
+          info: `Operator on ${udfConsumer.hostName} checks idle worker pool or connects to pyspark.daemon to fork a local Python worker.`,
+          size: 'in-memory',
+          command: 'PythonWorkerFactory.createThroughDaemon()',
+          fields: [
+            { name: 'host', value: udfConsumer.hostName },
+            { name: 'reuse', value: 'FIFO idle pool' },
+          ],
+          senderState: 'Acquired local worker SocketChannel',
+          receiverState: 'Checked out worker PID 18422',
+        });
+        b.addEvent({
+          stepId: sUdf,
+          from: pyRunner,
+          to: activePyWorker,
           channel: 'python',
           protocol: isArrow ? 'Local Socket (Arrow IPC)' : 'Local Socket (CPickle)',
           port: '127.0.0.1:ephemeral',
-          label: 'Return UDF results',
-          info: 'worker.py returns evaluated scores in input order; operator rejoins pass-through columns and releases worker to idle pool.',
-          size: '96 KiB',
-          command: 'outfile.flush() -> PythonWorkerFactory.releaseWorker()',
-          fields: [{ name: 'workerReturned', value: 'true (idle pool)' }],
-          senderState: 'Waiting for next task batch',
-          receiverState: 'UnsafeRow output ready for write',
+          label: isArrow ? 'Stream Arrow batch' : 'Stream pickled batch',
+          info: `BasePythonRunner ReaderInputStream on ${udfConsumer.hostName} sends UDF & ${isArrow ? 'Arrow RecordBatches' : 'pickled batches'} over the local socket.`,
+          size: isArrow ? '256 KiB Arrow' : '128 KiB pickle',
+          command: 'ReaderInputStream (non-blocking Selector) -> worker.main()',
+          fields: [{ name: 'format', value: isArrow ? 'Arrow IPC' : 'BatchedSerializer(CPickle)' }],
+          senderState: 'Interleaving writes & reads on task thread',
+          receiverState: 'Running score_udf in Python process',
         });
-        if (isTaskResultLost) {
-          taskResultLostHandled = true;
-          injectTaskResultLostStep(b, state, {
-            inCollectStep: false,
-            stageLabel: 'EvalPythonExec ResultStage',
+        if (isTaskFail) {
+          emitTaskExceptionStep('EvalPythonExec ResultStage', udfConsumer.consumerExec);
+        } else if (tryInjectPythonUdfFault(b, state, pyCtx) === 'none') {
+          b.addEvent({
+            stepId: sUdf,
+            from: activePyWorker,
+            to: pyRunner,
+            channel: 'python',
+            protocol: isArrow ? 'Local Socket (Arrow IPC)' : 'Local Socket (CPickle)',
+            port: '127.0.0.1:ephemeral',
+            label: 'Return UDF results',
+            info: 'worker.py returns evaluated scores in input order; operator rejoins pass-through columns and releases worker to idle pool.',
+            size: '96 KiB',
+            command: 'outfile.flush() -> PythonWorkerFactory.releaseWorker()',
+            fields: [{ name: 'workerReturned', value: 'true (idle pool)' }],
+            senderState: 'Waiting for next task batch',
+            receiverState: 'UnsafeRow output ready for write',
           });
+          if (isTaskResultLost) {
+            taskResultLostHandled = true;
+            injectTaskResultLostStep(b, state, {
+              inCollectStep: false,
+              stageLabel: 'EvalPythonExec ResultStage',
+            });
+          }
         }
       }
     }
-  } else if (!state.abortedByFault && cfg.jobType === 'cached-rdd') {
-    const isTaskFail = cfg.fault === 'task-exception';
+  } else if (!state.abortedByFault && cfg.jobType === 'jvm-udf-dataset') {
+    const jvmApp = b.std('jvm-user-app');
+    const driverEncoder = b.driverEncoderInstance();
+    const sqlPlanner = b.std('sql-planner');
+    const wscg = b.std('whole-stage-codegen');
+    const dag = b.std('dag-scheduler');
+    const initialConsumer = getConsumerPair();
 
-    if (willScaleUp || isTaskFail || isSpillOom) {
+    const sJvmPlan = b.addStep({
+      id: 'sim-step-jvm-udf-plan',
+      title: b.isJava
+        ? `Driver derives JavaBeanEncoder (Encoders.bean) + registers Java UDF1 & fuses WholeStageCodegen`
+        : `Driver builds ExpressionEncoder[Order] + defines Scala udf(...) & fuses WholeStageCodegen`,
+      explanation: b.isJava
+        ? `Driver invokes JavaTypeInference.encoderFor(Order.class) -> JavaBeanEncoder (bound by Catalyst into ExpressionEncoder) and registers scalar Java UDF1<Double, Double> via spark.udf().register("norm_amt", (UDF1<Double, Double>) ..., DataTypes.DoubleType) using inputEncoders=Seq(None) (UserDefinedFunction.scala:165-173), receiving a boxed, nullable java.lang.Double (ScalaUDF.scala:1125-1145). Catalyst binds DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF) (object.scala:205-217: scalar withColumn UDF runs AFTER SerializeFromObject) and WholeStageCodegenExec fuses Path B directly into JVM bytecode with ZERO BatchEvalPythonExec; DriverSchedulerBackend sends LaunchTask to ${initialConsumer.consumerExec} (${initialConsumer.hostName}).`
+        : `Driver builds ExpressionEncoder[Order] via Encoders.product[Order] and defines typed Scala udf((d: Double) => ...), deriving its input encoder from Scala's Double TypeTag (UserDefinedFunction.scala:132-173) so Catalyst inserts an If(IsNull(col), Literal(null), ScalaUDF(...)) null-check guard before calling primitive Double => Double. Catalyst binds DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF) (object.scala:205-217: scalar withColumn UDF runs AFTER SerializeFromObject) and WholeStageCodegenExec fuses Path B directly into JVM bytecode with ZERO BatchEvalPythonExec; DriverSchedulerBackend sends LaunchTask to ${initialConsumer.consumerExec} (${initialConsumer.hostName}).`,
+      category: 'sql-planning-aqe',
+      keyState: `Pure-JVM Dataset[Order] + ${b.isJava ? 'Java UDF1' : 'ScalaUDF'} fused in WholeStageCodegen (0 Python workers)`,
+      command: b.isJava
+        ? 'JavaTypeInference.encoderFor(Order.class) -> JavaBeanEncoder + UDF1<Double, Double> -> WholeStageCodegenExec'
+        : 'Encoders.product[Order] + udf((d: Double) => ...) -> WholeStageCodegenExec -> LaunchTask',
+      detailsPassed: [
+        {
+          name: 'encoder',
+          value: b.isJava
+            ? 'JavaTypeInference.encoderFor(Order.class) -> JavaBeanEncoder -> ExpressionEncoder'
+            : 'Encoders.product[Order] -> ExpressionEncoder[Order]',
+        },
+        {
+          name: 'scalarUdf',
+          value: b.isJava
+            ? 'Java UDF1<Double, Double> (inputEncoders=Seq(None), boxed nullable java.lang.Double; UserDefinedFunction.scala:165-173, ScalaUDF.scala:1125-1145)'
+            : 'Scala typed udf((d: Double) => ...) on nullable column amount (TypeTag[Double] input encoder + If(IsNull(amount), Literal(null), ScalaUDF(...)) guard inserted by Analyzer.scala:3926-3948 when input is nullable; UserDefinedFunction.scala:132-173)',
+        },
+        {
+          name: 'operatorOrder',
+          value: 'DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF) (object.scala:205-217)',
+        },
+        { name: 'pythonBoundary', value: 'NONE (0 BatchEvalPythonExec, 0 Python workers)' },
+      ],
+      deepDiveComponentId: 'dataset-encoder-udf',
+    });
+    b.addEvent({
+      stepId: sJvmPlan,
+      from: jvmApp,
+      to: driverEncoder,
+      kind: 'local',
+      channel: 'internal',
+      protocol: b.isJava ? 'JavaTypeInference + UDF1' : 'ScalaReflection + ScalaUDF',
+      port: `${b.driverHost} in-JVM`,
+      label: b.isJava ? 'Encoders.bean(Order)' : 'Encoders.product[Order]',
+      info: b.isJava
+        ? 'JavaTypeInference.encoderFor(Order.class) derives JavaBeanEncoder (AgnosticEncoder bound to ExpressionEncoder) and spark.udf().register("norm_amt", (UDF1<Double, Double>) ..., DataTypes.DoubleType) uses inputEncoders=Seq(None) (UserDefinedFunction.scala:165-173), receiving boxed, nullable java.lang.Double (ScalaUDF.scala:1125-1145).'
+        : 'Encoders.product[Order] builds ExpressionEncoder[Order] and typed udf((d: Double) => ...) on nullable column amount derives its input encoder from Scala Double TypeTag (UserDefinedFunction.scala:132-173); because amount is nullable, Catalyst Analyzer (Analyzer.scala:3926-3948) inserts If(IsNull(amount), Literal(null), ScalaUDF(...)) before primitive Double => Double.',
+      size: 'in-memory',
+      command: b.isJava
+        ? 'Encoders.bean(Order.class); spark.udf().register("norm_amt", (UDF1<Double, Double>) ..., DataTypes.DoubleType)'
+        : 'Encoders.product[Order]; val norm_amt = udf((d: Double) => ...) // TypeTag[Double] encoder',
+      fields: [
+        ...(b.isJava
+          ? [{ name: 'inputEncoders', value: 'Seq(None) (boxed nullable java.lang.Double)' }]
+          : [
+              { name: 'inputEncoders', value: 'Derived from Scala Double TypeTag (UserDefinedFunction.scala:132-173)' },
+              { name: 'nullGuard', value: 'If(IsNull(col), Literal(null), ScalaUDF(...)) before primitive Double => Double' },
+            ]),
+        {
+          name: 'closureFormat',
+          value: b.isJava ? 'Java Serializable / SerializedLambda MapFunction' : 'Scala Function1 closure',
+        },
+      ],
+      senderState: 'Derived typed encoder & registered JVM scalar UDF',
+      receiverState: 'Encoder expressions & ScalaUDF ready for Catalyst binding',
+    });
+    b.addEvent({
+      stepId: sJvmPlan,
+      from: driverEncoder,
+      to: sqlPlanner,
+      kind: 'local',
+      channel: 'internal',
+      protocol: 'In-JVM Catalyst Binding',
+      port: `${b.driverHost} in-JVM`,
+      label: 'Bind Encoder + JVM UDF',
+      info: b.isJava
+        ? 'Catalyst binds DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF) (object.scala:205-217: scalar Java UDF1 runs AFTER SerializeFromObject consumes mapped output, receiving boxed nullable java.lang.Double; zero BatchEvalPythonExec).'
+        : 'Catalyst binds DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF) (object.scala:205-217: scalar withColumn UDF runs AFTER SerializeFromObject consumes mapped output, guarded by If(IsNull(col), Literal(null), ScalaUDF(...)); zero BatchEvalPythonExec).',
+      size: 'in-memory',
+      command: 'Catalyst Optimizer -> DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF)',
+      fields: [
+        { name: 'operatorOrder', value: 'DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF)' },
+        { name: 'batchEvalPythonExec', value: '0 (pure JVM Path B)' },
+      ],
+      senderState: 'Bound ExpressionEncoder & ScalaUDF',
+      receiverState: 'Handing physical plan to WholeStageCodegenExec',
+    });
+    b.addEvent({
+      stepId: sJvmPlan,
+      from: sqlPlanner,
+      to: wscg,
+      kind: 'local',
+      channel: 'internal',
+      protocol: 'In-JVM WholeStageCodegen',
+      port: `${b.driverHost} in-JVM`,
+      label: 'Fuse WholeStageCodegen',
+      info: 'WholeStageCodegenExec fuses Parquet scan, typed Dataset.map(Order), and scalar JVM UDF into a single Janino BufferedRowIterator without any Python boundary.',
+      size: 'in-memory',
+      command: 'WholeStageCodegenExec.doCodeGen() // Path B fused without BatchEvalPythonExec',
+      fields: [{ name: 'compiler', value: 'Janino default (in-JVM BufferedRowIterator)' }],
+      senderState: 'Fused physical operator pipeline',
+      receiverState: 'Submitting 1-stage ResultStage to DAGScheduler',
+    });
+    b.addEvent({
+      stepId: sJvmPlan,
+      from: wscg,
+      to: dag,
+      kind: 'local',
+      channel: 'internal',
+      protocol: 'In-JVM DAG Submit',
+      port: `${b.driverHost} in-JVM`,
+      label: 'Submit 1-stage JVM DAG',
+      info: `DAGScheduler creates ResultStage 0 (${cfg.numPartitions} tasks, 0 shuffles, 0 Python workers).`,
+      size: 'in-memory',
+      command: `DAGScheduler.submitJob(ResultStage 0, partitions=0..${cfg.numPartitions - 1})`,
+      fields: [
+        { name: 'partitions', value: String(cfg.numPartitions) },
+        { name: 'pythonWorkers', value: '0' },
+      ],
+      senderState: 'Stage 0 submitted',
+      receiverState: 'Dispatching serialized tasks via DriverSchedulerBackend',
+    });
+    b.addEvent({
+      stepId: sJvmPlan,
+      from: state.schedBackend,
+      to: initialConsumer.consumerExec,
+      channel: 'rpc',
+      protocol: 'Spark Netty RPC',
+      port: b.driverRpc,
+      label: `LaunchTask (${cfg.numPartitions} parts)`,
+      info: `DriverSchedulerBackend sends LaunchTask to live executor ${initialConsumer.consumerExec} (${initialConsumer.hostName}) carrying ${b.isJava ? 'JavaBeanEncoder + Java UDF1' : 'ExpressionEncoder[Order] + ScalaUDF'}.`,
+      size: '3.4 KB',
+      command: 'executorEndpoint.send(LaunchTask(serializedTask))',
+      fields: [
+        { name: 'targetExecutor', value: `${initialConsumer.consumerExec} (${initialConsumer.hostName})` },
+        { name: 'slots', value: String(totalSlots) },
+      ],
+      senderState: `Running up to ${Math.min(cfg.numPartitions, totalSlots)} concurrent tasks`,
+      receiverState: 'Executing fused Dataset.map & JVM UDF on Executor JVM thread',
+    });
+    if (willScaleUp) {
+      emitDynamicAllocationScaleUp();
+    }
+    if (isSpillOom) {
+      injectTaskSpillOomStep(b, state);
+    }
+
+    const execConsumer = getConsumerPair();
+    if (isMidExecTaskAbort) {
+      emitMidExecTaskAbort('Typed Dataset + JVM UDF ResultStage', execConsumer.consumerExec);
+    } else {
+      const execTaskAttempt = b.execTaskAttemptInstance(execConsumer.consumerExec);
+      const execEncoder = b.execEncoderInstance(execConsumer.consumerExec);
+      const dn = b.std('hdfs-datanode');
+      const sJvmExec = b.addStep({
+        id: 'sim-step-jvm-udf-exec',
+        title: `Executor (${execConsumer.hostName}) evaluates Dataset.map(Order) & ${b.isJava ? 'Java UDF1' : 'ScalaUDF'} in-JVM`,
+        explanation: `${execConsumer.consumerExec} on ${execConsumer.hostName} executes Dataset.map(Order) and ${b.isJava ? 'Java UDF1<Double, Double>.call(java.lang.Double)' : 'ScalaUDF'} directly on the Executor JVM task thread via ${execEncoder} (ZERO Python workers, ZERO socket IPC) and writes staged Parquet parts to HDFS DataNode.`,
+        category: 'sql-planning-aqe',
+        keyState: isTaskResultLost
+          ? `Executor ${execConsumer.consumerExec} staged Parquet parts; IndirectTaskResult queued`
+          : `All ${cfg.numPartitions} pure-JVM Dataset/UDF tasks finished (0 Python workers)`,
+        command: b.isJava
+          ? 'TaskRunner -> JavaBeanEncoder + UDF1.call(Double) -> ParquetWriter'
+          : 'TaskRunner -> ExpressionEncoder[Order] + ScalaUDF -> ParquetWriter',
+        detailsPassed: [
+          { name: 'executorInstance', value: `${execConsumer.consumerExec} (${execConsumer.hostName})` },
+          { name: 'encoderInstance', value: execEncoder },
+          { name: 'pythonWorkersSpawned', value: '0' },
+        ],
+        deepDiveComponentId: 'dataset-encoder-udf',
+      });
+      b.addEvent({
+        stepId: sJvmExec,
+        from: execConsumer.consumerExec,
+        to: execTaskAttempt,
+        kind: 'local',
+        channel: 'internal',
+        protocol: 'In-JVM TaskRunner',
+        port: `${execConsumer.hostName} in-JVM`,
+        label: 'Run fused task thread',
+        info: `${execConsumer.consumerExec} invokes TaskRunner on ${execConsumer.hostName} JVM thread pool.`,
+        size: 'in-memory',
+        command: 'Executor.TaskRunner.run() // pure-JVM WholeStageCodegen',
+        fields: [{ name: 'host', value: execConsumer.hostName }],
+        senderState: 'Task thread executing fused pipeline',
+        receiverState: 'Invoking typed Dataset encoder & JVM UDF in-JVM',
+      });
+      b.addEvent({
+        stepId: sJvmExec,
+        from: execTaskAttempt,
+        to: execEncoder,
+        kind: 'local',
+        channel: 'internal',
+        protocol: b.isJava ? 'In-JVM BeanEnc + UDF1' : 'In-JVM Encoder + ScalaUDF',
+        port: `${execConsumer.hostName} in-JVM`,
+        label: b.isJava ? 'BeanEnc + UDF1(Double)' : 'Dataset.map + ScalaUDF',
+        info: b.isJava
+          ? `Executor task thread runs DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF) on ${execConsumer.hostName} JVM (object.scala:205-217): JavaBeanEncoder maps Order, then Project invokes Java UDF1<Double, Double>.call(java.lang.Double) on boxed nullable Double AFTER SerializeFromObject (0 Python workers).`
+          : `Executor task thread runs DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF) on ${execConsumer.hostName} JVM (object.scala:205-217): ExpressionEncoder[Order] maps Order, then Project runs If(IsNull(col), Literal(null), ScalaUDF(...)) before primitive Double => Double AFTER SerializeFromObject (0 Python workers).`,
+        size: 'in-memory',
+        command: b.isJava
+          ? 'DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF[UDF1.call(java.lang.Double)])'
+          : 'DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF)',
+        fields: [
+          { name: 'operatorOrder', value: 'DeserializeToObject -> MapElements -> SerializeFromObject -> Project(ScalaUDF)' },
+          { name: 'pythonWorkers', value: '0 (pure JVM task thread)' },
+          { name: 'ipcSockets', value: '0 (in-JVM call)' },
+        ],
+        senderState: 'Evaluated typed Dataset & scalar JVM UDF in-JVM',
+        receiverState: 'Produced Tungsten UnsafeRow output for Parquet write',
+      });
+      b.addEvent({
+        stepId: sJvmExec,
+        from: execTaskAttempt,
+        to: dn,
+        channel: 'data',
+        protocol: 'HDFS DataTransferProtocol',
+        port: 'dn01:9866',
+        label: 'Write staged Parquet',
+        info: `Executors write staged Parquet output blocks directly to HDFS DataNode :9866 with zero Python workers.`,
+        size: `${cfg.numPartitions * 48} MiB`,
+        command: 'SingleDirectoryDataWriter.write() -> DFSOutputStream (dn01:9866)',
+        fields: [
+          { name: 'shuffleBytes', value: '0 B' },
+          { name: 'pythonWorkers', value: '0' },
+        ],
+        senderState: isTaskResultLost
+          ? 'Task staged Parquet part; sending IndirectTaskResult to driver'
+          : 'All JVM Dataset/UDF tasks finished',
+        receiverState: 'Staged Parquet parts flushed to DataNodes',
+      });
+      if (isTaskResultLost) {
+        taskResultLostHandled = true;
+        injectTaskResultLostStep(b, state, {
+          inCollectStep: false,
+          stageLabel: 'Typed Dataset + JVM UDF ResultStage',
+        });
+      }
+    }
+  } else if (!state.abortedByFault && cfg.jobType === 'cached-rdd') {
+    if (willScaleUp || isMidExecTaskAbort || isSpillOom) {
       const dag = b.std('dag-scheduler');
       const sCacheSubmit = b.addStep({
         id: 'sim-step-cache-submit',
-        title: `Submit Action 1 (rdd.count()) for ${cfg.numPartitions} partitions`,
+        title: `Submit Action 1 (${b.isJava ? 'javaRdd.count()' : 'rdd.count()'}) for ${cfg.numPartitions} partitions`,
         explanation: `DAGScheduler submits Action 1 across ${cfg.numPartitions} partitions (${Math.max(0, cfg.numPartitions - totalSlots)} pending in backlog).`,
         category: 'sql-planning-aqe',
         keyState: `Action 1 submitted (${cfg.numPartitions} partitions)`,
-        command: `DAGScheduler.submitJob(rdd.count(), partitions=0..${cfg.numPartitions - 1})`,
+        command: `DAGScheduler.submitJob(${b.isJava ? 'javaRdd.count()' : 'rdd.count()'}, partitions=0..${cfg.numPartitions - 1})`,
         detailsPassed: [{ name: 'partitions', value: String(cfg.numPartitions) }],
         deepDiveComponentId: 'dag-scheduler',
       });
@@ -3236,25 +4194,72 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       }
     }
 
-    if (isTaskFail) {
-      emitTaskExceptionStep('Action 1 (rdd.count())', producerExec);
+    if (isMidExecTaskAbort) {
+      emitMidExecTaskAbort('Action 1 (rdd.count())', producerExec);
     } else {
       const rddCache = b.workerStd('rdd-cache', producerZone);
       const dn = b.std('hdfs-datanode');
       const sCache = b.addStep({
         id: 'sim-step-cache',
         title: `Action 1 caches MEMORY_ONLY; Action 2 hits p=0 & recomputes evicted p=${targetPart}`,
-        explanation: `persist(MEMORY_ONLY) is lazy until Action 1 (rdd.count()). Each executor computes partitions via RDD.getOrCompute, stores rdd_17_p in local MemoryStore, and updates BlockManagerMaster. Under MEMORY_ONLY, RAM eviction drops blocks instead of spilling to disk: Action 2 hits partition 0 (rdd_17_0) in MemoryStore, while evicted partition ${targetPart} (rdd_17_${targetPart}) misses and recomputes from HDFS lineage via RDD.getOrCompute.`,
+        explanation: b.isPySpark
+          ? `persist(MEMORY_ONLY) is lazy until Action 1 (PySpark RDD.count() runs mapPartitions via Python worker). Each executor computes partitions via RDD.getOrCompute, stores rdd_17_p in local MemoryStore, and updates BlockManagerMaster. Under MEMORY_ONLY, RAM eviction drops blocks instead of spilling to disk: Action 2 hits partition 0 (rdd_17_0) in MemoryStore, while evicted partition ${targetPart} (rdd_17_${targetPart}) misses and recomputes from HDFS lineage via RDD.getOrCompute.`
+          : `persist(MEMORY_ONLY) is lazy until Action 1 (${b.isJava ? 'JavaRDD.count()' : 'RDD.count()'} directly in-JVM, ZERO Python workers). Each executor computes partitions via RDD.getOrCompute, stores rdd_17_p in local MemoryStore, and updates BlockManagerMaster. Under MEMORY_ONLY, RAM eviction drops blocks instead of spilling to disk: Action 2 hits partition 0 (rdd_17_0) in MemoryStore, while evicted partition ${targetPart} (rdd_17_${targetPart}) misses and recomputes from HDFS lineage via RDD.getOrCompute.`,
         category: 'yarn-lifecycle',
         keyState: `MEMORY_ONLY: Action 2 hit rdd_17_0; evicted rdd_17_${targetPart} recomputed via RDD.getOrCompute`,
         command: `RDD.iterator() -> BlockManager.getOrElseUpdateRDDBlock(rdd_17_0 / rdd_17_${targetPart}, MEMORY_ONLY)`,
         detailsPassed: [
           { name: 'storageLevel', value: 'MEMORY_ONLY (RAM eviction triggers lineage recompute, no disk spill)' },
+          {
+            name: 'executionRuntime',
+            value: b.isPySpark ? 'PySpark PythonRDD mapPartitions via local Python worker' : `Pure-JVM ${b.langDisplay} RDD.count() (0 Python workers)`,
+          },
           { name: 'cacheHit', value: 'Partition 0 (rdd_17_0) served from MemoryStore' },
           { name: 'evictedRecompute', value: `Partition ${targetPart} (rdd_17_${targetPart}) missed -> RDD.getOrCompute` },
         ],
         deepDiveComponentId: 'rdd-cache',
       });
+      if (b.isPySpark) {
+        const pyRunner = b.workerStd('python-runner', producerZone);
+        const pyWorker = b.workerStd('python-worker', producerZone);
+        b.addEvent({
+          stepId: sCache,
+          from: pyRunner,
+          to: pyWorker,
+          categoryOverride: 'python-worker-ipc',
+          channel: 'python',
+          protocol: 'Local Socket (CPickle)',
+          port: '127.0.0.1:ephemeral',
+          label: 'PyRDD mapPartitions count',
+          info: `PySpark RDD.count() evaluates mapPartitions(lambda it: [sum(1 for _ in it)]) in the local Python worker on ${producerHost}.`,
+          size: '64 KiB',
+          command: 'PythonRDD.compute() -> worker.py mapPartitions (RDD.count())',
+          fields: [{ name: 'api', value: 'PySpark RDD.count() via Python worker' }],
+          senderState: 'Streamed partition iterator to local Python worker',
+          receiverState: 'Returned partition element count',
+        });
+      } else {
+        const jvmApp = b.std('jvm-user-app');
+        const dag = b.std('dag-scheduler');
+        b.addEvent({
+          stepId: sCache,
+          from: jvmApp,
+          to: dag,
+          kind: 'local',
+          channel: 'internal',
+          protocol: 'In-JVM RDD.count()',
+          port: `${b.driverHost} in-JVM`,
+          label: b.isJava ? 'JavaRDD.persist().count()' : 'RDD.persist().count()',
+          info: `${b.appEntryLabel}() triggers Action 1 & Action 2 directly in-JVM with ZERO Python workers or Py4J calls.`,
+          size: 'in-memory',
+          command: b.isJava
+            ? 'javaRdd.persist(StorageLevel.MEMORY_ONLY()).count()'
+            : 'rdd.persist(StorageLevel.MEMORY_ONLY).count()',
+          fields: [{ name: 'pythonWorkers', value: '0 (pure JVM RDD execution)' }],
+          senderState: 'Submitted in-JVM RDD count actions',
+          receiverState: 'Executing directly on Executor JVM task threads',
+        });
+      }
       b.addEvent({
         stepId: sCache,
         from: rddCache,
@@ -3363,9 +4368,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       }
     }
   } else if (!state.abortedByFault && cfg.jobType === 'collect-action') {
-    const isTaskFail = cfg.fault === 'task-exception';
-
-    if (willScaleUp || isTaskFail || isSpillOom) {
+    if (willScaleUp || isMidExecTaskAbort || isSpillOom) {
       const dag = b.std('dag-scheduler');
       const sCollectSubmit = b.addStep({
         id: 'sim-step-collect-submit',
@@ -3416,8 +4419,8 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       }
     }
 
-    if (isTaskFail) {
-      emitTaskExceptionStep('collect() ResultStage', producerExec);
+    if (isMidExecTaskAbort) {
+      emitMidExecTaskAbort('collect() ResultStage', producerExec);
     } else {
       const trg = b.std('task-result-getter');
       const isLarge =
@@ -3428,6 +4431,9 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
       const crossingCount = Math.floor(512 / perPartMiB) + 1;
       const crossingTotalMiB = crossingCount * perPartMiB;
       const maxResultSizeLabel = cfg.fault === 'max-result-size' ? '512 MiB' : '1 GiB';
+      const deliveryDesc = b.isPySpark
+        ? 'Python collect() via PythonRDD.collectAndServe'
+        : `${b.appEntryLabel}() in-JVM Array/List collect()`;
 
       const sCollect = b.addStep({
         id: 'sim-step-collect',
@@ -3438,9 +4444,9 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           ? cfg.fault === 'max-result-size'
             ? `Each of ${cfg.numPartitions} partitions serializes to ${perPartMiB} MiB (${totalMiB} MiB total) and is stored as a TaskResultBlock (StorageLevel.MEMORY_AND_DISK_SER) via IndirectTaskResult. With spark.driver.maxResultSize=512 MiB, TaskSetManager.canFetchMoreResults crosses the limit on partition #${crossingCount} (${crossingTotalMiB} MiB > 512 MiB) and aborts BEFORE fetching that TaskResultBlock.`
             : isTaskResultLost
-              ? `Each of ${cfg.numPartitions} partitions serializes to ${perPartMiB} MiB (${totalMiB} MiB total) and is stored as a TaskResultBlock with StorageLevel.MEMORY_AND_DISK_SER before sending IndirectTaskResult to Driver TaskResultGetter. Before result delivery, TaskResultGetter fails to fetch the lost TaskResultBlock, reports TaskResultLost, and retries the task before delivering results to Python collect().`
+              ? `Each of ${cfg.numPartitions} partitions serializes to ${perPartMiB} MiB (${totalMiB} MiB total) and is stored as a TaskResultBlock with StorageLevel.MEMORY_AND_DISK_SER before sending IndirectTaskResult to Driver TaskResultGetter. Before result delivery, TaskResultGetter fails to fetch the lost TaskResultBlock, reports TaskResultLost, and retries the task before delivering results to ${deliveryDesc}.`
               : `Each of ${cfg.numPartitions} partitions serializes to ${perPartMiB} MiB (${totalMiB} MiB total) and is stored as a TaskResultBlock (StorageLevel.MEMORY_AND_DISK_SER) via IndirectTaskResult. With spark.driver.maxResultSize=1 GiB (1024 MiB), totalMiB (${totalMiB} MiB <= 1024 MiB) passes TaskSetManager.canFetchMoreResults and Driver TaskResultGetter fetches TaskResultBlocks over ${producerBmPort}.`
-          : 'Small serialized partition results fit inside StatusUpdate RPC messages directly to the driver and are concatenated in Python.',
+          : `Small serialized partition results fit inside StatusUpdate RPC messages directly to the driver and are delivered to ${deliveryDesc}.`,
         category: 'yarn-lifecycle',
         keyState:
           cfg.fault === 'max-result-size'
@@ -3449,8 +4455,10 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
               ? `IndirectTaskResult (${perPartMiB} MiB, MEMORY_AND_DISK_SER) queued for TaskResultGetter fetch`
               : isLarge
                 ? `collect() succeeded: ${totalMiB} MiB (${cfg.numPartitions}x${perPartMiB} MiB) <= 1 GiB maxResultSize`
-                : 'Driver assembled collect() result list in Python',
-        command: 'RDD.collect() -> TaskResultGetter.enqueueSuccessfulTask()',
+                : `Driver assembled collect() result for ${deliveryDesc}`,
+        command: b.isPySpark
+          ? 'RDD.collect() (RDD.scala:1122-1125) -> TaskResultGetter -> DAGScheduler -> PythonRDD.collectAndServe()'
+          : `RDD.collect() (RDD.scala:1122-1125) -> TaskResultGetter -> DAGScheduler -> ${b.isJava ? 'List<Row>' : 'Array[Row]'} in-JVM`,
         detailsPassed: [
           {
             name: 'transport',
@@ -3462,6 +4470,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
             ? [{ name: 'resultSizing', value: `${cfg.numPartitions} parts x ${perPartMiB} MiB = ${totalMiB} MiB` }]
             : []),
           { name: 'maxResultSize', value: `${maxResultSizeLabel} (spark.driver.maxResultSize)` },
+          { name: 'driverDelivery', value: deliveryDesc },
         ],
         deepDiveComponentId: 'task-result-getter',
       });
@@ -3511,37 +4520,100 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
             { name: 'limit', value: '512 MiB (spark.driver.maxResultSize)' },
           ],
           senderState: 'Aborted BEFORE fetching crossing TaskResultBlock',
-          receiverState: 'Job failed; Python receives SparkException (no partial list)',
+          receiverState: `Job failed; ${b.appEntryLabel} receives SparkException (no partial list)`,
           isError: true,
         });
         emitTerminalAppOutcome(b, state, {
-          origin: 'user-python-app',
+          origin: 'user-app-failure',
           diagnostic: `Total serialized results (${crossingTotalMiB} MiB) exceeded spark.driver.maxResultSize (512 MiB)`,
           stopLiveExecutors: true,
         });
-      } else if (isTaskResultLost) {
-        taskResultLostHandled = true;
-        injectTaskResultLostStep(b, state, {
-          inCollectStep: true,
-          perPartMiB,
-          totalMiB,
-        });
-      } else if (isLarge) {
+      } else {
+        let deliveryStepId = sCollect;
+        if (isTaskResultLost) {
+          taskResultLostHandled = true;
+          injectTaskResultLostStep(b, state, {
+            inCollectStep: true,
+            perPartMiB,
+            totalMiB,
+          });
+          deliveryStepId = 'sim-step-task-result-lost';
+        } else if (isLarge) {
+          b.addEvent({
+            stepId: sCollect,
+            from: trg,
+            to: producerBm,
+            channel: 'data',
+            protocol: 'BlockTransfer (TaskResultBlock)',
+            port: producerBmPort,
+            label: 'getRemoteBytes(taskres)',
+            info: `Driver TaskResultGetter fetches TaskResultBlock (${perPartMiB} MiB; ${cfg.numPartitions} parts = ${totalMiB} MiB <= 1 GiB limit) from ${producerBmPort} after quota check passes.`,
+            size: `${perPartMiB} MiB`,
+            command: 'sparkEnv.blockManager.getRemoteBytes(TaskResultBlockId(tid))',
+            fields: [{ name: 'quotaCheck', value: `Passed (${totalMiB} MiB <= 1 GiB)` }],
+            senderState: 'Fetched TaskResultBlock; handing partition result to TaskScheduler / DAGScheduler',
+            receiverState: 'TaskResultBlock removed after fetch',
+          });
+        }
+        const dagCollect = b.std('dag-scheduler');
         b.addEvent({
-          stepId: sCollect,
+          stepId: deliveryStepId,
           from: trg,
-          to: producerBm,
-          channel: 'data',
-          protocol: 'BlockTransfer (TaskResultBlock)',
-          port: producerBmPort,
-          label: 'getRemoteBytes(taskres)',
-          info: `Driver TaskResultGetter fetches TaskResultBlock (${perPartMiB} MiB; ${cfg.numPartitions} parts = ${totalMiB} MiB <= 1 GiB limit) from ${producerBmPort} after quota check passes.`,
-          size: `${perPartMiB} MiB`,
-          command: 'sparkEnv.blockManager.getRemoteBytes(TaskResultBlockId(tid))',
-          fields: [{ name: 'quotaCheck', value: `Passed (${totalMiB} MiB <= 1 GiB)` }],
-          senderState: 'Result delivered to Python collect()',
-          receiverState: 'TaskResultBlock removed after fetch',
+          to: dagCollect,
+          kind: 'local',
+          channel: 'internal',
+          protocol: 'In-JVM TaskScheduler/DAG',
+          port: `${b.driverHost} in-JVM`,
+          label: 'Deliver part results',
+          info: 'TaskResultGetter fetches and deserializes individual partition results into TaskScheduler / DAGScheduler before RDD.collect() (RDD.scala:1122-1125) concatenates partition arrays.',
+          size: 'in-memory',
+          command: 'scheduler.handleSuccessfulTask(tsm, tid, result) -> DAGScheduler JobWaiter',
+          fields: [{ name: 'handoff', value: 'TaskResultGetter -> TaskScheduler / DAGScheduler (per-partition arrays)' }],
+          senderState: 'Individual partition results delivered to TaskScheduler / DAGScheduler',
+          receiverState: 'All partition arrays collected for RDD.collect() concatenation',
         });
+        if (b.isPySpark) {
+          const pyDriver = b.std('python-driver');
+          b.addEvent({
+            stepId: deliveryStepId,
+            from: dagCollect,
+            to: pyDriver,
+            channel: 'python',
+            protocol: 'PythonRDD.collectAndServe',
+            port: b.isClient ? '127.0.0.1:44108' : '127.0.0.1:43122',
+            label: 'collectAndServe -> Py',
+            info: 'After TaskResultGetter delivers partition results to TaskScheduler / DAGScheduler, RDD.collect() (RDD.scala:1122-1125) / PythonRDD.collectAndServe streams collected pickled partition batches over local socket to python-driver (orders.py).',
+            size: isLarge ? `${totalMiB} MiB` : '120 KB',
+            command: 'RDD.collect() (RDD.scala:1122-1125) -> PythonRDD.collectAndServe(rdd) -> local auth socket -> orders.py',
+            fields: [{ name: 'bridge', value: 'PythonRDD.collectAndServe (driver loopback socket)' }],
+            senderState: 'Result delivered to Python collect()',
+            receiverState: 'orders.py materialized Python list',
+          });
+        } else {
+          const jvmApp = b.std('jvm-user-app');
+          b.addEvent({
+            stepId: deliveryStepId,
+            from: dagCollect,
+            to: jvmApp,
+            kind: 'local',
+            channel: 'internal',
+            protocol: 'In-JVM RDD.collect()',
+            port: `${b.driverHost} in-JVM`,
+            label: 'RDD.collect() concat',
+            info: `After TaskResultGetter feeds individual partition results into TaskScheduler / DAGScheduler, RDD.collect() (RDD.scala:1122-1125, Array.concat(results: _*)) concatenates the partition arrays into the final ${b.isJava ? 'Java List<Row>' : 'Scala Array[Row]'} in-JVM for ${b.appEntryLabel}() (zero loopback IPC).`,
+            size: 'in-memory',
+            command: b.isJava
+              ? 'RDD.collect() (RDD.scala:1122-1125) -> Array.concat -> List<Row> in-JVM'
+              : 'RDD.collect() (RDD.scala:1122-1125) -> Array.concat(results: _*) -> Array[Row] in-JVM',
+            fields: [
+              { name: 'concatenation', value: 'RDD.collect() (RDD.scala:1122-1125) concatenates per-partition arrays' },
+              { name: 'returnType', value: b.isJava ? 'Java List<Row>' : 'Scala Array[Row]' },
+              { name: 'pythonBridge', value: '0 (direct JVM heap return)' },
+            ],
+            senderState: `Result delivered in-JVM to ${b.appEntryLabel} collect()`,
+            receiverState: `${b.appEntryLabel} received concatenated ${b.isJava ? 'List<Row>' : 'Array[Row]'}`,
+          });
+        }
       }
     }
   }
@@ -3624,16 +4696,16 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
         protocol: 'Hadoop RPC (abortJob cleanup)',
         port: 'nn01:8020',
         label: 'abortJob() cleanup',
-        info: 'FileFormatWriter invokes best-effort abortJob() to delete _temporary/ and propagates original exception to Python.',
+        info: `FileFormatWriter invokes best-effort abortJob() to delete _temporary/ and propagates original exception to ${b.appEntryLabel}.`,
         size: '1.4 KB',
         command: 'committer.abortJob(jobContext); throw originalException',
         fields: [{ name: 'stagingCleanup', value: 'Best-effort delete of _temporary/' }],
-        senderState: 'Rethrew failure to orders.py',
+        senderState: `Rethrew failure to ${b.appEntryLabel}`,
         receiverState: 'Removed staging directory (verify target path before retry)',
         isError: true,
       });
       emitTerminalAppOutcome(b, state, {
-        origin: 'user-python-app',
+        origin: 'user-app-failure',
         diagnostic: 'Driver V1 commitJob() failed with HDFS IOException after best-effort abortJob()',
         stopLiveExecutors: true,
       });
@@ -3687,7 +4759,7 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
           { name: 'algorithm', value: 'FileOutputCommitter algorithm 1' },
           { name: 'finalPublish', value: 'Moved _temporary/0/task_* -> final dir & removed _temporary/' },
         ],
-        senderState: 'Write action returned cleanly to Python',
+        senderState: `Write action returned cleanly to ${b.appEntryLabel}`,
         receiverState: 'Dataset published on HDFS',
       });
     }
@@ -3697,13 +4769,14 @@ export function buildSimulatedRun(rawConfig: SimulationConfig): ExecutionRun {
   // ORDERLY SHUTDOWN (if not aborted by terminal fault)
   // =========================================================================
   if (!state.abortedByFault) {
+    const stopCall = b.isJava ? 'spark.close()' : 'spark.stop()';
     const sStop = b.addStep({
       id: 'sim-step-shutdown',
-      title: `spark.stop() halts ${state.liveExecs.length} live executor(s) & active AM unregisters SUCCEEDED`,
-      explanation: `orders.py calls spark.stop(). CoarseGrainedSchedulerBackend sends StopExecutor ONLY to the ${state.liveExecs.length} live executor(s) (${state.liveExecs.join(', ')}), orders.py exits 0, and active AM (${state.activeAm}) unregisters FinalApplicationStatus.SUCCEEDED on RM :8030.`,
+      title: `${stopCall} halts ${state.liveExecs.length} live executor(s) & active AM unregisters SUCCEEDED`,
+      explanation: `${b.appEntryLabel} calls ${b.isJava ? 'spark.close() -> SparkContext.stop(0)' : 'spark.stop()'}. CoarseGrainedSchedulerBackend sends StopExecutor ONLY to the ${state.liveExecs.length} live executor(s) (${state.liveExecs.join(', ')}), ${b.appEntryLabel} exits 0, and active AM (${state.activeAm}) unregisters FinalApplicationStatus.SUCCEEDED on RM :8030.`,
       category: 'yarn-lifecycle',
       keyState: `Stopped ${state.liveExecs.length} live executor(s) | YARN state=FINISHED, finalStatus=SUCCEEDED`,
-      command: 'spark.stop() -> StopExecutors -> amClient.unregister(SUCCEEDED)',
+      command: `${stopCall} -> StopExecutors -> amClient.unregister(SUCCEEDED)`,
       detailsPassed: [
         { name: 'liveExecutorsStopped', value: `${state.liveExecs.length} (${state.liveExecs.join(', ')})` },
         { name: 'activeAm', value: state.activeAm },
