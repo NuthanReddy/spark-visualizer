@@ -833,7 +833,7 @@ test('all enriched catalog traces adapt cleanly with valid trees, instances, and
   }
 });
 
-test('local port normalization classifies all qualified in-JVM/OS/local-dir events as local across all 106 traces and language-keyed enriched runs', () => {
+test('local port normalization classifies all qualified in-JVM/OS/local-dir events as local across all 128 traces and language-keyed enriched runs', () => {
   // Direct unit checks for qualified local ports vs real network/socket endpoints
   for (const localPort of [
     'in-JVM',
@@ -862,7 +862,7 @@ test('local port normalization classifies all qualified in-JVM/OS/local-dir even
     assert.equal(isLocalPort(wirePort), false, `Expected ${JSON.stringify(wirePort)} to stay wire`);
   }
 
-  assert.equal(ALL_TRACES.length, 106);
+  assert.equal(ALL_TRACES.length, 128);
   assert.equal(Object.keys(DEEP_STEP_ENRICHMENTS).length, 7);
   assert.equal(Object.keys(DEEP_STEP_ENRICHMENTS_BY_LANG).length, 5);
 
@@ -1691,8 +1691,8 @@ test('computeHiddenCategoriesForStep is depth-aware and excludes collapsed grand
   );
 });
 
-test('all 106 curated traces enforce same-hostZone invariant for local/in-JVM/loopback hops and validate observability + scenario-03 + locality fixes', () => {
-  assert.equal(ALL_TRACES.length, 106);
+test('all 128 curated traces enforce same-hostZone invariant for local/in-JVM/loopback hops and validate observability + scenario-03 + locality fixes', () => {
+  assert.equal(ALL_TRACES.length, 128);
 
   const violations: string[] = [];
   const checkEvent = (traceId: string, mode: string, run: ExecutionRun, ev: RunEvent) => {
@@ -2131,8 +2131,8 @@ test('process-level locality invariant rejects cross-process in-JVM hops and res
   assert.equal(isDriverRuntimeInstance(clientDiscoveryRun.instances[fcdSessionToSc.toInstance]), true);
 });
 
-test('Golden multi-language invariant: ALL 106 Scala & Java curated traces (collapsed & expanded) emit ZERO Python/Py4J components or orders.py/worker.py/PyDriver/PythonRunner references', () => {
-  assert.equal(ALL_TRACES.length, 106);
+test('Golden multi-language invariant: ALL 128 Scala & Java curated traces (collapsed & expanded) emit ZERO Python/Py4J components or orders.py/worker.py/PyDriver/PythonRunner references', () => {
+  assert.equal(ALL_TRACES.length, 128);
 
   const PYTHON_ONLY_COMPONENTS = new Set<ComponentId>([
     'python-driver',

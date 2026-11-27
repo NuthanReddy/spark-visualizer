@@ -15,10 +15,18 @@ import { computeClusterCardSize } from '../src/engine/mapGeometry.ts';
 import { computePeerInteractions } from '../src/engine/peerInteractions.ts';
 import { advanceTimeline, buildEdgeCurve, MESSAGE_DURATION_MS } from '../src/playback.ts';
 
-test('catalog defines all 71 components with non-overlapping Master Canvas coordinates and valid language tags', () => {
-  assert.equal(COMPONENT_LIST.length, 71);
+test('catalog defines all 89 components with non-overlapping Master Canvas coordinates and Scala/Java > PySpark counts', () => {
+  assert.equal(COMPONENT_LIST.length, 89);
   const ids = new Set(COMPONENT_LIST.map(c => c.id));
-  assert.equal(ids.size, 71);
+  assert.equal(ids.size, 89);
+
+  const pysparkComps = COMPONENT_LIST.filter(c => c.languages?.includes('pyspark')).length;
+  const scalaComps = COMPONENT_LIST.filter(c => c.languages?.includes('scala')).length;
+  const javaComps = COMPONENT_LIST.filter(c => c.languages?.includes('java')).length;
+  assert.equal(pysparkComps, 81);
+  assert.equal(scalaComps, 82);
+  assert.equal(javaComps, 82);
+  assert.ok(scalaComps > pysparkComps && javaComps > pysparkComps);
 
   const subZoneByLabel = new Map(DRIVER_SUB_ZONES.map(s => [s.label, s.rect]));
   const { cardW, cardH } = computeClusterCardSize(COMPONENT_LIST);
@@ -101,18 +109,22 @@ test('catalog defines all 71 components with non-overlapping Master Canvas coord
   }
 });
 
-test('traces cover 9 dynamic lifecycle flows, 26 scenarios, and all 71 components', () => {
-  assert.equal(LIFECYCLE_TRACES.length, 9);
-  assert.equal(SCENARIO_TRACES.length, 26);
-  assert.equal(COMPONENT_TRACES.length, 71);
-  assert.equal(ALL_TRACES.length, 106);
+test('traces cover 11 lifecycle flows, 28 scenarios, and all 89 components', () => {
+  assert.equal(LIFECYCLE_TRACES.length, 11);
+  assert.equal(SCENARIO_TRACES.length, 28);
+  assert.equal(COMPONENT_TRACES.length, 89);
+  assert.equal(ALL_TRACES.length, 128);
 
   for (const flow of LIFECYCLE_TRACES) {
-    assert.deepEqual(
-      [...(flow.languages ?? [])],
-      ['pyspark', 'scala', 'java'],
-      `${flow.id}: expected unified lifecycle flow to support all 3 languages`,
-    );
+    if (flow.id === 'flow-typed-dataset-aggregator') {
+      assert.deepEqual([...(flow.languages ?? [])], ['scala', 'java']);
+    } else {
+      assert.deepEqual(
+        [...(flow.languages ?? [])],
+        ['pyspark', 'scala', 'java'],
+        `${flow.id}: expected unified lifecycle flow to support all 3 languages`,
+      );
+    }
     assert.equal(
       flow.languageVariantGroup,
       undefined,
@@ -123,7 +135,7 @@ test('traces cover 9 dynamic lifecycle flows, 26 scenarios, and all 71 component
   const scenarioNums = SCENARIO_TRACES.map(t => t.scenarioNumber).sort((a, b) => (a ?? 0) - (b ?? 0));
   assert.deepEqual(
     scenarioNums,
-    Array.from({ length: 26 }, (_, i) => i + 1),
+    Array.from({ length: 28 }, (_, i) => i + 1),
   );
 
   for (const comp of COMPONENT_LIST) {
@@ -183,12 +195,12 @@ test('playback clock and curve sampler behave deterministically', () => {
 });
 
 test('observability components, traces, categories, and peer interactions are wired cleanly', () => {
-  assert.deepEqual(COMPONENTS['listener-bus'].clusterPos, [1554, 304]);
-  assert.deepEqual(COMPONENTS['app-status-store'].clusterPos, [1554, 396]);
-  assert.deepEqual(COMPONENTS['spark-ui'].clusterPos, [1554, 488]);
-  assert.deepEqual(COMPONENTS['event-log'].clusterPos, [1554, 580]);
-  assert.deepEqual(COMPONENTS['metrics-system'].clusterPos, [1554, 672]);
-  assert.deepEqual(COMPONENTS['executor-metrics-poller'].clusterPos, [1652, 1030]);
+  assert.deepEqual(COMPONENTS['listener-bus'].clusterPos, [1868, 304]);
+  assert.deepEqual(COMPONENTS['app-status-store'].clusterPos, [1868, 400]);
+  assert.deepEqual(COMPONENTS['spark-ui'].clusterPos, [1868, 496]);
+  assert.deepEqual(COMPONENTS['event-log'].clusterPos, [1868, 592]);
+  assert.deepEqual(COMPONENTS['metrics-system'].clusterPos, [1868, 688]);
+  assert.deepEqual(COMPONENTS['executor-metrics-poller'].clusterPos, [2024, 1032]);
 
   const msTrace = TRACE_BY_ID['comp-metrics-system'];
   const empTrace = TRACE_BY_ID['comp-executor-metrics-poller'];

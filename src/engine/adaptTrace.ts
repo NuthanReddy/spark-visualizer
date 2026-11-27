@@ -131,12 +131,22 @@ export function inferStepCategory(
     to === 'executor-allocation-manager' ||
     from === 'executor-monitor' ||
     to === 'executor-monitor' ||
+    from === 'resource-profile-manager' ||
+    to === 'resource-profile-manager' ||
     from === 'health-tracker' ||
     to === 'health-tracker' ||
     from === 'delegation-token-manager' ||
     to === 'delegation-token-manager' ||
+    from === 'security-manager' ||
+    to === 'security-manager' ||
     from === 'jvm-user-app' ||
-    to === 'jvm-user-app'
+    to === 'jvm-user-app' ||
+    from === 'closure-cleaner' ||
+    to === 'closure-cleaner' ||
+    from === 'scala-repl-compiler' ||
+    to === 'scala-repl-compiler' ||
+    from === 'java-spark-api' ||
+    to === 'java-spark-api'
   ) {
     return 'yarn-lifecycle';
   }
@@ -174,14 +184,36 @@ export function inferStepCategory(
   if (
     from === 'session-catalog' ||
     to === 'session-catalog' ||
+    from === 'catalyst-analyzer' ||
+    to === 'catalyst-analyzer' ||
+    from === 'catalyst-optimizer' ||
+    to === 'catalyst-optimizer' ||
+    from === 'shuffle-exchange' ||
+    to === 'shuffle-exchange' ||
+    from === 'columnar-cache' ||
+    to === 'columnar-cache' ||
     from === 'sql-planner' ||
     to === 'sql-planner' ||
     from === 'adaptive-query-execution' ||
     to === 'adaptive-query-execution' ||
     from === 'whole-stage-codegen' ||
     to === 'whole-stage-codegen' ||
+    from === 'janino-code-generator' ||
+    to === 'janino-code-generator' ||
+    from === 'tungsten-unsafe-row' ||
+    to === 'tungsten-unsafe-row' ||
+    from === 'hash-aggregate' ||
+    to === 'hash-aggregate' ||
+    from === 'sort-merge-join' ||
+    to === 'sort-merge-join' ||
     from === 'dataset-encoder-udf' ||
     to === 'dataset-encoder-udf' ||
+    from === 'typed-dataset-ops' ||
+    to === 'typed-dataset-ops' ||
+    from === 'scala-java-udf' ||
+    to === 'scala-java-udf' ||
+    from === 'typed-aggregator' ||
+    to === 'typed-aggregator' ||
     from === 'dag-scheduler' ||
     to === 'dag-scheduler' ||
     from === 'task-scheduler' ||
@@ -194,6 +226,10 @@ export function inferStepCategory(
   if (
     from === 'serializer-manager' ||
     to === 'serializer-manager' ||
+    from === 'kryo-registrator' ||
+    to === 'kryo-registrator' ||
+    from === 'user-classloader' ||
+    to === 'user-classloader' ||
     from === 'context-cleaner' ||
     to === 'context-cleaner' ||
     from === 'transport-context' ||
