@@ -43,7 +43,7 @@ Open `http://127.0.0.1:5173`.
 
 ## Keyboard shortcuts
 
-`Space` Play/Pause | `Left` / `Right` Prev/Next Step | `S` Step Message | `R` Reset | `[` / `]` Speed | `V` Switch View | `C` Categories | `G` Simulator | `L` Toggle Sidebar | `D` Diagram-Only | `T` Dark/Light Theme | `F` Fullscreen | `Ctrl+K` or `/` Search | `?` Shortcuts Help | `Esc` Close Modal.
+`Space` Play/Pause | `Left` / `Right` Prev/Next Step | `S` Step Message | `R` Reset | `[` / `]` Speed | `V` Switch View | `C` Categories | `G` Simulator | `L` Left Catalog | `I` Right Inspector | `W` Wire Trace Log | `D` Diagram-Only | `T` Dark/Light Theme | `F` Fullscreen | `Ctrl+K` or `/` Search | `?` Shortcuts Help | `Esc` Close Modal.
 
 ## GitHub Pages
 

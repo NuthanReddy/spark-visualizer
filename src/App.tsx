@@ -14,7 +14,9 @@ import {
   Minus,
   Moon,
   Network,
+  PanelBottom,
   PanelLeft,
+  PanelRight,
   Plus,
   RotateCcw,
   Search,
@@ -394,6 +396,8 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(
     () => !window.matchMedia('(max-width: 760px)').matches,
   );
+  const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [traceLogOpen, setTraceLogOpen] = useState(true);
   const [diagramOnly, setDiagramOnly] = useState(false);
   const [floatingInspectorOpen, setFloatingInspectorOpen] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('step');
@@ -1799,7 +1803,24 @@ export default function App() {
         setModal((prev) => (prev === 'shortcuts' ? null : 'shortcuts'));
         break;
       case 'l':
-        setSidebarOpen((v) => !v);
+        if (diagramOnly) {
+          setDiagramOnly(false);
+          setSidebarOpen(true);
+        } else {
+          setSidebarOpen((v) => !v);
+        }
+        break;
+      case 'i':
+        if (diagramOnly) {
+          setDiagramOnly(false);
+          setFloatingInspectorOpen(false);
+          setInspectorOpen(true);
+        } else {
+          setInspectorOpen((v) => !v);
+        }
+        break;
+      case 'w':
+        setTraceLogOpen((v) => !v);
         break;
       case 'd':
         setDiagramOnly((v) => {
@@ -1957,11 +1978,40 @@ export default function App() {
         : FAULT_MAP[simFaultId].short
       : (simTelemetry?.faultLabel ?? 'Fault: None');
 
+  const showSidebar = sidebarOpen && !diagramOnly;
+  const showInspector = inspectorOpen && !diagramOnly;
+  const showTraceLog = traceLogOpen;
+
+  const handleToggleSidebar = () => {
+    if (diagramOnly) {
+      setDiagramOnly(false);
+      setSidebarOpen(true);
+    } else {
+      setSidebarOpen((v) => !v);
+    }
+  };
+
+  const handleToggleInspector = () => {
+    if (diagramOnly) {
+      setDiagramOnly(false);
+      setFloatingInspectorOpen(false);
+      setInspectorOpen(true);
+    } else {
+      setInspectorOpen((v) => !v);
+    }
+  };
+
+  const handleToggleTraceLog = () => {
+    setTraceLogOpen((v) => !v);
+  };
+
   return (
     <div
       className={[
         'app',
-        sidebarOpen && !diagramOnly ? '' : 'without-sidebar',
+        showSidebar ? '' : 'without-sidebar',
+        showInspector ? '' : 'without-inspector',
+        showTraceLog ? '' : 'without-trace-log',
         sidebarOpen ? 'catalog-open' : '',
         diagramOnly ? 'diagram-only' : '',
       ]
@@ -1969,64 +2019,77 @@ export default function App() {
         .join(' ')}
     >
       <header className="topbar">
-        <a
-          className="brand"
-          href={encodeCatalogHash(
-            TRACE_BY_ID[
-              resolveLanguageVariantTraceId(
+        <div className="topbar-left">
+          <button
+            type="button"
+            className={`icon-button topbar-left-toggle ${showSidebar ? 'is-on' : ''}`}
+            title="Toggle left catalog sidebar (L)"
+            aria-label="Toggle catalog sidebar"
+            aria-pressed={showSidebar}
+            onClick={handleToggleSidebar}
+          >
+            <PanelLeft size={16} />
+          </button>
+
+          <a
+            className="brand"
+            href={encodeCatalogHash(
+              TRACE_BY_ID[
+                resolveLanguageVariantTraceId(
+                  DEFAULT_TRACE.id,
+                  activeLanguage,
+                  ALL_TRACES,
+                )
+              ] ?? DEFAULT_TRACE,
+              'topology',
+              activeLanguage,
+            )}
+            onClick={(e) => {
+              e.preventDefault();
+              const homeId = resolveLanguageVariantTraceId(
                 DEFAULT_TRACE.id,
                 activeLanguage,
                 ALL_TRACES,
-              )
-            ] ?? DEFAULT_TRACE,
-            'topology',
-            activeLanguage,
-          )}
-          onClick={(e) => {
-            e.preventDefault();
-            const homeId = resolveLanguageVariantTraceId(
-              DEFAULT_TRACE.id,
-              activeLanguage,
-              ALL_TRACES,
-            );
-            if (view !== 'topology') {
-              navHistoryModeRef.current = 'push';
-              setView('topology');
-            }
-            selectTrace(homeId, {
-              componentId: null,
-              tab: 'step',
-              animate: false,
-              languageOverride: activeLanguage,
-            });
-          }}
-        >
-          <span className="brand-mark" aria-hidden="true">
-            <svg viewBox="0 0 36 36" width="28" height="28">
-              <path
-                d="M8 26 L18 8 L28 26 M11.5 20.5 H24.5"
-                fill="none"
-                stroke="var(--ch-rpc)"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-              <circle cx="18" cy="8" r="3" fill="var(--ch-yarn)" />
-              <circle cx="8" cy="26" r="3" fill="var(--ch-data)" />
-              <circle cx="28" cy="26" r="3" fill="var(--ch-python)" />
-            </svg>
-          </span>
-          <span className="brand-copy">
-            <span className="brand-title">
-              SPARK <em>VISUALIZER</em>
+              );
+              if (view !== 'topology') {
+                navHistoryModeRef.current = 'push';
+                setView('topology');
+              }
+              selectTrace(homeId, {
+                componentId: null,
+                tab: 'step',
+                animate: false,
+                languageOverride: activeLanguage,
+              });
+            }}
+          >
+            <span className="brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 36 36" width="28" height="28">
+                <path
+                  d="M8 26 L18 8 L28 26 M11.5 20.5 H24.5"
+                  fill="none"
+                  stroke="var(--ch-rpc)"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <circle cx="18" cy="8" r="3" fill="var(--ch-yarn)" />
+                <circle cx="8" cy="26" r="3" fill="var(--ch-data)" />
+                <circle cx="28" cy="26" r="3" fill="var(--ch-python)" />
+              </svg>
             </span>
-            <span className="brand-tagline">
-              {(SPARK_LANGUAGES.find((l) => l.id === activeLanguage)?.label ?? 'PySpark').toUpperCase()} ON YARN |{' '}
-              {COMPONENT_LIST.filter((c) => !c.languages || c.languages.includes(activeLanguage)).length}/
-              {COMPONENT_LIST.length} COMPONENTS | {ALL_TRACES.length} TRACES
+            <span className="brand-copy">
+              <span className="brand-title">
+                SPARK <em>VISUALIZER</em>
+              </span>
+              <span className="brand-tagline">
+                {(SPARK_LANGUAGES.find((l) => l.id === activeLanguage)?.label ?? 'PySpark').toUpperCase()} ON YARN |{' '}
+                {COMPONENT_LIST.filter((c) => !c.languages || c.languages.includes(activeLanguage)).length}/
+                {COMPONENT_LIST.length} COMPONENTS | {ALL_TRACES.length} TRACES
+              </span>
             </span>
-          </span>
-        </a>
+          </a>
+        </div>
 
         <div
           className="lang-switcher"
@@ -2102,16 +2165,24 @@ export default function App() {
 
           <button
             type="button"
-            className={`icon-button ${sidebarOpen && !diagramOnly ? 'is-on' : ''}`}
-            title="Toggle catalog sidebar (L)"
-            aria-label="Toggle catalog sidebar"
-            aria-pressed={sidebarOpen && !diagramOnly}
-            onClick={() => {
-              if (diagramOnly) setDiagramOnly(false);
-              setSidebarOpen((v) => !v);
-            }}
+            className={`icon-button ${showTraceLog ? 'is-on' : ''}`}
+            title="Toggle wire trace log (W)"
+            aria-label="Toggle wire trace log"
+            aria-pressed={showTraceLog}
+            onClick={handleToggleTraceLog}
           >
-            <PanelLeft size={16} />
+            <PanelBottom size={16} />
+          </button>
+
+          <button
+            type="button"
+            className={`icon-button ${showInspector ? 'is-on' : ''}`}
+            title="Toggle right inspector pane (I)"
+            aria-label="Toggle right inspector pane"
+            aria-pressed={showInspector}
+            onClick={handleToggleInspector}
+          >
+            <PanelRight size={16} />
           </button>
 
           <button
@@ -2164,7 +2235,7 @@ export default function App() {
       </header>
 
       <main className="workspace">
-        {sidebarOpen && !diagramOnly && (
+        {showSidebar && (
           <CatalogSidebar
             mode={catalogMode}
             onModeChange={setCatalogMode}
@@ -2815,25 +2886,27 @@ export default function App() {
           </div>
         </section>
 
-        {!diagramOnly && <InspectorPanel {...inspectorProps} />}
+        {showInspector && <InspectorPanel {...inspectorProps} />}
 
-        <MessageTable
-          run={activeRun}
-          projection={projection}
-          activeEventId={activeEventId}
-          progress={progress}
-          playing={playing}
-          speed={speed}
-          onReset={handleReset}
-          onPrevEvent={handlePrevEvent}
-          onTogglePlay={handleTogglePlay}
-          onNextEvent={handleNextEvent}
-          onSpeedChange={setSpeed}
-          onSelectEvent={handleSelectEvent}
-          onSelectComponent={handleSelectComponent}
-          onEnableCategories={handleEnableCategories}
-          onResetFilters={handleResetFilters}
-        />
+        {showTraceLog && (
+          <MessageTable
+            run={activeRun}
+            projection={projection}
+            activeEventId={activeEventId}
+            progress={progress}
+            playing={playing}
+            speed={speed}
+            onReset={handleReset}
+            onPrevEvent={handlePrevEvent}
+            onTogglePlay={handleTogglePlay}
+            onNextEvent={handleNextEvent}
+            onSpeedChange={setSpeed}
+            onSelectEvent={handleSelectEvent}
+            onSelectComponent={handleSelectComponent}
+            onEnableCategories={handleEnableCategories}
+            onResetFilters={handleResetFilters}
+          />
+        )}
       </main>
 
       {diagramOnly && floatingInspectorOpen && (
@@ -2977,6 +3050,8 @@ export default function App() {
               ['Toggle job, data & fault simulator', 'G'],
               ['Toggle step category filters', 'C'],
               ['Toggle left catalog sidebar', 'L'],
+              ['Toggle right inspector pane', 'I'],
+              ['Toggle wire trace log', 'W'],
               ['Diagram-only focus mode', 'D'],
               ['Toggle dark / light blueprint theme', 'T'],
               ['Toggle fullscreen', 'F'],
